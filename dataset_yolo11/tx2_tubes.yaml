@@ -1,0 +1,5 @@
+path: C:/Users/luis_/Desktop/tx2_cv_2026-05-11/dataset_yolo11
+train: images/train
+val: images/val
+names:
+  0: tubo

@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+.uv-cache-check/
+
+# Logs and local runtime files
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+.claude/
+.tmp_*
+20260407_191100_61A4_B8A44FEF1AB4/
+
+# Frontend build/dependencies
+mvp_react_app/node_modules/
+mvp_react_app/dist/
+
+# Raw videos and generated media/previews
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.png
+*.jpg
+*.jpeg
+
+# Keep curated YOLO datasets in Git.
+!dataset/images/**/*.jpg
+!dataset_yolo11/images/**/*.jpg
+dataset_yolo11/**/*.cache
+
+# Generated outputs. Keep calibration/config JSON needed by the local apps.
+outputs/*
+!outputs/homography_selection.json
+!outputs/roi_selection.json
+!outputs/table_measurement_calibration.json
+
+# YOLO weights/checkpoints. Keep the trained app model only.
+*.pt
+!runs/detect/runs_tx2/yolo11n_tubos_v1/weights/best.pt
+runs/**
+!runs/
+!runs/detect/
+!runs/detect/runs_tx2/
+!runs/detect/runs_tx2/yolo11n_tubos_v1/
+!runs/detect/runs_tx2/yolo11n_tubos_v1/args.yaml
+!runs/detect/runs_tx2/yolo11n_tubos_v1/results.csv
+!runs/detect/runs_tx2/yolo11n_tubos_v1/weights/
+!runs/detect/runs_tx2/yolo11n_tubos_v1/weights/best.pt

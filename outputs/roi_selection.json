@@ -1,0 +1,20 @@
+{
+  "source_homography": "C:\\Users\\luis_\\Desktop\\tx2_cv_2026-05-11\\outputs\\homography_selection.json",
+  "image_size": [
+    1209,
+    688
+  ],
+  "roi_abs": {
+    "x": 1206,
+    "y": 473,
+    "w": 0,
+    "h": 0
+  },
+  "roi_norm": {
+    "x": 0.997896,
+    "y": 0.687988,
+    "w": 0.0,
+    "h": 0.0
+  },
+  "preview": "C:\\Users\\luis_\\Desktop\\tx2_cv_2026-05-11\\outputs\\roi_selection_preview.jpg"
+}

@@ -1,0 +1,7 @@
+asyncua
+flask
+matplotlib
+numpy
+opencv-python
+pillow
+ultralytics
