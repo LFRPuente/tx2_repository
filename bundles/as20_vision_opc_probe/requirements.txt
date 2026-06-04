@@ -1,0 +1,4 @@
+asyncua
+nest_asyncio
+notebook
+ipykernel
