@@ -3,6 +3,33 @@
 Portable bundle para probar, desde una maquina dentro de la VPN, los tags de
 Kepware/OPC UA del sistema de vision.
 
+## Contexto rapido
+
+Este bundle nace de la revision de la app `BilletScanning` y de la captura de
+Kepware en el server `BRJTXQMOSTX2OPC.BARNSTXPROD.LOCAL`.
+
+La app existente no se conecta directo al PLC. El camino es:
+
+```text
+Python / Notebook -> OPC UA -> Kepware -> ControlLogix PLC
+```
+
+Para esta prueba no estamos leyendo el grupo `TX2MH > Scanning`. Estamos
+leyendo el grupo que viste en Kepware:
+
+```text
+Connectivity > ControlLogix > AS20 > VisionSystem
+```
+
+El objetivo es validar dos cosas:
+
+- Que `VisionWD` cambie rapido para confirmar que el PLC/sistema de vision esta
+  vivo.
+- Que `MeasureLength` exista y podamos leer su valor/timestamps OPC UA para
+  evaluar si sirve como disparo o medicion para sincronizar con el video.
+
+Mas detalle en `CONTEXT.md`.
+
 ## Endpoint
 
 ```text
@@ -49,3 +76,11 @@ Tambien puedes ejecutar:
 .\open_notebook.ps1
 ```
 
+## Archivos
+
+```text
+plc_timestamp_probe.ipynb  Notebook principal
+requirements.txt           Dependencias minimas
+open_notebook.ps1          Crea venv, instala dependencias y abre Jupyter
+CONTEXT.md                 Contexto tecnico de la prueba
+```
