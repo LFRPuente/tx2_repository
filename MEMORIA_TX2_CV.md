@@ -1,6 +1,6 @@
 # Memoria de trabajo - TX2 CV
 
-Fecha de actualizacion: 2026-05-11
+Fecha de actualizacion: 2026-06-09
 
 ## Estado general
 
@@ -170,6 +170,73 @@ run_warp_player_app.bat
 
 Si se quiere usar este reproductor para TX2, conviene actualizarlo para cargar `outputs\homography_selection.json` o reemplazar sus puntos hardcodeados.
 
+### tools/plc_vision_plain_test.py
+
+Script Python plano, sin notebook, para validar conectividad OPC UA contra
+Kepware TX2.
+
+Endpoint default:
+
+```text
+opc.tcp://10.14.6.48:49320
+```
+
+Tags default:
+
+```text
+ns=2;s=ControlLogix.AS20.VisionSystem.MeasureLength
+ns=2;s=ControlLogix.AS20.VisionSystem.VisionWD
+```
+
+Comando recomendado:
+
+```powershell
+python tools\plc_vision_plain_test.py --samples 100 --interval 0.07
+```
+
+Resultado observado el 2026-06-09:
+
+- conexion OPC UA exitosa contra Kepware;
+- `VisionWD` cambio de `300` a `438`;
+- cambios detectados: `91 / 99`;
+- `MeasureLength` leyo `False`;
+- resultado: `PASS`.
+
+### tools/plc_cut_sync_monitor.py
+
+Monitor Python plano para sincronizar lecturas contra cambios de `VisionWD`.
+Cada vez que cambia `VisionWD`, lee el tag de evento/medicion configurado
+por `--event-node`, por default `MeasureLength`. Si el valor cambia, registra
+flancos `rising`, `falling` o `changed`.
+
+Comando usado para prueba:
+
+```powershell
+python tools\plc_cut_sync_monitor.py --duration 120 --poll-interval 0.01
+```
+
+Resultado observado el 2026-06-09:
+
+- ticks de `VisionWD` capturados: `634`;
+- eventos `MeasureLength` encontrados: `12`;
+- ciclos `True -> False` detectados: `6`;
+- duracion activa promedio de `MeasureLength`: aproximadamente `875 ms`.
+
+Pares observados por timestamp OPC UA:
+
+```text
+2026-06-09T23:20:09.868075+00:00 -> 2026-06-09T23:20:10.921245+00:00  ~1053 ms
+2026-06-09T23:20:20.863776+00:00 -> 2026-06-09T23:20:21.459729+00:00  ~596 ms
+2026-06-09T23:20:31.561710+00:00 -> 2026-06-09T23:20:32.360143+00:00  ~798 ms
+2026-06-09T23:20:52.065505+00:00 -> 2026-06-09T23:20:52.864239+00:00  ~799 ms
+2026-06-09T23:21:08.964744+00:00 -> 2026-06-09T23:21:09.973007+00:00  ~1008 ms
+2026-06-09T23:21:25.471539+00:00 -> 2026-06-09T23:21:26.466684+00:00  ~995 ms
+```
+
+Interpretacion: `MeasureLength` se comporta como bit/evento booleano. Si este
+bit corresponde al corte o a la medicion lista, sus `source_timestamp` de OPC UA
+pueden usarse para sincronizar eventos contra video.
+
 ## Notebook
 
 Notebook principal:
@@ -304,6 +371,8 @@ No hay archivo `requirements.txt`, `pyproject.toml` ni entorno formal detectado 
 2. Para medir linea con la homografia guardada: ejecutar `run_line_measure_app.ps1`.
 3. Para reproducir warp en TX2: primero actualizar `warp_player_app.py`, porque conserva defaults de `tx1`.
 4. Para experimentacion y regenerar outputs: usar `tube_horizontal_limit_detection.ipynb`.
+5. Para validar PLC/Kepware: ejecutar `tools\plc_vision_plain_test.py`.
+6. Para capturar flancos de medicion/corte: ejecutar `tools\plc_cut_sync_monitor.py`.
 
 ## Nota sobre TX1
 
