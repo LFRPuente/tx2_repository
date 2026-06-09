@@ -76,10 +76,33 @@ Tambien puedes ejecutar:
 .\open_notebook.ps1
 ```
 
+## Monitoreo sincronizado con VisionWD
+
+Para monitorear usando `VisionWD` como tick, corre:
+
+```powershell
+python watchdog_sync_probe.py --seconds 120 --poll-seconds 0.069
+```
+
+Esto no escribe al PLC. Solo lee `VisionWD`, registra una fila cuando cambia y
+lee `MeasureLength` en ese mismo tick observado. La salida tambien se guarda en:
+
+```text
+watchdog_sync_log.csv
+```
+
+Si necesitas capturar menos saltos de watchdog, usa un poll mas rapido pero
+todavia razonable:
+
+```powershell
+python watchdog_sync_probe.py --seconds 120 --poll-seconds 0.035
+```
+
 ## Archivos
 
 ```text
 plc_timestamp_probe.ipynb  Notebook principal
+watchdog_sync_probe.py      Monitor anclado a cambios de VisionWD
 requirements.txt           Dependencias minimas
 open_notebook.ps1          Crea venv, instala dependencias y abre Jupyter
 CONTEXT.md                 Contexto tecnico de la prueba

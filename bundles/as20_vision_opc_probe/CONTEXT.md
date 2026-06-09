@@ -105,3 +105,25 @@ Para sincronizar contra video, el mejor caso seria tener un tag numerico de
 longitud y/o un timestamp/evento de medicion. `VisionWD` solo confirma vida; no
 marca necesariamente el instante fisico de la medicion.
 
+## Sincronizacion practica con VisionWD
+
+Para el MVP podemos usar `VisionWD` como reloj de referencia de planta:
+
+```text
+1. Leer VisionWD continuamente.
+2. Registrar solo cuando VisionWD cambia.
+3. En ese mismo tick observado, leer MeasureLength.
+4. Guardar watchdog_source_timestamp, measure_source_timestamp y read_utc.
+```
+
+Esto no convierte al watchdog en timestamp exacto de medicion, pero nos da una
+linea de tiempo estable para comparar eventos de planta contra el video.
+
+El script `watchdog_sync_probe.py` hace justo eso. Por default usa:
+
+```text
+poll-seconds = 0.069
+```
+
+Si se observan saltos frecuentes de `VisionWD` mayores a 1, se puede bajar el
+poll a `0.035` para muestrear aproximadamente dos veces por ciclo del watchdog.
