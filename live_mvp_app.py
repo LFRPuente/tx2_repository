@@ -62,7 +62,7 @@ def clean_value(value: Any) -> Any:
 def img_to_b64(img: np.ndarray, quality: int = 82) -> str:
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
     if not ok:
-        raise RuntimeError("No se pudo codificar la imagen")
+        raise RuntimeError("Could not encode image")
     return base64.b64encode(buf).decode("ascii")
 
 
@@ -264,15 +264,15 @@ class CameraReader:
             return build_rtsp_url(self.args), f"RTSP {self.args.camera_ip}"
         if self.args.source == "auto" and (self.args.rtsp_url or (self.args.camera_user and self.args.camera_password)):
             return build_rtsp_url(self.args), f"RTSP {self.args.camera_ip}"
-        return str(self.args.video), f"Video simulado {self.args.video.name}"
+        return str(self.args.video), f"Simulated video {self.args.video.name}"
 
     def _run(self) -> None:
         frame_index = 0
         while not self.stop_event.is_set():
             source, label = self._resolve_source()
-            pending_error = "Conectando a fuente de video..."
+            pending_error = "Connecting to video source..."
             if label.startswith("RTSP") and not (self.args.rtsp_url or (self.args.camera_user and self.args.camera_password)):
-                pending_error = "Conectando RTSP sin credenciales; si la camara requiere auth, define AXIS_USER y AXIS_PASSWORD."
+                pending_error = "Connecting to RTSP without credentials. If the camera requires auth, set AXIS_USER and AXIS_PASSWORD."
             self._set_state(connected=False, source_label=label, error=pending_error)
 
             cap = cv2.VideoCapture()
@@ -283,7 +283,7 @@ class CameraReader:
                 pass
             cap.open(source, cv2.CAP_FFMPEG)
             if not cap.isOpened():
-                self._set_state(connected=False, source_label=label, error=f"No se pudo abrir fuente: {label}")
+                self._set_state(connected=False, source_label=label, error=f"Could not open source: {label}")
                 cap.release()
                 time.sleep(2.0)
                 continue
@@ -293,7 +293,7 @@ class CameraReader:
                 fps = self.args.capture_fps or 15.0
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-            simulated_video = label.startswith("Video simulado")
+            simulated_video = label.startswith("Simulated video")
             self._set_state(connected=True, source_label=label, error="", fps=fps, width=width, height=height)
 
             last_push = time.perf_counter()
@@ -303,7 +303,7 @@ class CameraReader:
                     if simulated_video:
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         continue
-                    self._set_state(connected=False, error="Lectura de camara fallo; reintentando")
+                    self._set_state(connected=False, error="Camera read failed; retrying")
                     break
 
                 now_mono = time.perf_counter()
@@ -516,7 +516,7 @@ class ClipRecorder:
                 time.sleep(0.025)
 
             if not frames:
-                raise RuntimeError("No hubo frames para grabar el clip.")
+                raise RuntimeError("No frames were available to record the clip.")
 
             day_dir = self.args.output_dir / "live_plc_clips" / datetime.now().strftime("%Y-%m-%d")
             day_dir.mkdir(parents=True, exist_ok=True)
@@ -530,7 +530,7 @@ class ClipRecorder:
             fps = float(self.args.record_fps or self.args.capture_fps or 15.0)
             writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
             if not writer.isOpened():
-                raise RuntimeError(f"No se pudo abrir VideoWriter: {video_path}")
+                raise RuntimeError(f"Could not open VideoWriter: {video_path}")
             for item in frames:
                 frame = item["frame"]
                 if frame.shape[1] != width or frame.shape[0] != height:
@@ -723,28 +723,28 @@ h2 { font-size: 16px; }
       <p class="eyebrow">TX2 Vision</p>
       <h1>Live MVP</h1>
     </div>
-    <div id="top-state" class="pill warn">conectando...</div>
+    <div id="top-state" class="pill warn">connecting...</div>
   </header>
 
   <section class="metrics">
-    <div class="metric total"><span>Medida total</span><strong id="m-total">-</strong></div>
-    <div class="metric ref"><span>Diferencia a REF</span><strong id="m-delta">-</strong></div>
+    <div class="metric total"><span>Total measurement</span><strong id="m-total">-</strong></div>
+    <div class="metric ref"><span>Distance to REF</span><strong id="m-delta">-</strong></div>
     <div class="metric"><span>YOLO</span><strong id="m-yolo">-</strong></div>
     <div class="metric"><span>Frame</span><strong id="m-frame">-</strong></div>
     <div class="metric"><span>PLC</span><strong id="m-plc">-</strong></div>
-    <div class="metric"><span>Grabador</span><strong id="m-rec">-</strong></div>
+    <div class="metric"><span>Recorder</span><strong id="m-rec">-</strong></div>
   </section>
 
   <main class="grid">
     <section class="panel">
       <div class="panel-head">
         <div>
-          <p class="eyebrow">Camara / video</p>
-          <h2>Imagen real con overlay</h2>
+          <p class="eyebrow">Camera / video</p>
+          <h2>Live image with overlay</h2>
         </div>
         <span id="camera-state" class="pill">-</span>
       </div>
-      <div class="stage" id="original-stage"><div class="empty">Esperando frame...</div></div>
+      <div class="stage" id="original-stage"><div class="empty">Waiting for frame...</div></div>
     </section>
 
     <div class="side">
@@ -752,18 +752,18 @@ h2 { font-size: 16px; }
         <div class="panel-head">
           <div>
             <p class="eyebrow">Warp</p>
-            <h2>ROI rectificado + YOLO/Sobel</h2>
+            <h2>Rectified ROI + YOLO/Sobel</h2>
           </div>
           <span id="processor-state" class="pill">-</span>
         </div>
-        <div class="stage" id="rectified-stage"><div class="empty">Esperando procesamiento...</div></div>
+        <div class="stage" id="rectified-stage"><div class="empty">Waiting for processing...</div></div>
       </section>
 
       <section class="panel">
         <div class="panel-head">
           <div>
-            <p class="eyebrow">Esquema</p>
-            <h2>Referencia vs frente</h2>
+            <p class="eyebrow">Diagram</p>
+            <h2>Reference vs front edge</h2>
           </div>
         </div>
         <svg class="diagram" viewBox="0 0 760 310" role="img" aria-label="Measurement diagram">
@@ -780,15 +780,15 @@ h2 { font-size: 16px; }
       <section class="panel">
         <div class="panel-head">
           <div>
-            <p class="eyebrow">Estado</p>
+            <p class="eyebrow">Status</p>
             <h2>Backend live</h2>
           </div>
         </div>
         <div class="log">
-          <div class="row"><span>Fuente</span><strong id="s-source">-</strong></div>
-          <div class="row"><span>Ultimo procesamiento</span><strong id="s-processed">-</strong></div>
-          <div class="row"><span>Evento PLC</span><strong id="s-event">-</strong></div>
-          <div class="row"><span>Ultimo clip</span><strong id="s-clip">-</strong></div>
+          <div class="row"><span>Source</span><strong id="s-source">-</strong></div>
+          <div class="row"><span>Latest processing</span><strong id="s-processed">-</strong></div>
+          <div class="row"><span>PLC event</span><strong id="s-event">-</strong></div>
+          <div class="row"><span>Latest clip</span><strong id="s-clip">-</strong></div>
           <div class="row"><span>Error</span><strong id="s-error">-</strong></div>
         </div>
       </section>
@@ -806,7 +806,7 @@ function fmt(value, digits = 3) {
 
 function setImage(stage, b64, alt) {
   if (!b64) {
-    stage.innerHTML = '<div class="empty">Esperando frame...</div>';
+    stage.innerHTML = '<div class="empty">Waiting for frame...</div>';
     return;
   }
   let img = stage.querySelector('img');
@@ -863,11 +863,11 @@ async function refreshStatus() {
     const plc = data.plc || {};
     const recorder = data.recorder || {};
     const healthy = camera.connected && processor.ok;
-    pill($('top-state'), healthy ? 'live' : 'revisar estado', healthy ? 'ok' : 'warn');
-    pill($('camera-state'), camera.connected ? 'conectada' : 'sin fuente', camera.connected ? 'ok' : 'err');
-    pill($('processor-state'), processor.processing ? 'procesando' : (processor.ok ? 'ok' : 'error'), processor.ok ? 'ok' : 'warn');
-    $('m-plc').textContent = plc.enabled ? (plc.connected ? 'OK' : 'OFF') : 'desactivado';
-    $('m-rec').textContent = recorder.recording ? 'grabando' : 'listo';
+    pill($('top-state'), healthy ? 'live' : 'check status', healthy ? 'ok' : 'warn');
+    pill($('camera-state'), camera.connected ? 'connected' : 'no source', camera.connected ? 'ok' : 'err');
+    pill($('processor-state'), processor.processing ? 'processing' : (processor.ok ? 'ok' : 'error'), processor.ok ? 'ok' : 'warn');
+    $('m-plc').textContent = plc.enabled ? (plc.connected ? 'OK' : 'OFF') : 'disabled';
+    $('m-rec').textContent = recorder.recording ? 'recording' : 'ready';
     $('s-source').textContent = camera.source_label || '-';
     $('s-processed').textContent = processor.last_duration_ms ? `${processor.last_duration_ms} ms` : '-';
     const lastEvent = plc.last_event;
@@ -919,7 +919,7 @@ def api_live_status():
 def api_live_frame():
     data = _processor.snapshot(include_images=True)
     if data.get("result") is None:
-        return jsonify(error=data.get("error") or "Aun no hay frame procesado", processor=data), 503
+        return jsonify(error=data.get("error") or "No processed frame is available yet", processor=data), 503
     return jsonify(data)
 
 
@@ -952,9 +952,9 @@ def main() -> int:
     _processor.start()
     _plc.start()
 
-    print(f"\n  TX2 Live MVP en http://127.0.0.1:{_args.port}\n")
-    print(f"  Fuente: {_args.source}")
-    print(f"  PLC: {'habilitado' if _args.plc_enabled else 'deshabilitado'}")
+    print(f"\n  TX2 Live MVP at http://127.0.0.1:{_args.port}\n")
+    print(f"  Source: {_args.source}")
+    print(f"  PLC: {'enabled' if _args.plc_enabled else 'disabled'}")
     app.run(host="127.0.0.1", port=_args.port, debug=False, threaded=True)
     return 0
 

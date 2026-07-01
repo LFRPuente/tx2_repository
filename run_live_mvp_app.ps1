@@ -27,7 +27,7 @@ foreach ($candidate in $candidates) {
 }
 
 if (-not $pythonExe) {
-    Write-Host "No se encontro Python. Ajusta la ruta del ejecutable en este lanzador."
+    Write-Host "Python was not found. Adjust the executable path in this launcher."
     exit 1
 }
 
