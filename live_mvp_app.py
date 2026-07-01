@@ -27,6 +27,8 @@ from flask import Flask, jsonify, render_template_string
 import homography_web_app as vision
 
 
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000")
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_VIDEO = Path(r"C:\Users\luis_\Downloads\20260508_000307_7F66.mkv")
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
@@ -67,10 +69,10 @@ def img_to_b64(img: np.ndarray, quality: int = 82) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Live TX2 MVP with camera, PLC, YOLO and recording.")
     parser.add_argument("--port", type=int, default=8767)
-    parser.add_argument("--source", choices=("video", "rtsp", "auto"), default="video")
+    parser.add_argument("--source", choices=("video", "rtsp", "auto"), default="rtsp")
     parser.add_argument("--video", type=Path, default=DEFAULT_VIDEO)
     parser.add_argument("--camera-ip", default="10.14.115.241")
-    parser.add_argument("--rtsp-url", default="")
+    parser.add_argument("--rtsp-url", default=os.environ.get("AXIS_RTSP_URL", ""))
     parser.add_argument("--codec", choices=("jpeg", "h264"), default="jpeg")
     parser.add_argument("--camera-user", default=os.environ.get("AXIS_USER", ""))
     parser.add_argument("--camera-password", default=os.environ.get("AXIS_PASSWORD", ""))
@@ -268,9 +270,21 @@ class CameraReader:
         frame_index = 0
         while not self.stop_event.is_set():
             source, label = self._resolve_source()
-            cap = cv2.VideoCapture(source)
+            pending_error = "Conectando a fuente de video..."
+            if label.startswith("RTSP") and not (self.args.rtsp_url or (self.args.camera_user and self.args.camera_password)):
+                pending_error = "Conectando RTSP sin credenciales; si la camara requiere auth, define AXIS_USER y AXIS_PASSWORD."
+            self._set_state(connected=False, source_label=label, error=pending_error)
+
+            cap = cv2.VideoCapture()
+            try:
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+            except Exception:
+                pass
+            cap.open(source, cv2.CAP_FFMPEG)
             if not cap.isOpened():
                 self._set_state(connected=False, source_label=label, error=f"No se pudo abrir fuente: {label}")
+                cap.release()
                 time.sleep(2.0)
                 continue
 

@@ -2,10 +2,10 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $scriptPath = Join-Path $root "live_mvp_app.py"
-$videoPath = "C:\Users\luis_\Downloads\20260508_000307_7F66.mkv"
 $outputDir = Join-Path $root "outputs"
 $datasetDir = Join-Path $root "dataset"
 $modelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_tubos_v1\weights\best.pt"
+$cameraIp = "10.14.115.241"
 
 $candidates = @(
     (Get-Command python -ErrorAction SilentlyContinue).Source
@@ -31,12 +31,13 @@ if (-not $pythonExe) {
     exit 1
 }
 
-# Default source is video, so the MVP can be tested without camera credentials.
-# For RTSP, change --source video to --source rtsp and set AXIS_USER / AXIS_PASSWORD.
-# For PLC-triggered clips, add --plc-enabled.
+# This MVP is live by default: Python reads the AXIS camera directly through RTSP.
+# If the camera requires auth, set AXIS_USER and AXIS_PASSWORD before running.
+# To test with a file temporarily, change --source rtsp to --source video and pass --video.
 & $pythonExe $scriptPath `
-  --source video `
-  --video $videoPath `
+  --source rtsp `
+  --camera-ip $cameraIp `
+  --codec jpeg `
   --output-dir $outputDir `
   --dataset-dir $datasetDir `
   --model $modelPath `
