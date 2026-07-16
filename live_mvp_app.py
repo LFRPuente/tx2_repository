@@ -80,7 +80,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video", type=Path, default=DEFAULT_VIDEO)
     parser.add_argument("--camera-ip", default="10.14.115.241")
     parser.add_argument("--rtsp-url", default=os.environ.get("AXIS_RTSP_URL", ""))
-    parser.add_argument("--codec", choices=("jpeg", "h264"), default="jpeg")
+    parser.add_argument("--codec", choices=("jpeg", "h264"), default="h264")
+    parser.add_argument("--camera-resolution", default="1920x1080")
     parser.add_argument("--camera-user", default=os.environ.get("AXIS_USER", ""))
     parser.add_argument("--camera-password", default=os.environ.get("AXIS_PASSWORD", ""))
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -88,11 +89,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--conf", type=float, default=0.50)
     parser.add_argument("--imgsz", type=int, default=960)
-    parser.add_argument("--capture-fps", type=float, default=15.0)
-    parser.add_argument("--process-fps", type=float, default=2.0)
+    parser.add_argument("--capture-fps", type=float, default=10.0)
+    parser.add_argument("--process-fps", type=float, default=10.0)
     parser.add_argument("--buffer-seconds", type=float, default=45.0)
     parser.add_argument("--record-seconds", type=float, default=8.0)
-    parser.add_argument("--record-fps", type=float, default=15.0)
+    parser.add_argument("--record-fps", type=float, default=10.0)
     parser.add_argument("--max-clips", type=int, default=100)
     parser.add_argument("--plc-enabled", action="store_true")
     parser.add_argument("--plc-endpoint", default=DEFAULT_ENDPOINT)
@@ -110,7 +111,11 @@ def build_rtsp_url(args: argparse.Namespace) -> str:
     auth = ""
     if args.camera_user and args.camera_password:
         auth = f"{args.camera_user}:{args.camera_password}@"
-    return f"rtsp://{auth}{args.camera_ip}/axis-media/media.amp?videocodec={args.codec}"
+    fps = max(1, int(round(float(args.capture_fps))))
+    return (
+        f"rtsp://{auth}{args.camera_ip}/axis-media/media.amp"
+        f"?videocodec={args.codec}&resolution={args.camera_resolution}&fps={fps}"
+    )
 
 
 def configure_vision_module(args: argparse.Namespace) -> None:
@@ -548,6 +553,23 @@ class ClipRecorder:
 
         snapshots.append(snapshot)
 
+    @staticmethod
+    def _sample_frames(frames: list[dict[str, Any]], fps: float, duration: float) -> list[dict[str, Any]]:
+        target_count = max(1, int(round(duration * fps)))
+        start_mono = float(frames[0]["monotonic"])
+        selected: list[dict[str, Any]] = []
+        frame_index = 0
+        for sample_index in range(target_count):
+            target_mono = start_mono + sample_index / fps
+            while frame_index + 1 < len(frames):
+                current_delta = abs(float(frames[frame_index]["monotonic"]) - target_mono)
+                next_delta = abs(float(frames[frame_index + 1]["monotonic"]) - target_mono)
+                if next_delta > current_delta:
+                    break
+                frame_index += 1
+            selected.append(frames[frame_index])
+        return selected
+
     def _record_clip(self, clip_index: int, event: dict[str, Any]) -> None:
         frames: list[dict[str, Any]] = []
         processing_snapshots: list[dict[str, Any]] = []
@@ -583,11 +605,12 @@ class ClipRecorder:
 
             first_frame = frames[0]["frame"]
             height, width = first_frame.shape[:2]
-            fps = float(self.args.record_fps or self.args.capture_fps or 15.0)
+            fps = float(self.args.record_fps or self.args.capture_fps or 10.0)
+            output_frames = self._sample_frames(frames, fps, float(self.args.record_seconds))
             writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
             if not writer.isOpened():
                 raise RuntimeError(f"Could not open VideoWriter: {video_path}")
-            for item in frames:
+            for item in output_frames:
                 frame = item["frame"]
                 if frame.shape[1] != width or frame.shape[0] != height:
                     frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
@@ -600,11 +623,12 @@ class ClipRecorder:
                 "event": event,
                 "record_seconds": float(self.args.record_seconds),
                 "video_fps": fps,
-                "frames_written": len(frames),
-                "first_frame_utc": frames[0]["utc"],
-                "last_frame_utc": frames[-1]["utc"],
-                "first_frame_index": int(frames[0]["index"]),
-                "last_frame_index": int(frames[-1]["index"]),
+                "frames_captured": len(frames),
+                "frames_written": len(output_frames),
+                "first_frame_utc": output_frames[0]["utc"],
+                "last_frame_utc": output_frames[-1]["utc"],
+                "first_frame_index": int(output_frames[0]["index"]),
+                "last_frame_index": int(output_frames[-1]["index"]),
                 "video_path": str(video_path),
                 "analysis_dir": str(analysis_dir),
                 "processing_snapshots": processing_snapshots,
@@ -868,7 +892,7 @@ async function refreshStatus() {
   }
 }
 
-setInterval(refreshFrame, 650);
+setInterval(refreshFrame, 100);
 setInterval(refreshStatus, 1000);
 refreshFrame();
 refreshStatus();

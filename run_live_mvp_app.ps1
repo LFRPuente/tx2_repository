@@ -53,14 +53,16 @@ if (-not $env:AXIS_PASSWORD) {
 & $pythonExe $scriptPath `
   --source rtsp `
   --camera-ip $cameraIp `
-  --codec jpeg `
+  --codec h264 `
+  --camera-resolution 1920x1080 `
   --output-dir $outputDir `
   --dataset-dir $datasetDir `
   --model $modelPath `
   --conf 0.50 `
-  --capture-fps 15 `
-  --process-fps 2 `
+  --capture-fps 10 `
+  --process-fps 10 `
   --record-seconds 8 `
+  --record-fps 10 `
   --max-clips 100 `
   --plc-enabled `
   --plc-edge rising `

@@ -66,8 +66,10 @@ http://127.0.0.1:8767
 ```
 
 The Live MVP provides a light interface with the live camera view and
-measurement diagram. It connects to the PLC through OPC UA and records one
-8-second clip when `MeasureLength` changes from `False` to `True`.
+measurement diagram. It keeps the AXIS stream at `1920x1080` and targets 10 FPS
+for capture, processing, browser updates, and saved clips. It connects to the
+PLC through OPC UA and records one 8-second clip when `MeasureLength` changes
+from `False` to `True`.
 
 Open the saved clip history at:
 
