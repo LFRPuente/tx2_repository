@@ -3,7 +3,7 @@ Live MVP for TX2 vision measurement.
 
 This app is intentionally separate from the existing React MVP. It runs a small
 Flask UI plus a background camera reader, live processor, optional PLC monitor,
-and PLC-triggered 10 second clip recorder.
+and PLC-triggered 8 second clip recorder.
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import os
+import sys
 import threading
 import time
 from collections import deque
@@ -22,14 +23,16 @@ from typing import Any
 
 import cv2
 import numpy as np
-from flask import Flask, jsonify, render_template_string
-
-import homography_web_app as vision
-
+from flask import Flask, abort, jsonify, render_template_string, send_file
 
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000")
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import homography_web_app as vision
+
 DEFAULT_VIDEO = Path(r"C:\Users\luis_\Downloads\20260508_000307_7F66.mkv")
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
 DEFAULT_DATASET_DIR = ROOT / "dataset"
@@ -52,8 +55,12 @@ def clean_value(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, bytes):
         return value.hex()
+    if isinstance(value, np.generic):
+        return value.item()
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
+    if isinstance(value, dict):
+        return {str(key): clean_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [clean_value(item) for item in value]
     return str(value)
@@ -84,15 +91,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-fps", type=float, default=15.0)
     parser.add_argument("--process-fps", type=float, default=2.0)
     parser.add_argument("--buffer-seconds", type=float, default=45.0)
-    parser.add_argument("--record-seconds", type=float, default=10.0)
+    parser.add_argument("--record-seconds", type=float, default=8.0)
     parser.add_argument("--record-fps", type=float, default=15.0)
+    parser.add_argument("--max-clips", type=int, default=100)
     parser.add_argument("--plc-enabled", action="store_true")
     parser.add_argument("--plc-endpoint", default=DEFAULT_ENDPOINT)
     parser.add_argument("--watchdog-node", default=DEFAULT_WATCHDOG_NODE)
     parser.add_argument("--event-node", default=DEFAULT_EVENT_NODE)
     parser.add_argument("--plc-poll-interval", type=float, default=0.01)
     parser.add_argument("--plc-timeout", type=float, default=8.0)
-    parser.add_argument("--plc-edge", choices=("changed", "rising", "falling", "any"), default="changed")
+    parser.add_argument("--plc-edge", choices=("changed", "rising", "falling", "any"), default="rising")
     return parser.parse_args()
 
 
@@ -129,7 +137,7 @@ def event_edge(previous: Any, current: Any) -> str:
 def edge_matches(configured: str, observed: str) -> bool:
     if not observed:
         return False
-    if configured == "any":
+    if configured in ("any", "changed"):
         return True
     return configured == observed
 
@@ -468,9 +476,10 @@ class LiveProcessor:
 
 
 class ClipRecorder:
-    def __init__(self, args: argparse.Namespace, buffer: FrameBuffer) -> None:
+    def __init__(self, args: argparse.Namespace, buffer: FrameBuffer, processor: LiveProcessor | None = None) -> None:
         self.args = args
         self.buffer = buffer
+        self.processor = processor
         self.lock = threading.Lock()
         self.recording = False
         self.clip_index = 0
@@ -499,8 +508,50 @@ class ClipRecorder:
         thread = threading.Thread(target=self._record_clip, args=(clip_index, event), daemon=True)
         thread.start()
 
+    def _capture_processing_snapshot(
+        self,
+        analysis_dir: Path,
+        snapshots: list[dict[str, Any]],
+        seen_frame_indices: set[int],
+    ) -> None:
+        if self.processor is None:
+            return
+        processor_data = self.processor.snapshot(include_images=True)
+        result = processor_data.get("result")
+        if not isinstance(result, dict):
+            return
+        frame_index = result.get("frame_index")
+        if frame_index is None:
+            return
+        frame_index = int(frame_index)
+        if frame_index in seen_frame_indices:
+            return
+        seen_frame_indices.add(frame_index)
+
+        snap_index = len(snapshots)
+        snapshot: dict[str, Any] = {
+            key: clean_value(value)
+            for key, value in result.items()
+            if key not in ("original_image", "rectified_image")
+        }
+        snapshot["snapshot_index"] = snap_index
+
+        for image_key, suffix in (("original_image", "original_overlay"), ("rectified_image", "rectified_overlay")):
+            image_b64 = result.get(image_key)
+            if not image_b64:
+                continue
+            image_name = f"analysis_{snap_index:03d}_{suffix}.jpg"
+            image_path = analysis_dir / image_name
+            image_path.write_bytes(base64.b64decode(str(image_b64)))
+            snapshot[f"{suffix}_path"] = str(image_path)
+            snapshot[f"{suffix}_file"] = image_name
+
+        snapshots.append(snapshot)
+
     def _record_clip(self, clip_index: int, event: dict[str, Any]) -> None:
         frames: list[dict[str, Any]] = []
+        processing_snapshots: list[dict[str, Any]] = []
+        seen_processing_frames: set[int] = set()
         start_mono = time.perf_counter()
         last_index = -1
         latest = self.buffer.latest()
@@ -508,20 +559,25 @@ class ClipRecorder:
             last_index = int(latest["index"]) - 1
 
         try:
+            day_dir = self.args.output_dir / "live_plc_clips" / datetime.now().strftime("%Y-%m-%d")
+            day_dir.mkdir(parents=True, exist_ok=True)
+            edge = event.get("event_edge") or "event"
+            base = f"live_{clip_index:04d}_{file_stamp()}_{edge}"
+            analysis_dir = day_dir / f"{base}_analysis"
+            analysis_dir.mkdir(parents=True, exist_ok=True)
+
             while time.perf_counter() - start_mono < float(self.args.record_seconds):
                 new_frames = self.buffer.frames_since(last_index)
                 if new_frames:
                     frames.extend(new_frames)
                     last_index = int(new_frames[-1]["index"])
+                self._capture_processing_snapshot(analysis_dir, processing_snapshots, seen_processing_frames)
                 time.sleep(0.025)
+            self._capture_processing_snapshot(analysis_dir, processing_snapshots, seen_processing_frames)
 
             if not frames:
                 raise RuntimeError("No frames were available to record the clip.")
 
-            day_dir = self.args.output_dir / "live_plc_clips" / datetime.now().strftime("%Y-%m-%d")
-            day_dir.mkdir(parents=True, exist_ok=True)
-            edge = event.get("event_edge") or "event"
-            base = f"live_{clip_index:04d}_{file_stamp()}_{edge}"
             video_path = day_dir / f"{base}.mp4"
             json_path = day_dir / f"{base}.json"
 
@@ -550,8 +606,12 @@ class ClipRecorder:
                 "first_frame_index": int(frames[0]["index"]),
                 "last_frame_index": int(frames[-1]["index"]),
                 "video_path": str(video_path),
+                "analysis_dir": str(analysis_dir),
+                "processing_snapshots": processing_snapshots,
+                "processing_snapshot_count": len(processing_snapshots),
             }
             json_path.write_text(json.dumps(sidecar, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._enforce_retention()
             with self.lock:
                 self.last_clip = sidecar
                 self.error = ""
@@ -561,6 +621,12 @@ class ClipRecorder:
         finally:
             with self.lock:
                 self.recording = False
+
+    def _enforce_retention(self) -> None:
+        max_clips = max(1, int(self.args.max_clips or 100))
+        sidecars = clip_sidecars(self.args.output_dir)
+        for json_path in sidecars[max_clips:]:
+            delete_clip_artifacts(self.args.output_dir, json_path)
 
 
 class PLCMonitor:
@@ -672,40 +738,42 @@ HTML = r"""
 <title>TX2 Live MVP</title>
 <style>
 :root {
-  color: #e7ece9;
-  background: #111619;
+  color: #172025;
+  background: #f5f7f8;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; min-height: 100vh; background: #111619; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: #f5f7f8; }
 .app { width: min(1760px, calc(100vw - 24px)); margin: 0 auto; padding: 14px 0 18px; }
 .topbar { display: flex; align-items: end; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
 h1, h2, p { margin: 0; letter-spacing: 0; }
 h1 { font-size: 27px; line-height: 1.05; }
 h2 { font-size: 16px; }
-.eyebrow { color: #8ca09a; font-size: 12px; font-weight: 800; text-transform: uppercase; margin-bottom: 4px; }
-.pill { border: 1px solid #334148; border-radius: 999px; padding: 8px 12px; color: #aebdb8; background: #172025; font-weight: 800; white-space: nowrap; }
-.pill.ok { border-color: #2c755b; color: #9df2c8; background: #10241c; }
-.pill.warn { border-color: #8e6b2f; color: #ffd88e; background: #271f11; }
-.pill.err { border-color: #8d3b3b; color: #ffb7b7; background: #2a1515; }
-.metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
-.metric { border: 1px solid #27333a; border-radius: 8px; background: #172025; padding: 11px; min-height: 70px; }
-.metric span { display: block; color: #90a19b; font-size: 12px; font-weight: 800; }
-.metric strong { display: block; margin-top: 6px; color: #f4f8f5; font-size: 22px; line-height: 1.05; overflow-wrap: anywhere; }
-.metric.total strong { color: #78e2ad; }
-.metric.ref strong { color: #f1bc64; }
-.grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, .9fr); gap: 12px; align-items: start; }
-.panel { border: 1px solid #27333a; border-radius: 8px; background: #172025; overflow: hidden; box-shadow: 0 16px 32px rgba(0,0,0,.22); }
-.panel-head { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #27333a; }
-.stage { display: grid; place-items: center; min-height: 300px; background: #050708; }
+.eyebrow { color: #68787f; font-size: 12px; font-weight: 800; text-transform: uppercase; margin-bottom: 4px; }
+.pill { border: 1px solid #cbd5da; border-radius: 999px; padding: 8px 12px; color: #485960; background: #ffffff; font-weight: 800; white-space: nowrap; }
+.pill.ok { border-color: #58a680; color: #14784f; background: #ecfff5; }
+.pill.warn { border-color: #d7a34d; color: #8a5a0a; background: #fff7e5; }
+.pill.err { border-color: #d48282; color: #a23232; background: #fff0f0; }
+.nav { display: flex; align-items: center; gap: 10px; }
+.nav a { border: 1px solid #cbd5da; border-radius: 8px; padding: 9px 12px; color: #172025; background: #ffffff; text-decoration: none; font-weight: 900; }
+.metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
+.metric { border: 1px solid #d8e0e4; border-radius: 8px; background: #ffffff; padding: 11px; min-height: 70px; box-shadow: 0 8px 18px rgba(23,32,37,.06); }
+.metric span { display: block; color: #68787f; font-size: 12px; font-weight: 800; }
+.metric strong { display: block; margin-top: 6px; color: #172025; font-size: 22px; line-height: 1.05; overflow-wrap: anywhere; }
+.metric.total strong { color: #18845a; }
+.metric.ref strong { color: #a86817; }
+.grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(360px, .75fr); gap: 12px; align-items: start; }
+.panel { border: 1px solid #d8e0e4; border-radius: 8px; background: #ffffff; overflow: hidden; box-shadow: 0 14px 28px rgba(23,32,37,.08); }
+.panel-head { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #d8e0e4; }
+.stage { display: grid; place-items: center; min-height: 300px; background: #eef2f4; }
 .stage img { display: block; width: 100%; height: auto; max-height: calc(100vh - 260px); object-fit: contain; }
 .side { display: grid; gap: 12px; }
 .diagram { width: 100%; height: auto; display: block; background: #f7faf8; }
-.log { padding: 12px; display: grid; gap: 8px; color: #bdc9c5; font-size: 13px; }
-.row { display: flex; justify-content: space-between; gap: 14px; border-bottom: 1px solid rgba(255,255,255,.06); padding-bottom: 7px; }
+.log { padding: 12px; display: grid; gap: 8px; color: #506168; font-size: 13px; }
+.row { display: flex; justify-content: space-between; gap: 14px; border-bottom: 1px solid rgba(23,32,37,.08); padding-bottom: 7px; }
 .row:last-child { border-bottom: 0; padding-bottom: 0; }
-.row strong { color: #f3f7f5; text-align: right; overflow-wrap: anywhere; }
-.empty { color: #8ca09a; font-weight: 800; padding: 44px 12px; text-align: center; }
+.row strong { color: #172025; text-align: right; overflow-wrap: anywhere; }
+.empty { color: #68787f; font-weight: 800; padding: 44px 12px; text-align: center; }
 @media (max-width: 1150px) {
   .grid { grid-template-columns: 1fr; }
   .metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -723,14 +791,16 @@ h2 { font-size: 16px; }
       <p class="eyebrow">TX2 Vision</p>
       <h1>Live MVP</h1>
     </div>
-    <div id="top-state" class="pill warn">connecting...</div>
+    <div class="nav">
+      <a href="/history">History</a>
+      <div id="top-state" class="pill warn">connecting...</div>
+    </div>
   </header>
 
   <section class="metrics">
     <div class="metric total"><span>Total measurement</span><strong id="m-total">-</strong></div>
     <div class="metric ref"><span>Distance to REF</span><strong id="m-delta">-</strong></div>
     <div class="metric"><span>YOLO</span><strong id="m-yolo">-</strong></div>
-    <div class="metric"><span>Frame</span><strong id="m-frame">-</strong></div>
     <div class="metric"><span>PLC</span><strong id="m-plc">-</strong></div>
     <div class="metric"><span>Recorder</span><strong id="m-rec">-</strong></div>
   </section>
@@ -747,52 +817,23 @@ h2 { font-size: 16px; }
       <div class="stage" id="original-stage"><div class="empty">Waiting for frame...</div></div>
     </section>
 
-    <div class="side">
-      <section class="panel">
-        <div class="panel-head">
-          <div>
-            <p class="eyebrow">Warp</p>
-            <h2>Rectified ROI + YOLO/Sobel</h2>
-          </div>
-          <span id="processor-state" class="pill">-</span>
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Diagram</p>
+          <h2>Reference vs front edge</h2>
         </div>
-        <div class="stage" id="rectified-stage"><div class="empty">Waiting for processing...</div></div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head">
-          <div>
-            <p class="eyebrow">Diagram</p>
-            <h2>Reference vs front edge</h2>
-          </div>
-        </div>
-        <svg class="diagram" viewBox="0 0 760 310" role="img" aria-label="Measurement diagram">
-          <rect x="38" y="34" width="684" height="232" rx="8" fill="#f7faf8" stroke="#cbd6cf" stroke-width="2" />
-          <rect x="86" y="82" width="588" height="132" rx="6" fill="#e5ece8" stroke="#c0cbc6" />
-          <line x1="92" x2="668" y1="156" y2="156" stroke="#d28230" stroke-width="5" stroke-linecap="round" stroke-dasharray="12 9" />
-          <text x="104" y="184" fill="#a66324" font-size="20" font-weight="900">REF</text>
-          <line id="diagram-front" x1="92" x2="668" y1="205" y2="205" stroke="#28a96e" stroke-width="7" stroke-linecap="round" />
-          <text id="diagram-label" x="104" y="235" fill="#14784f" font-size="20" font-weight="900">front</text>
-          <line id="diagram-measure" x1="700" x2="700" y1="156" y2="205" stroke="#243c48" stroke-width="3" stroke-dasharray="8 7" />
-        </svg>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head">
-          <div>
-            <p class="eyebrow">Status</p>
-            <h2>Backend live</h2>
-          </div>
-        </div>
-        <div class="log">
-          <div class="row"><span>Source</span><strong id="s-source">-</strong></div>
-          <div class="row"><span>Latest processing</span><strong id="s-processed">-</strong></div>
-          <div class="row"><span>PLC event</span><strong id="s-event">-</strong></div>
-          <div class="row"><span>Latest clip</span><strong id="s-clip">-</strong></div>
-          <div class="row"><span>Error</span><strong id="s-error">-</strong></div>
-        </div>
-      </section>
-    </div>
+      </div>
+      <svg class="diagram" viewBox="0 0 760 310" role="img" aria-label="Measurement diagram">
+        <rect x="38" y="34" width="684" height="232" rx="8" fill="#f7faf8" stroke="#cbd6cf" stroke-width="2" />
+        <rect x="86" y="82" width="588" height="132" rx="6" fill="#e5ece8" stroke="#c0cbc6" />
+        <line x1="92" x2="668" y1="156" y2="156" stroke="#d28230" stroke-width="5" stroke-linecap="round" stroke-dasharray="12 9" />
+        <text x="104" y="184" fill="#a66324" font-size="20" font-weight="900">REF</text>
+        <line id="diagram-front" x1="92" x2="668" y1="205" y2="205" stroke="#28a96e" stroke-width="7" stroke-linecap="round" />
+        <text id="diagram-label" x="104" y="235" fill="#14784f" font-size="20" font-weight="900">front</text>
+        <line id="diagram-measure" x1="700" x2="700" y1="156" y2="205" stroke="#243c48" stroke-width="3" stroke-dasharray="8 7" />
+      </svg>
+    </section>
   </main>
 </div>
 
@@ -841,15 +882,13 @@ async function refreshFrame() {
     const result = data.result;
     if (!result) return;
     setImage($('original-stage'), result.original_image, 'Live camera');
-    setImage($('rectified-stage'), result.rectified_image, 'Rectified live camera');
     const measurement = result.measurement;
     $('m-total').textContent = measurement ? `${fmt(measurement.measurement_in)} in` : '-';
     $('m-delta').textContent = measurement ? `${fmt(measurement.delta_in)} in` : '-';
     $('m-yolo').textContent = `${result.count || 0}`;
-    $('m-frame').textContent = result.frame_index ?? '-';
     updateDiagram(result.front_y_ratio);
   } catch (err) {
-    $('s-error').textContent = err.message || String(err);
+    pill($('top-state'), 'frame error', 'err');
   }
 }
 
@@ -865,19 +904,10 @@ async function refreshStatus() {
     const healthy = camera.connected && processor.ok;
     pill($('top-state'), healthy ? 'live' : 'check status', healthy ? 'ok' : 'warn');
     pill($('camera-state'), camera.connected ? 'connected' : 'no source', camera.connected ? 'ok' : 'err');
-    pill($('processor-state'), processor.processing ? 'processing' : (processor.ok ? 'ok' : 'error'), processor.ok ? 'ok' : 'warn');
     $('m-plc').textContent = plc.enabled ? (plc.connected ? 'OK' : 'OFF') : 'disabled';
     $('m-rec').textContent = recorder.recording ? 'recording' : 'ready';
-    $('s-source').textContent = camera.source_label || '-';
-    $('s-processed').textContent = processor.last_duration_ms ? `${processor.last_duration_ms} ms` : '-';
-    const lastEvent = plc.last_event;
-    $('s-event').textContent = lastEvent ? `${lastEvent.value} @ ${lastEvent.source_timestamp || lastEvent.read_utc || '-'}` : '-';
-    const clip = recorder.last_clip;
-    $('s-clip').textContent = clip ? `${clip.frames_written} frames` : '-';
-    $('s-error').textContent = camera.error || processor.error || plc.error || recorder.error || '-';
   } catch (err) {
     pill($('top-state'), 'error', 'err');
-    $('s-error').textContent = err.message || String(err);
   }
 }
 
@@ -885,6 +915,160 @@ setInterval(refreshFrame, 650);
 setInterval(refreshStatus, 1000);
 refreshFrame();
 refreshStatus();
+</script>
+</body>
+</html>
+"""
+
+
+HISTORY_HTML = r"""
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TX2 Clip History</title>
+<style>
+:root { color: #172025; background: #f5f7f8; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: #f5f7f8; }
+.app { width: min(1500px, calc(100vw - 24px)); margin: 0 auto; padding: 14px 0 22px; }
+.topbar { display: flex; align-items: end; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
+h1, h2, p { margin: 0; letter-spacing: 0; }
+h1 { font-size: 27px; line-height: 1.05; }
+h2 { font-size: 16px; }
+.eyebrow { color: #68787f; font-size: 12px; font-weight: 800; text-transform: uppercase; margin-bottom: 4px; }
+.nav a, .btn { border: 1px solid #cbd5da; border-radius: 8px; padding: 9px 12px; color: #172025; background: #ffffff; text-decoration: none; font-weight: 900; cursor: pointer; }
+.grid { display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 12px; align-items: start; }
+.panel { border: 1px solid #d8e0e4; border-radius: 8px; background: #ffffff; overflow: hidden; box-shadow: 0 14px 28px rgba(23,32,37,.08); }
+.panel-head { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #d8e0e4; }
+.list { display: grid; max-height: calc(100vh - 120px); overflow: auto; }
+.clip { display: grid; gap: 5px; padding: 11px 12px; color: #2c3a40; background: transparent; border: 0; border-bottom: 1px solid rgba(23,32,37,.08); text-align: left; cursor: pointer; }
+.clip:hover, .clip.active { background: #edf5f8; }
+.clip strong { color: #172025; overflow-wrap: anywhere; }
+.clip span { color: #68787f; font-size: 12px; font-weight: 800; }
+.viewer { padding: 12px; display: grid; gap: 12px; }
+video, img { display: block; width: 100%; border-radius: 8px; background: #eef2f4; }
+.meta { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.metric { border: 1px solid #d8e0e4; border-radius: 8px; background: #ffffff; padding: 10px; min-height: 62px; }
+.metric span { display: block; color: #68787f; font-size: 12px; font-weight: 800; }
+.metric strong { display: block; margin-top: 5px; color: #172025; font-size: 18px; overflow-wrap: anywhere; }
+.snapshots { display: grid; gap: 10px; }
+.snapshot { border: 1px solid #d8e0e4; border-radius: 8px; overflow: hidden; background: #ffffff; }
+.snapshot-head { display: flex; justify-content: space-between; gap: 10px; padding: 9px 10px; border-bottom: 1px solid rgba(23,32,37,.08); color: #3c4d54; font-size: 13px; font-weight: 900; }
+.snapshot-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 8px; }
+.empty { color: #68787f; font-weight: 800; padding: 44px 12px; text-align: center; }
+@media (max-width: 980px) { .grid { grid-template-columns: 1fr; } .meta { grid-template-columns: repeat(2, minmax(0, 1fr)); } .snapshot-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">TX2 Vision</p>
+      <h1>Video history</h1>
+    </div>
+    <div class="nav"><a href="/">Live</a></div>
+  </header>
+  <main class="grid">
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">PLC clips</p>
+          <h2 id="clip-count">Loading...</h2>
+        </div>
+      </div>
+      <div class="list" id="clip-list"><div class="empty">Loading clips...</div></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Replay</p>
+          <h2 id="detail-title">Select a clip</h2>
+        </div>
+      </div>
+      <div class="viewer" id="viewer"><div class="empty">Select a saved PLC clip.</div></div>
+    </section>
+  </main>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (value, digits = 3) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(digits) : '-';
+};
+let activeClip = '';
+const initialClipId = location.pathname.startsWith('/history/') ? decodeURIComponent(location.pathname.split('/').pop() || '') : '';
+
+function clipLabel(clip) {
+  return clip.saved_at || clip.first_frame_utc || clip.clip_id;
+}
+
+function metric(label, value) {
+  return `<div class="metric"><span>${label}</span><strong>${value ?? '-'}</strong></div>`;
+}
+
+function renderSnapshots(snapshots) {
+  if (!snapshots || !snapshots.length) return '<div class="empty">No processing snapshots saved for this clip.</div>';
+  return `<div class="snapshots">${snapshots.map((snap) => {
+    const measurement = snap.measurement || {};
+    const total = measurement.measurement_in != null ? `${fmt(measurement.measurement_in)} in` : '-';
+    const delta = measurement.delta_in != null ? `${fmt(measurement.delta_in)} in` : '-';
+    return `<article class="snapshot">
+      <div class="snapshot-head">
+        <span>${snap.processed_utc || snap.frame_utc || '-'}</span>
+        <span>YOLO ${snap.count ?? 0} | Total ${total} | REF ${delta}</span>
+      </div>
+      <div class="snapshot-grid">
+        ${snap.original_overlay_url ? `<img src="${snap.original_overlay_url}" alt="Original overlay">` : '<div class="empty">No original overlay</div>'}
+        ${snap.rectified_overlay_url ? `<img src="${snap.rectified_overlay_url}" alt="Rectified overlay">` : '<div class="empty">No rectified overlay</div>'}
+      </div>
+    </article>`;
+  }).join('')}</div>`;
+}
+
+async function loadClip(clipId) {
+  activeClip = clipId;
+  document.querySelectorAll('.clip').forEach((el) => el.classList.toggle('active', el.dataset.clipId === clipId));
+  const response = await fetch(`/api/live/clips/${clipId}`);
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Could not load clip');
+  $('detail-title').textContent = data.clip_id;
+  $('viewer').innerHTML = `
+    <video controls src="${data.video_url}"></video>
+    <div class="meta">
+      ${metric('Saved', data.saved_at || '-')}
+      ${metric('Duration', `${data.record_seconds ?? '-'} s`)}
+      ${metric('PLC edge', data.event?.event_edge || '-')}
+      ${metric('Snapshots', data.processing_snapshot_count ?? 0)}
+    </div>
+    ${renderSnapshots(data.processing_snapshots)}
+  `;
+}
+
+async function loadHistory() {
+  const response = await fetch('/api/live/clips');
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Could not load history');
+  $('clip-count').textContent = `${data.count} saved clips`;
+  if (!data.clips.length) {
+    $('clip-list').innerHTML = '<div class="empty">No PLC videos saved yet.</div>';
+    return;
+  }
+  $('clip-list').innerHTML = data.clips.map((clip) => `
+    <button class="clip" data-clip-id="${clip.clip_id}">
+      <strong>${clipLabel(clip)}</strong>
+      <span>${clip.record_seconds ?? '-'} s | ${clip.processing_snapshot_count ?? 0} snapshots | ${clip.event?.event_edge || 'event'}</span>
+    </button>
+  `).join('');
+  document.querySelectorAll('.clip').forEach((button) => button.addEventListener('click', () => loadClip(button.dataset.clipId)));
+  const initial = data.clips.find((clip) => clip.clip_id === initialClipId) || data.clips[0];
+  loadClip(initial.clip_id);
+}
+
+loadHistory().catch((err) => {
+  $('clip-list').innerHTML = `<div class="empty">${err.message || err}</div>`;
+});
 </script>
 </body>
 </html>
@@ -900,9 +1084,88 @@ _recorder: ClipRecorder
 _plc: PLCMonitor
 
 
+def clips_root(output_dir: Path) -> Path:
+    return output_dir / "live_plc_clips"
+
+
+def clip_sidecars(output_dir: Path) -> list[Path]:
+    root = clips_root(output_dir)
+    if not root.exists():
+        return []
+    return sorted(root.rglob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def path_is_inside(path: Path, root: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        resolved_root = root.resolve()
+    except Exception:
+        return False
+    return resolved == resolved_root or resolved_root in resolved.parents
+
+
+def read_clip_sidecar(json_path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    data["clip_id"] = json_path.stem
+    data["json_path"] = str(json_path)
+    data["video_url"] = f"/api/live/clips/{json_path.stem}/video"
+    data["detail_url"] = f"/history/{json_path.stem}"
+    for snapshot in data.get("processing_snapshots", []) or []:
+        if snapshot.get("original_overlay_file"):
+            snapshot["original_overlay_url"] = f"/api/live/clips/{json_path.stem}/asset/{snapshot['original_overlay_file']}"
+        if snapshot.get("rectified_overlay_file"):
+            snapshot["rectified_overlay_url"] = f"/api/live/clips/{json_path.stem}/asset/{snapshot['rectified_overlay_file']}"
+    return data
+
+
+def find_clip_json(clip_id: str) -> Path | None:
+    for json_path in clip_sidecars(_args.output_dir):
+        if json_path.stem == clip_id:
+            return json_path
+    return None
+
+
+def delete_clip_artifacts(output_dir: Path, json_path: Path) -> None:
+    root = clips_root(output_dir)
+    data = read_clip_sidecar(json_path) or {}
+    candidates: list[Path] = [json_path]
+    for key in ("video_path", "analysis_dir"):
+        value = data.get(key)
+        if value:
+            candidates.append(Path(value))
+    for candidate in candidates:
+        if not path_is_inside(candidate, root):
+            continue
+        try:
+            if candidate.is_dir():
+                for child in sorted(candidate.rglob("*"), reverse=True):
+                    if child.is_file():
+                        child.unlink(missing_ok=True)
+                    elif child.is_dir():
+                        child.rmdir()
+                candidate.rmdir()
+            else:
+                candidate.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 @app.route("/")
 def index():
     return render_template_string(HTML)
+
+
+@app.route("/history")
+def history():
+    return render_template_string(HISTORY_HTML)
+
+
+@app.route("/history/<clip_id>")
+def history_clip(clip_id: str):
+    return render_template_string(HISTORY_HTML)
 
 
 @app.route("/api/live/status")
@@ -925,15 +1188,48 @@ def api_live_frame():
 
 @app.route("/api/live/clips")
 def api_live_clips():
-    clips_dir = _args.output_dir / "live_plc_clips"
     clips = []
-    if clips_dir.exists():
-        for json_path in sorted(clips_dir.rglob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True):
-            try:
-                clips.append(json.loads(json_path.read_text(encoding="utf-8")))
-            except Exception:
-                continue
+    for json_path in clip_sidecars(_args.output_dir):
+        data = read_clip_sidecar(json_path)
+        if data is not None:
+            clips.append(data)
     return jsonify(clips=clips[:100], count=len(clips))
+
+
+@app.route("/api/live/clips/<clip_id>")
+def api_live_clip(clip_id: str):
+    json_path = find_clip_json(clip_id)
+    if json_path is None:
+        return jsonify(error="Clip not found"), 404
+    data = read_clip_sidecar(json_path)
+    if data is None:
+        return jsonify(error="Clip metadata could not be read"), 500
+    return jsonify(data)
+
+
+@app.route("/api/live/clips/<clip_id>/video")
+def api_live_clip_video(clip_id: str):
+    json_path = find_clip_json(clip_id)
+    if json_path is None:
+        abort(404)
+    data = read_clip_sidecar(json_path) or {}
+    video_path = Path(str(data.get("video_path", "")))
+    if not video_path.exists() or not path_is_inside(video_path, clips_root(_args.output_dir)):
+        abort(404)
+    return send_file(video_path, mimetype="video/mp4", conditional=True)
+
+
+@app.route("/api/live/clips/<clip_id>/asset/<path:asset_name>")
+def api_live_clip_asset(clip_id: str, asset_name: str):
+    json_path = find_clip_json(clip_id)
+    if json_path is None:
+        abort(404)
+    data = read_clip_sidecar(json_path) or {}
+    analysis_dir = Path(str(data.get("analysis_dir", "")))
+    asset_path = analysis_dir / asset_name
+    if not asset_path.exists() or not path_is_inside(asset_path, analysis_dir) or not path_is_inside(asset_path, clips_root(_args.output_dir)):
+        abort(404)
+    return send_file(asset_path, mimetype="image/jpeg", conditional=True)
 
 
 def main() -> int:
@@ -945,7 +1241,7 @@ def main() -> int:
     _buffer = FrameBuffer(maxlen=buffer_len)
     _camera = CameraReader(_args, _buffer)
     _processor = LiveProcessor(_args, _buffer)
-    _recorder = ClipRecorder(_args, _buffer)
+    _recorder = ClipRecorder(_args, _buffer, _processor)
     _plc = PLCMonitor(_args, _recorder)
 
     _camera.start()

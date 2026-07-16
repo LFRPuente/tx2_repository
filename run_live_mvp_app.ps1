@@ -44,5 +44,8 @@ if (-not $pythonExe) {
   --conf 0.50 `
   --capture-fps 15 `
   --process-fps 2 `
-  --record-seconds 10 `
+  --record-seconds 8 `
+  --max-clips 100 `
+  --plc-enabled `
+  --plc-edge rising `
   --port 8767

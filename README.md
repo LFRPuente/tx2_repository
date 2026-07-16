@@ -5,11 +5,15 @@ Tools and MVP applications for TX2 piece-front measurement from video.
 ## Main Pieces
 
 - `homography_web_app.py`: Flask tool for homography, YOLO annotation, measurement calibration, Sobel front detection, and frame review.
+- `live_mvp_app.py`: live Flask MVP with AXIS video, PLC-triggered recording, measurement processing, and clip history.
 - `mvp_react_app/`: React/Vite MVP showing the simplified measurement view with the real video overlay and a diagram.
 - `yolo_roi_sobel_projection.py`: YOLO ROI plus Sobel Y projection analysis.
 - `tools/plc_timestamp_probe.ipynb`: notebook to probe PLC/OPC UA timestamp tags from the VPN.
 - `tools/plc_vision_plain_test.py`: notebook-free PLC/OPC UA smoke test for `MeasureLength` and `VisionWD`.
 - `tools/plc_cut_sync_monitor.py`: synchronizes reads to `VisionWD` changes and logs `MeasureLength` edges for cut/measure timing.
+- `tools/axis_camera_viewer.py`: opens the live AXIS camera stream through RTSP.
+- `tools/axis_live_processor.py`: runs the live AXIS stream through the same homography, YOLO, Sobel, and measurement pipeline used by the app.
+- `tools/plc_triggered_video_recorder.py`: records AXIS RTSP clips when the PLC cut/measure tag changes.
 - `dataset/` and `dataset_yolo11/`: curated YOLO annotation datasets.
 - `runs/detect/runs_tx2/yolo11n_tubos_v1/weights/best.pt`: trained model used by the local app.
 
@@ -43,6 +47,89 @@ Then open:
 
 ```text
 http://127.0.0.1:5173
+```
+
+## Run The Live MVP
+
+Configure the AXIS credentials in the terminal that will launch the app:
+
+```powershell
+$env:AXIS_USER="your-user"
+$env:AXIS_PASSWORD="your-password"
+.\run_live_mvp_app.ps1
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8767
+```
+
+The Live MVP provides a light interface with the live camera view and
+measurement diagram. It connects to the PLC through OPC UA and records one
+8-second clip when `MeasureLength` changes from `False` to `True`.
+
+Open the saved clip history at:
+
+```text
+http://127.0.0.1:8767/history
+```
+
+Each history entry contains the MP4, PLC event metadata, processing snapshots,
+and the overlays produced while the clip was recorded. The app retains the 100
+most recent clips and removes older clip artifacts automatically.
+
+Live MVP data is stored directly under:
+
+```text
+outputs/live_plc_clips/<date>/
+```
+
+Storage currently uses MP4, JSON, and JPEG files. SQLite is not used.
+
+## AXIS Live Camera
+
+The AXIS cameras at `10.14.115.74` and `10.14.115.75` expose the standard
+RTSP endpoint, but require Digest authentication.
+
+Open a raw live view:
+
+```powershell
+$env:AXIS_USER="user"
+$env:AXIS_PASSWORD="password"
+python tools\axis_camera_viewer.py --ip 10.14.115.74
+```
+
+Run the live stream through the TX2 processing pipeline:
+
+```powershell
+$env:AXIS_USER="user"
+$env:AXIS_PASSWORD="password"
+python tools\axis_live_processor.py --ip 10.14.115.74 --output-dir outputs
+```
+
+If inference falls behind the stream, process every third frame:
+
+```powershell
+python tools\axis_live_processor.py --ip 10.14.115.74 --output-dir outputs --process-every 3
+```
+
+## PLC Triggered Video Clips
+
+Record the live AXIS stream around each PLC cut/measure event. The script keeps
+a pre-roll buffer, waits for the configured OPC UA tag edge, then writes an MP4
+clip plus a JSON sidecar with PLC and frame timestamps.
+
+```powershell
+$env:AXIS_USER="your-user"
+$env:AXIS_PASSWORD="your-password"
+python tools\plc_triggered_video_recorder.py --ip 10.14.115.241 --edge rising --pre-seconds 3 --post-seconds 3
+```
+
+Clips are saved under:
+
+```text
+outputs/plc_cut_clips/
 ```
 
 ## PLC Timestamp Notebook
