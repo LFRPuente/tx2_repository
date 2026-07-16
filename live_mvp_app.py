@@ -756,12 +756,6 @@ h2 { font-size: 16px; }
 .pill.err { border-color: #d48282; color: #a23232; background: #fff0f0; }
 .nav { display: flex; align-items: center; gap: 10px; }
 .nav a { border: 1px solid #cbd5da; border-radius: 8px; padding: 9px 12px; color: #172025; background: #ffffff; text-decoration: none; font-weight: 900; }
-.metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
-.metric { border: 1px solid #d8e0e4; border-radius: 8px; background: #ffffff; padding: 11px; min-height: 70px; box-shadow: 0 8px 18px rgba(23,32,37,.06); }
-.metric span { display: block; color: #68787f; font-size: 12px; font-weight: 800; }
-.metric strong { display: block; margin-top: 6px; color: #172025; font-size: 22px; line-height: 1.05; overflow-wrap: anywhere; }
-.metric.total strong { color: #18845a; }
-.metric.ref strong { color: #a86817; }
 .grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(360px, .75fr); gap: 12px; align-items: start; }
 .panel { border: 1px solid #d8e0e4; border-radius: 8px; background: #ffffff; overflow: hidden; box-shadow: 0 14px 28px rgba(23,32,37,.08); }
 .panel-head { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #d8e0e4; }
@@ -776,10 +770,8 @@ h2 { font-size: 16px; }
 .empty { color: #68787f; font-weight: 800; padding: 44px 12px; text-align: center; }
 @media (max-width: 1150px) {
   .grid { grid-template-columns: 1fr; }
-  .metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 @media (max-width: 680px) {
-  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .topbar { align-items: start; flex-direction: column; }
 }
 </style>
@@ -797,33 +789,12 @@ h2 { font-size: 16px; }
     </div>
   </header>
 
-  <section class="metrics">
-    <div class="metric total"><span>Total measurement</span><strong id="m-total">-</strong></div>
-    <div class="metric ref"><span>Distance to REF</span><strong id="m-delta">-</strong></div>
-    <div class="metric"><span>YOLO</span><strong id="m-yolo">-</strong></div>
-    <div class="metric"><span>PLC</span><strong id="m-plc">-</strong></div>
-    <div class="metric"><span>Recorder</span><strong id="m-rec">-</strong></div>
-  </section>
-
   <main class="grid">
     <section class="panel">
-      <div class="panel-head">
-        <div>
-          <p class="eyebrow">Camera / video</p>
-          <h2>Live image with overlay</h2>
-        </div>
-        <span id="camera-state" class="pill">-</span>
-      </div>
       <div class="stage" id="original-stage"><div class="empty">Waiting for frame...</div></div>
     </section>
 
     <section class="panel">
-      <div class="panel-head">
-        <div>
-          <p class="eyebrow">Diagram</p>
-          <h2>Reference vs front edge</h2>
-        </div>
-      </div>
       <svg class="diagram" viewBox="0 0 760 310" role="img" aria-label="Measurement diagram">
         <rect x="38" y="34" width="684" height="232" rx="8" fill="#f7faf8" stroke="#cbd6cf" stroke-width="2" />
         <rect x="86" y="82" width="588" height="132" rx="6" fill="#e5ece8" stroke="#c0cbc6" />
@@ -839,11 +810,6 @@ h2 { font-size: 16px; }
 
 <script>
 const $ = (id) => document.getElementById(id);
-
-function fmt(value, digits = 3) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n.toFixed(digits) : '-';
-}
 
 function setImage(stage, b64, alt) {
   if (!b64) {
@@ -882,10 +848,6 @@ async function refreshFrame() {
     const result = data.result;
     if (!result) return;
     setImage($('original-stage'), result.original_image, 'Live camera');
-    const measurement = result.measurement;
-    $('m-total').textContent = measurement ? `${fmt(measurement.measurement_in)} in` : '-';
-    $('m-delta').textContent = measurement ? `${fmt(measurement.delta_in)} in` : '-';
-    $('m-yolo').textContent = `${result.count || 0}`;
     updateDiagram(result.front_y_ratio);
   } catch (err) {
     pill($('top-state'), 'frame error', 'err');
@@ -899,13 +861,8 @@ async function refreshStatus() {
     if (!response.ok) throw new Error(data.error || 'status error');
     const camera = data.camera || {};
     const processor = data.processor || {};
-    const plc = data.plc || {};
-    const recorder = data.recorder || {};
     const healthy = camera.connected && processor.ok;
     pill($('top-state'), healthy ? 'live' : 'check status', healthy ? 'ok' : 'warn');
-    pill($('camera-state'), camera.connected ? 'connected' : 'no source', camera.connected ? 'ok' : 'err');
-    $('m-plc').textContent = plc.enabled ? (plc.connected ? 'OK' : 'OFF') : 'disabled';
-    $('m-rec').textContent = recorder.recording ? 'recording' : 'ready';
   } catch (err) {
     pill($('top-state'), 'error', 'err');
   }
