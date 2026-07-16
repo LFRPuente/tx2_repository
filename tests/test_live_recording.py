@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 import cv2
 import numpy as np
 
-from live_mvp_app import ClipRecorder, FrameBuffer
+from live_mvp_app import HTML, ClipRecorder, FrameBuffer
 from tools.plc_triggered_video_recorder import edge_matches
 
 
@@ -46,6 +46,11 @@ class PlcEdgeTests(unittest.TestCase):
         self.assertTrue(edge_matches("rising", "changed"))
         self.assertTrue(edge_matches("falling", "changed"))
         self.assertFalse(edge_matches("", "changed"))
+
+    def test_live_ui_exposes_plc_signal_state(self) -> None:
+        self.assertIn('id="plc-signal"', HTML)
+        self.assertIn("plc.last_trigger", HTML)
+        self.assertIn("PLC signal received", HTML)
 
 
 class ClipRecorderTests(unittest.TestCase):

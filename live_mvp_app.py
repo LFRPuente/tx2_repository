@@ -699,6 +699,7 @@ class PLCMonitor:
             "events_found": 0,
             "last_watchdog": None,
             "last_event": None,
+            "last_trigger": None,
             "last_read_utc": None,
         }
 
@@ -776,6 +777,7 @@ class PLCMonitor:
                     }
                     if edge_matches(self.args.plc_edge, edge):
                         updates["events_found"] = int(self.state.get("events_found", 0)) + 1
+                        updates["last_trigger"] = row
                         self.recorder.start_event_clip(row)
                     self._set_state(**updates)
                     previous_watchdog = watchdog_value
@@ -808,8 +810,17 @@ h2 { font-size: 16px; }
 .pill.ok { border-color: #58a680; color: #14784f; background: #ecfff5; }
 .pill.warn { border-color: #d7a34d; color: #8a5a0a; background: #fff7e5; }
 .pill.err { border-color: #d48282; color: #a23232; background: #fff0f0; }
-.nav { display: flex; align-items: center; gap: 10px; }
+.nav { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .nav a { border: 1px solid #cbd5da; border-radius: 8px; padding: 9px 12px; color: #172025; background: #ffffff; text-decoration: none; font-weight: 900; }
+.plc-signal { min-height: 36px; display: inline-flex; align-items: center; gap: 8px; border: 1px solid #cbd5da; border-radius: 8px; padding: 7px 10px; color: #586970; background: #ffffff; font-size: 13px; font-weight: 800; white-space: nowrap; }
+.plc-signal .dot { width: 9px; height: 9px; border-radius: 50%; background: #9aa8ae; box-shadow: 0 0 0 3px rgba(154,168,174,.16); }
+.plc-signal.seen { border-color: #84bda3; color: #14784f; background: #f4fff9; }
+.plc-signal.seen .dot { background: #229966; box-shadow: 0 0 0 3px rgba(34,153,102,.16); }
+.plc-signal.received { border-color: #229966; color: #0f6945; background: #e7fff2; }
+.plc-signal.received .dot { background: #16a366; animation: plc-pulse .8s ease-out 2; }
+.plc-signal.offline { border-color: #d7a34d; color: #8a5a0a; background: #fff7e5; }
+.plc-signal.offline .dot { background: #d49a36; box-shadow: 0 0 0 3px rgba(212,154,54,.16); }
+@keyframes plc-pulse { 0% { box-shadow: 0 0 0 0 rgba(22,163,102,.42); } 100% { box-shadow: 0 0 0 9px rgba(22,163,102,0); } }
 .grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(360px, .75fr); gap: 12px; align-items: start; }
 .panel { border: 1px solid #d8e0e4; border-radius: 8px; background: #ffffff; overflow: hidden; box-shadow: 0 14px 28px rgba(23,32,37,.08); }
 .panel-head { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #d8e0e4; }
@@ -839,6 +850,10 @@ h2 { font-size: 16px; }
     </div>
     <div class="nav">
       <a href="/history">History</a>
+      <div id="plc-signal" class="plc-signal offline" role="status" aria-live="polite">
+        <span class="dot" aria-hidden="true"></span>
+        <span id="plc-signal-text">Connecting to PLC...</span>
+      </div>
       <div id="top-state" class="pill warn">connecting...</div>
     </div>
   </header>
@@ -864,6 +879,8 @@ h2 { font-size: 16px; }
 
 <script>
 const $ = (id) => document.getElementById(id);
+let lastPlcEventCount = null;
+let plcSignalHighlightUntil = 0;
 
 function setImage(stage, b64, alt) {
   if (!b64) {
@@ -894,6 +911,41 @@ function updateDiagram(ratio) {
   $('diagram-measure').setAttribute('y2', y);
 }
 
+function signalTime(trigger) {
+  const raw = trigger?.event_source_timestamp || trigger?.read_utc;
+  if (!raw) return '';
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? String(raw) : parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function updatePlcSignal(plc) {
+  const signal = $('plc-signal');
+  const text = $('plc-signal-text');
+  const count = Number(plc.events_found || 0);
+  const trigger = plc.last_trigger;
+
+  if (!plc.connected) {
+    plcSignalHighlightUntil = 0;
+    signal.className = 'plc-signal offline';
+    text.textContent = 'PLC disconnected';
+    signal.title = '';
+  } else if (!trigger) {
+    plcSignalHighlightUntil = 0;
+    signal.className = 'plc-signal';
+    text.textContent = 'Waiting for PLC signal';
+    signal.title = '';
+  } else {
+    const receivedNow = lastPlcEventCount !== null && count > lastPlcEventCount;
+    if (receivedNow) plcSignalHighlightUntil = Date.now() + 4000;
+    const highlighting = Date.now() < plcSignalHighlightUntil;
+    const time = signalTime(trigger);
+    signal.className = `plc-signal ${highlighting ? 'received' : 'seen'}`;
+    text.textContent = `${highlighting ? 'PLC signal received' : 'Last PLC signal'}${time ? ` | ${time}` : ''}`;
+    signal.title = trigger.event_source_timestamp || trigger.read_utc || '';
+  }
+  lastPlcEventCount = count;
+}
+
 async function refreshFrame() {
   try {
     const response = await fetch('/api/live/frame');
@@ -915,6 +967,7 @@ async function refreshStatus() {
     if (!response.ok) throw new Error(data.error || 'status error');
     const camera = data.camera || {};
     const processor = data.processor || {};
+    updatePlcSignal(data.plc || {});
     const healthy = camera.connected && processor.ok;
     pill($('top-state'), healthy ? 'live' : 'check status', healthy ? 'ok' : 'warn');
   } catch (err) {
