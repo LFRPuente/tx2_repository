@@ -56,7 +56,7 @@ class PlcEdgeTests(unittest.TestCase):
 
 
 class ClipRecorderTests(unittest.TestCase):
-    def test_overlapping_events_keep_separate_fixed_duration_clips(self) -> None:
+    def test_second_event_closes_first_clip_without_overlapping_frames(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             args = SimpleNamespace(
                 output_dir=Path(temp_dir),
@@ -100,15 +100,16 @@ class ClipRecorderTests(unittest.TestCase):
                     "event_read_monotonic": first_event_time,
                 }
             )
-            time.sleep(0.06)
+            time.sleep(0.16)
+            second_event_time = time.perf_counter()
             recorder.start_event_clip(
                 {
                     "event_edge": "rising",
-                    "event_read_monotonic": time.perf_counter(),
+                    "event_read_monotonic": second_event_time,
                 }
             )
 
-            self.assertEqual(recorder.snapshot()["active_recordings"], 2)
+            self.assertEqual(recorder.snapshot()["active_recordings"], 1)
             deadline = time.perf_counter() + 3.0
             while recorder.snapshot()["recording"] and time.perf_counter() < deadline:
                 time.sleep(0.02)
@@ -118,22 +119,33 @@ class ClipRecorderTests(unittest.TestCase):
             self.assertFalse(recorder.snapshot()["recording"])
             self.assertEqual(recorder.snapshot()["error"], "")
 
-            sidecars = sorted(Path(temp_dir).rglob("*.json"))
+            sidecars = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in Path(temp_dir).rglob("*.json")
+            ]
+            sidecars.sort(key=lambda item: item["clip_index"])
             self.assertEqual(len(sidecars), 2)
-            for sidecar_path in sidecars:
-                data = json.loads(sidecar_path.read_text(encoding="utf-8"))
-                self.assertEqual(data["frames_written"], 4)
-                self.assertAlmostEqual(data["video_duration_seconds"], 0.4, places=3)
+            first_clip, second_clip = sidecars
 
+            self.assertEqual(first_clip["stop_reason"], "next_plc_signal")
+            self.assertLess(first_clip["record_seconds"], 0.4)
+            self.assertGreater(first_clip["record_seconds"], 0.1)
+            self.assertEqual(first_clip["next_event"]["event_read_monotonic"], second_event_time)
+            self.assertEqual(second_clip["stop_reason"], "max_duration")
+            self.assertAlmostEqual(second_clip["record_seconds"], 0.4, places=3)
+            self.assertEqual(second_clip["frames_written"], 4)
+            self.assertLess(first_clip["last_frame_index"], second_clip["first_frame_index"])
+
+            for data in sidecars:
                 video = cv2.VideoCapture(data["video_path"])
                 try:
                     self.assertTrue(video.isOpened())
-                    self.assertEqual(int(video.get(cv2.CAP_PROP_FRAME_COUNT)), 4)
+                    self.assertEqual(int(video.get(cv2.CAP_PROP_FRAME_COUNT)), data["frames_written"])
                     self.assertAlmostEqual(video.get(cv2.CAP_PROP_FPS), 10.0, delta=0.2)
                 finally:
                     video.release()
 
-    def test_failed_overlapping_clip_is_not_hidden_by_success(self) -> None:
+    def test_failed_replacement_clip_is_not_hidden_by_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             args = SimpleNamespace(
                 output_dir=Path(temp_dir),

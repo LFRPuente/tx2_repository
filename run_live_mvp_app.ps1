@@ -63,7 +63,7 @@ if (-not $env:AXIS_PASSWORD) {
   --process-fps 10 `
   --buffer-seconds 2 `
   --buffer-max-frames 60 `
-  --record-seconds 8 `
+  --record-seconds 10 `
   --record-fps 10 `
   --max-clips 100 `
   --plc-enabled `
