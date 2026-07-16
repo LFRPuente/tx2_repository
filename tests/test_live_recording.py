@@ -51,6 +51,8 @@ class PlcEdgeTests(unittest.TestCase):
         self.assertIn('id="plc-signal"', HTML)
         self.assertIn("plc.last_trigger", HTML)
         self.assertIn("PLC signal received", HTML)
+        self.assertNotIn("TX2 Vision", HTML)
+        self.assertNotIn("<h1>Live MVP</h1>", HTML)
 
 
 class ClipRecorderTests(unittest.TestCase):

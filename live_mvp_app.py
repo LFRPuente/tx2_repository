@@ -801,7 +801,7 @@ HTML = r"""
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: #f5f7f8; }
 .app { width: min(1760px, calc(100vw - 24px)); margin: 0 auto; padding: 14px 0 18px; }
-.topbar { display: flex; align-items: end; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
+.topbar { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-bottom: 12px; }
 h1, h2, p { margin: 0; letter-spacing: 0; }
 h1 { font-size: 27px; line-height: 1.05; }
 h2 { font-size: 16px; }
@@ -844,10 +844,6 @@ h2 { font-size: 16px; }
 <body>
 <div class="app">
   <header class="topbar">
-    <div>
-      <p class="eyebrow">TX2 Vision</p>
-      <h1>Live MVP</h1>
-    </div>
     <div class="nav">
       <a href="/history">History</a>
       <div id="plc-signal" class="plc-signal offline" role="status" aria-live="polite">
