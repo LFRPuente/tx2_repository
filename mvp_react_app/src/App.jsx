@@ -39,8 +39,31 @@ function PieceDiagram({ frame }) {
       </div>
 
       <svg className="piece-diagram" viewBox="0 0 760 430" role="img" aria-label="Piece front measurement diagram">
+        <defs>
+          <linearGradient id="steelPieceA" x1="0" x2="1" y1="0" y2="0">
+            <stop offset="0%" stopColor="#6f7d82" />
+            <stop offset="16%" stopColor="#b4bec2" />
+            <stop offset="43%" stopColor="#d8dee0" />
+            <stop offset="70%" stopColor="#8b989d" />
+            <stop offset="100%" stopColor="#5f6b70" />
+          </linearGradient>
+          <linearGradient id="steelPieceB" x1="0" x2="1" y1="0" y2="0">
+            <stop offset="0%" stopColor="#77858a" />
+            <stop offset="18%" stopColor="#c1c9cc" />
+            <stop offset="48%" stopColor="#e1e5e6" />
+            <stop offset="76%" stopColor="#929fa4" />
+            <stop offset="100%" stopColor="#667278" />
+          </linearGradient>
+          <linearGradient id="steelPackShade" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stopColor="#e6ebea" stopOpacity=".62" />
+            <stop offset="100%" stopColor="#c9d1cf" stopOpacity=".26" />
+          </linearGradient>
+          <filter id="pieceShadow" x="-25%" y="-10%" width="150%" height="125%">
+            <feDropShadow dx="0" dy="3" stdDeviation="2.2" floodColor="#253238" floodOpacity=".18" />
+          </filter>
+        </defs>
         <rect x="44" y="44" width="672" height="342" rx="8" fill="#f7faf8" stroke="#cbd6cf" strokeWidth="2" />
-        <rect x="72" y="82" width="616" height="262" rx="6" fill="#ffffff" stroke="#d9e0dc" />
+        <rect x="72" y="82" width="616" height="262" rx="6" fill="#f9fbfa" stroke="#d9e0dc" />
         <path d="M380 372 V96" stroke="#aeb8b2" strokeWidth="3" strokeDasharray="10 9" />
         <path d="M380 96 l-10 18 h20 z" fill="#aeb8b2" />
 
@@ -64,17 +87,19 @@ function PieceDiagram({ frame }) {
           width="524"
           height={Math.max(16, packBottom - packTop)}
           rx="7"
-          fill="#edf5f1"
-          opacity=".78"
+          fill="url(#steelPackShade)"
         />
 
         {pieceCols.map((col) => {
           const x = 132 + col * 40;
-          const shade = col % 2 ? '#d7e5df' : '#c2d7ce';
+          const gradient = col % 2 ? 'url(#steelPieceB)' : 'url(#steelPieceA)';
+          const capStroke = col % 2 ? '#eef2f2' : '#d7dddf';
           return (
-            <g key={col}>
-              <rect x={x} y={packTop} width="24" height={pieceHeight} rx="4" fill={shade} stroke="#8ba99b" />
-              <line x1={x + 6} y1={packTop + 6} x2={x + 6} y2={packTop + pieceHeight - 6} stroke="#f6fbf8" strokeWidth="2" opacity=".75" />
+            <g key={col} filter="url(#pieceShadow)">
+              <rect x={x} y={packTop} width="25" height={pieceHeight} rx="5" fill={gradient} stroke="#566268" strokeWidth="1.1" />
+              <rect x={x + 2.5} y={packTop + 3} width="20" height={Math.max(8, pieceHeight - 6)} rx="4" fill="none" stroke={capStroke} strokeWidth="1" opacity=".42" />
+              <line x1={x + 7} y1={packTop + 7} x2={x + 7} y2={packTop + pieceHeight - 8} stroke="#ffffff" strokeWidth="1.4" opacity=".48" />
+              <line x1={x + 18} y1={packTop + 7} x2={x + 18} y2={packTop + pieceHeight - 8} stroke="#3f4a50" strokeWidth="1.1" opacity=".24" />
             </g>
           );
         })}

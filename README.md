@@ -81,6 +81,12 @@ Each history entry contains the MP4, PLC event metadata, processing snapshots,
 and the overlays produced while the clip was recorded. The app retains the 100
 most recent clips and removes older clip artifacts automatically.
 
+The live frame buffer is capped to avoid retaining several gigabytes of raw
+images. Clips are streamed directly to disk and resampled to the configured
+output FPS, so their playback duration matches the PLC recording window. If a
+second PLC event arrives while another clip is active, both recording windows
+are preserved as separate clips.
+
 Live MVP data is stored directly under:
 
 ```text
@@ -88,6 +94,46 @@ outputs/live_plc_clips/<date>/
 ```
 
 Storage currently uses MP4, JSON, and JPEG files. SQLite is not used.
+
+## Next Steps On The TX2 Server
+
+Run the following preparation commands from the repository root:
+
+```powershell
+git pull
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+Before the live test, confirm that these calibration and model files are the
+ones intended for the production camera:
+
+```text
+outputs/homography_selection.json
+outputs/roi_selection.json
+outputs/table_measurement_calibration.json
+runs/detect/runs_tx2/yolo11n_tubos_v1/weights/best.pt
+```
+
+Use this checklist for the on-machine validation:
+
+- [ ] Set `AXIS_USER` and `AXIS_PASSWORD`, then run `run_live_mvp_app.ps1`.
+- [ ] Open `http://127.0.0.1:8767` and confirm the original camera image remains at its native resolution.
+- [ ] Confirm YOLO detects the package in the rectified image and Sobel Y runs only inside the selected YOLO ROI.
+- [ ] Confirm the detected front is horizontal and its projection spans the full original image.
+- [ ] Confirm the reference line, distance to reference, and total measurement are correct in inches.
+- [ ] Confirm OPC UA connects to `opc.tcp://10.14.6.48:49320` and `VisionWD` keeps changing.
+- [ ] Trigger a `MeasureLength` rising edge and verify that exactly one 8-second clip appears in `/history`.
+- [ ] Trigger two events less than eight seconds apart and verify that neither event is lost.
+- [ ] Verify each sidecar JSON contains the PLC source timestamp, watchdog value, frame timestamps, and processing snapshots.
+- [ ] Verify each saved MP4 keeps the camera resolution and reports 80 frames at 10 FPS for an 8-second window.
+- [ ] Leave the app running for at least 30 minutes and confirm the frame buffer stays capped and process memory does not grow continuously.
+
+After the live validation, decide the production host binding, Windows service
+or scheduled-task setup, log retention, clip retention, and final storage path.
+The current PLC tag `MeasureLength` is used as a Boolean trigger; locating a
+separate numeric PLC length tag remains necessary if the calculated measurement
+must also be compared with or written back to the PLC.
 
 ## AXIS Live Camera
 

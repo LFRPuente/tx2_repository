@@ -91,7 +91,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--capture-fps", type=float, default=10.0)
     parser.add_argument("--process-fps", type=float, default=10.0)
-    parser.add_argument("--buffer-seconds", type=float, default=45.0)
+    parser.add_argument("--buffer-seconds", type=float, default=2.0)
+    parser.add_argument("--buffer-max-frames", type=int, default=60)
     parser.add_argument("--record-seconds", type=float, default=8.0)
     parser.add_argument("--record-fps", type=float, default=10.0)
     parser.add_argument("--max-clips", type=int, default=100)
@@ -213,19 +214,13 @@ class FrameBuffer:
         with self._lock:
             if not self._frames:
                 return None
-            item = self._frames[-1].copy()
-            item["frame"] = self._frames[-1]["frame"].copy()
-            return item
+            # Frames are immutable after append, so sharing the array avoids a Full HD copy.
+            return self._frames[-1].copy()
 
     def frames_since(self, min_index: int) -> list[dict[str, Any]]:
         with self._lock:
             selected = [item for item in self._frames if int(item["index"]) > int(min_index)]
-            copies = []
-            for item in selected:
-                copy = item.copy()
-                copy["frame"] = item["frame"].copy()
-                copies.append(copy)
-            return copies
+            return [item.copy() for item in selected]
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
@@ -486,7 +481,7 @@ class ClipRecorder:
         self.buffer = buffer
         self.processor = processor
         self.lock = threading.Lock()
-        self.recording = False
+        self.active_recordings: set[int] = set()
         self.clip_index = 0
         self.last_clip: dict[str, Any] | None = None
         self.error = ""
@@ -494,7 +489,8 @@ class ClipRecorder:
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             return {
-                "recording": self.recording,
+                "recording": bool(self.active_recordings),
+                "active_recordings": len(self.active_recordings),
                 "clip_index": self.clip_index,
                 "last_clip": self.last_clip,
                 "error": self.error,
@@ -503,12 +499,9 @@ class ClipRecorder:
 
     def start_event_clip(self, event: dict[str, Any]) -> None:
         with self.lock:
-            if self.recording:
-                self.error = "Ya habia una grabacion activa; evento ignorado para clip."
-                return
-            self.recording = True
             self.clip_index += 1
             clip_index = self.clip_index
+            self.active_recordings.add(clip_index)
             self.error = ""
         thread = threading.Thread(target=self._record_clip, args=(clip_index, event), daemon=True)
         thread.start()
@@ -553,29 +546,22 @@ class ClipRecorder:
 
         snapshots.append(snapshot)
 
-    @staticmethod
-    def _sample_frames(frames: list[dict[str, Any]], fps: float, duration: float) -> list[dict[str, Any]]:
-        target_count = max(1, int(round(duration * fps)))
-        start_mono = float(frames[0]["monotonic"])
-        selected: list[dict[str, Any]] = []
-        frame_index = 0
-        for sample_index in range(target_count):
-            target_mono = start_mono + sample_index / fps
-            while frame_index + 1 < len(frames):
-                current_delta = abs(float(frames[frame_index]["monotonic"]) - target_mono)
-                next_delta = abs(float(frames[frame_index + 1]["monotonic"]) - target_mono)
-                if next_delta > current_delta:
-                    break
-                frame_index += 1
-            selected.append(frames[frame_index])
-        return selected
-
     def _record_clip(self, clip_index: int, event: dict[str, Any]) -> None:
-        frames: list[dict[str, Any]] = []
         processing_snapshots: list[dict[str, Any]] = []
         seen_processing_frames: set[int] = set()
-        start_mono = time.perf_counter()
+        event_mono = float(event.get("event_read_monotonic") or time.perf_counter())
+        record_seconds = max(0.1, float(self.args.record_seconds))
+        deadline = event_mono + record_seconds
+        fps = max(1.0, min(float(self.args.record_fps or self.args.capture_fps or 10.0), 60.0))
+        target_frame_count = max(1, int(round(record_seconds * fps)))
+        frames_written = 0
+        source_frames_seen = 0
         last_index = -1
+        last_source: dict[str, Any] | None = None
+        first_written_source: dict[str, Any] | None = None
+        last_written_source: dict[str, Any] | None = None
+        writer: cv2.VideoWriter | None = None
+        video_path: Path | None = None
         latest = self.buffer.latest()
         if latest:
             last_index = int(latest["index"]) - 1
@@ -587,48 +573,72 @@ class ClipRecorder:
             base = f"live_{clip_index:04d}_{file_stamp()}_{edge}"
             analysis_dir = day_dir / f"{base}_analysis"
             analysis_dir.mkdir(parents=True, exist_ok=True)
+            video_path = day_dir / f"{base}.mp4"
+            json_path = day_dir / f"{base}.json"
 
-            while time.perf_counter() - start_mono < float(self.args.record_seconds):
+            while time.perf_counter() < deadline:
                 new_frames = self.buffer.frames_since(last_index)
                 if new_frames:
-                    frames.extend(new_frames)
                     last_index = int(new_frames[-1]["index"])
+                for item in new_frames:
+                    item_mono = float(item["monotonic"])
+                    if item_mono < event_mono:
+                        continue
+                    source_frames_seen += 1
+                    if writer is None:
+                        height, width = item["frame"].shape[:2]
+                        writer = cv2.VideoWriter(
+                            str(video_path),
+                            cv2.VideoWriter_fourcc(*"mp4v"),
+                            fps,
+                            (width, height),
+                        )
+                        if not writer.isOpened():
+                            raise RuntimeError(f"Could not open VideoWriter: {video_path}")
+                    if last_source is None:
+                        last_source = item
+
+                    while frames_written < target_frame_count:
+                        sample_mono = event_mono + (frames_written / fps)
+                        if sample_mono > item_mono:
+                            break
+                        writer.write(last_source["frame"])
+                        first_written_source = first_written_source or last_source
+                        last_written_source = last_source
+                        frames_written += 1
+                    last_source = item
                 self._capture_processing_snapshot(analysis_dir, processing_snapshots, seen_processing_frames)
                 time.sleep(0.025)
             self._capture_processing_snapshot(analysis_dir, processing_snapshots, seen_processing_frames)
 
-            if not frames:
+            if writer is None or last_source is None:
                 raise RuntimeError("No frames were available to record the clip.")
 
-            video_path = day_dir / f"{base}.mp4"
-            json_path = day_dir / f"{base}.json"
-
-            first_frame = frames[0]["frame"]
-            height, width = first_frame.shape[:2]
-            fps = float(self.args.record_fps or self.args.capture_fps or 10.0)
-            output_frames = self._sample_frames(frames, fps, float(self.args.record_seconds))
-            writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-            if not writer.isOpened():
-                raise RuntimeError(f"Could not open VideoWriter: {video_path}")
-            for item in output_frames:
-                frame = item["frame"]
-                if frame.shape[1] != width or frame.shape[0] != height:
-                    frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-                writer.write(frame)
+            while frames_written < target_frame_count:
+                writer.write(last_source["frame"])
+                first_written_source = first_written_source or last_source
+                last_written_source = last_source
+                frames_written += 1
             writer.release()
+            writer = None
+
+            if first_written_source is None or last_written_source is None:
+                raise RuntimeError("No frames were written to the clip.")
 
             sidecar = {
                 "clip_index": clip_index,
                 "saved_at": utc_now(),
                 "event": event,
-                "record_seconds": float(self.args.record_seconds),
+                "record_seconds": record_seconds,
                 "video_fps": fps,
-                "frames_captured": len(frames),
-                "frames_written": len(output_frames),
-                "first_frame_utc": output_frames[0]["utc"],
-                "last_frame_utc": output_frames[-1]["utc"],
-                "first_frame_index": int(output_frames[0]["index"]),
-                "last_frame_index": int(output_frames[-1]["index"]),
+                "video_duration_seconds": frames_written / fps,
+                "frames_captured": source_frames_seen,
+                "frames_written": frames_written,
+                "source_frames_seen": source_frames_seen,
+                "first_frame_utc": first_written_source["utc"],
+                "last_frame_utc": last_written_source["utc"],
+                "first_frame_index": int(first_written_source["index"]),
+                "last_frame_index": int(last_written_source["index"]),
                 "video_path": str(video_path),
                 "analysis_dir": str(analysis_dir),
                 "processing_snapshots": processing_snapshots,
@@ -640,11 +650,21 @@ class ClipRecorder:
                 self.last_clip = sidecar
                 self.error = ""
         except Exception as exc:
+            if writer is not None:
+                writer.release()
+                writer = None
+            if video_path is not None and video_path.exists():
+                try:
+                    video_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             with self.lock:
                 self.error = str(exc)
         finally:
+            if writer is not None:
+                writer.release()
             with self.lock:
-                self.recording = False
+                self.active_recordings.discard(clip_index)
 
     def _enforce_retention(self) -> None:
         max_clips = max(1, int(self.args.max_clips or 100))
@@ -709,6 +729,7 @@ class PLCMonitor:
             "source_timestamp": clean_value(data_value.SourceTimestamp),
             "server_timestamp": clean_value(data_value.ServerTimestamp),
             "read_utc": utc_now(),
+            "read_monotonic": time.perf_counter(),
         }
 
     async def _monitor_once(self) -> None:
@@ -733,6 +754,7 @@ class PLCMonitor:
                         "previous_event_value": previous_event,
                         "event_source_timestamp": event.get("source_timestamp"),
                         "event_server_timestamp": event.get("server_timestamp"),
+                        "event_read_monotonic": event.get("read_monotonic"),
                         "event_status": event.get("status"),
                         "event_edge": edge,
                     }
@@ -755,7 +777,7 @@ class PLCMonitor:
 
 HTML = r"""
 <!doctype html>
-<html lang="es">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -904,7 +926,7 @@ refreshStatus();
 
 HISTORY_HTML = r"""
 <!doctype html>
-<html lang="es">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1218,7 +1240,8 @@ def main() -> int:
     _args = parse_args()
     configure_vision_module(_args)
 
-    buffer_len = int(max(8, float(_args.buffer_seconds) * max(1.0, float(_args.capture_fps))))
+    requested_buffer_frames = int(max(8, float(_args.buffer_seconds) * max(1.0, float(_args.capture_fps))))
+    buffer_len = min(requested_buffer_frames, max(8, int(_args.buffer_max_frames)))
     _buffer = FrameBuffer(maxlen=buffer_len)
     _camera = CameraReader(_args, _buffer)
     _processor = LiveProcessor(_args, _buffer)

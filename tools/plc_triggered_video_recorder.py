@@ -90,10 +90,8 @@ def event_edge(previous: Any, current: Any) -> str:
 
 
 def edge_matches(edge: str, mode: str) -> bool:
-    if mode == "any":
+    if mode in ("any", "changed"):
         return bool(edge)
-    if mode == "changed":
-        return edge == "changed"
     return edge == mode
 
 

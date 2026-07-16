@@ -61,6 +61,8 @@ if (-not $env:AXIS_PASSWORD) {
   --conf 0.50 `
   --capture-fps 10 `
   --process-fps 10 `
+  --buffer-seconds 2 `
+  --buffer-max-frames 60 `
   --record-seconds 8 `
   --record-fps 10 `
   --max-clips 100 `
