@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import cv2
 import numpy as np
@@ -120,6 +125,68 @@ class ClipRecorderTests(unittest.TestCase):
                     self.assertAlmostEqual(video.get(cv2.CAP_PROP_FPS), 10.0, delta=0.2)
                 finally:
                     video.release()
+
+    def test_failed_overlapping_clip_is_not_hidden_by_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = SimpleNamespace(
+                output_dir=Path(temp_dir),
+                record_seconds=0.3,
+                record_fps=10.0,
+                capture_fps=30.0,
+                max_clips=10,
+            )
+            buffer = FrameBuffer(maxlen=20)
+            recorder = ClipRecorder(args, buffer)
+            stop_feeder = threading.Event()
+
+            def feed_frames() -> None:
+                index = 0
+                while not stop_feeder.is_set():
+                    buffer.append(
+                        {
+                            "index": index,
+                            "utc": f"frame-{index}",
+                            "monotonic": time.perf_counter(),
+                            "frame": np.full((48, 64, 3), index % 255, dtype=np.uint8),
+                        }
+                    )
+                    index += 1
+                    time.sleep(0.01)
+
+            feeder = threading.Thread(target=feed_frames, daemon=True)
+            feeder.start()
+            self.addCleanup(stop_feeder.set)
+            self.addCleanup(feeder.join, 1.0)
+
+            deadline = time.perf_counter() + 1.0
+            while buffer.latest() is None and time.perf_counter() < deadline:
+                time.sleep(0.01)
+
+            recorder.start_event_clip(
+                {
+                    "event_edge": "rising",
+                    "event_read_monotonic": time.perf_counter(),
+                }
+            )
+            time.sleep(0.05)
+            recorder.start_event_clip(
+                {
+                    "event_edge": "rising",
+                    "event_read_monotonic": time.perf_counter() - 5.0,
+                }
+            )
+
+            deadline = time.perf_counter() + 3.0
+            while recorder.snapshot()["recording"] and time.perf_counter() < deadline:
+                time.sleep(0.02)
+            stop_feeder.set()
+            feeder.join(timeout=1.0)
+
+            snapshot = recorder.snapshot()
+            self.assertFalse(snapshot["recording"])
+            self.assertEqual(snapshot["failed_recording_count"], 1)
+            self.assertIn("No frames were available", snapshot["error"])
+            self.assertEqual(len(list(Path(temp_dir).rglob("*.json"))), 1)
 
 
 if __name__ == "__main__":

@@ -484,6 +484,7 @@ class ClipRecorder:
         self.active_recordings: set[int] = set()
         self.clip_index = 0
         self.last_clip: dict[str, Any] | None = None
+        self.failed_recordings: deque[dict[str, Any]] = deque(maxlen=20)
         self.error = ""
 
     def snapshot(self) -> dict[str, Any]:
@@ -493,6 +494,8 @@ class ClipRecorder:
                 "active_recordings": len(self.active_recordings),
                 "clip_index": self.clip_index,
                 "last_clip": self.last_clip,
+                "failed_recording_count": len(self.failed_recordings),
+                "failed_recordings": [failure.copy() for failure in self.failed_recordings],
                 "error": self.error,
                 "record_seconds": self.args.record_seconds,
             }
@@ -502,7 +505,6 @@ class ClipRecorder:
             self.clip_index += 1
             clip_index = self.clip_index
             self.active_recordings.add(clip_index)
-            self.error = ""
         thread = threading.Thread(target=self._record_clip, args=(clip_index, event), daemon=True)
         thread.start()
 
@@ -648,7 +650,6 @@ class ClipRecorder:
             self._enforce_retention()
             with self.lock:
                 self.last_clip = sidecar
-                self.error = ""
         except Exception as exc:
             if writer is not None:
                 writer.release()
@@ -658,8 +659,15 @@ class ClipRecorder:
                     video_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+            failure = {
+                "clip_index": clip_index,
+                "failed_at": utc_now(),
+                "event": clean_value(event),
+                "error": str(exc),
+            }
             with self.lock:
-                self.error = str(exc)
+                self.error = failure["error"]
+                self.failed_recordings.append(failure)
         finally:
             if writer is not None:
                 writer.release()
