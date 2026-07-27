@@ -80,9 +80,10 @@ The trained weights are written to:
 runs/detect/runs_tx2/yolo11n_pieces_v1/weights/best.pt
 ```
 
-Both MVP launchers select that model automatically when it exists. Until then,
-they print a warning and use the legacy package model, so multiple individual
-detections should not be expected yet.
+Both MVP launchers select that model automatically when it exists. The
+individual checkpoint is present in the current repository. A launcher only
+falls back to the legacy package model, with an explicit warning, if that file
+is missing.
 
 Vision API responses now include:
 
@@ -190,11 +191,23 @@ http://127.0.0.1:8767
 
 The Live MVP provides a light interface with the live camera view and
 measurement diagram. It keeps the AXIS stream at `1920x1080` and targets 10 FPS
-for capture, processing, browser updates, and saved clips. It connects to the
-PLC through OPC UA and records one 8-second clip when `MeasureLength` changes
-from `False` to `True`. The recording is provisional until the window closes:
-if YOLO did not detect any piece during those 8 seconds, the MP4, processing
-captures, sidecar, and pending database event are discarded.
+for capture, processing, browser updates, and saved clips. Live inference uses
+the individual-piece model at an initial confidence of `0.10`, applies the same
+geometric rules as the offline tool, filters boxes against configured exclusion
+zones before Sobel, and retains the full `box_rules` diagnostics. Measurements
+are shown in compact sixteenth-inch format such as `40' 9 1/16"`.
+
+It connects to the PLC through OPC UA and records one 8-second clip when
+`MeasureLength` changes from `False` to `True`. The recording is provisional
+until the window closes: if YOLO did not detect any piece during those 8
+seconds, the MP4, processing captures, sidecar, and pending database event are
+discarded.
+
+The deployed `outputs/table_measurement_calibration.json` currently contains no
+`exclusion_zones`. The filtering and overlay support are active in code, but
+remain inert until zones are saved from the calibration tool. Do not restore
+coordinates from an older calibration without validating them against the
+deployed homography.
 
 Open the saved clip history at:
 

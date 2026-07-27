@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import base64
 import json
+import math
 import os
 import sys
 import threading
@@ -137,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument("--conf", type=float, default=0.50)
+    parser.add_argument("--conf", type=float, default=0.10)
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--capture-fps", type=float, default=10.0)
     parser.add_argument("--process-fps", type=float, default=10.0)
@@ -215,6 +216,24 @@ def line_is_valid(line: dict | None) -> bool:
     return bool(line) and all(np.isfinite(float(line[key])) for key in ("x1", "y1", "x2", "y2"))
 
 
+def format_inches_compact(value: float | int | Decimal | None) -> str:
+    if value is None or not np.isfinite(float(value)):
+        return "-"
+    total_sixteenths = int(math.floor(abs(float(value)) * 16.0 + 0.5))
+    sign = "-" if float(value) < 0 else ""
+    feet, remainder = divmod(total_sixteenths, 12 * 16)
+    inches, numerator = divmod(remainder, 16)
+    if numerator:
+        denominator = 16
+        while numerator % 2 == 0:
+            numerator //= 2
+            denominator //= 2
+        inch_text = f"{inches} {numerator}/{denominator}"
+    else:
+        inch_text = str(inches)
+    return f"{sign}{feet}' {inch_text}\""
+
+
 def draw_line(img: np.ndarray, line: dict | None, color: tuple[int, int, int], label: str) -> None:
     if not line_is_valid(line):
         return
@@ -238,6 +257,25 @@ def draw_rectified_overlay(
     calibration: dict,
 ) -> np.ndarray:
     out = rectified.copy()
+    exclusion_zones = vision.normalize_exclusion_zones(
+        calibration.get("exclusion_zones"),
+        image_shape=rectified.shape,
+    )
+    if exclusion_zones:
+        zone_layer = out.copy()
+        for zone in exclusion_zones:
+            x0 = int(round(float(zone["x"])))
+            y0 = int(round(float(zone["y"])))
+            x1 = int(round(float(zone["x"]) + float(zone["w"])))
+            y1 = int(round(float(zone["y"]) + float(zone["h"])))
+            cv2.rectangle(zone_layer, (x0, y0), (x1, y1), (48, 62, 210), -1)
+        out = cv2.addWeighted(zone_layer, 0.22, out, 0.78, 0.0)
+        for zone in exclusion_zones:
+            x0 = int(round(float(zone["x"])))
+            y0 = int(round(float(zone["y"])))
+            x1 = int(round(float(zone["x"]) + float(zone["w"])))
+            y1 = int(round(float(zone["y"]) + float(zone["h"])))
+            cv2.rectangle(out, (x0, y0), (x1, y1), (38, 48, 210), 2, cv2.LINE_AA)
     for index, piece in enumerate(pieces):
         box = piece["box"]
         piece_id = int(piece["piece_id"])
@@ -260,7 +298,7 @@ def draw_rectified_overlay(
         draw_line(out, (piece.get("sobel") or {}).get("line"), color, f"P{piece_id}")
         measurement = piece.get("measurement")
         if isinstance(measurement, dict):
-            label = f"{float(measurement['measurement_in']):.3f} in"
+            label = format_inches_compact(measurement["measurement_in"])
             label_y = min(
                 out.shape[0] - 8,
                 max(24, int(float(measurement["line_y"])) + 24 + (index % 2) * 18),
@@ -537,11 +575,22 @@ class LiveProcessor:
         original = item["frame"]
         matrix, out_size, _homography = vision.load_homography()
         rectified = cv2.warpPerspective(original, matrix, out_size)
-        boxes = vision.predict_yolo_boxes(rectified, conf=float(self.args.conf), imgsz=int(self.args.imgsz))
+        calibration = vision.load_measurement_calibration()
+        boxes, box_rules = vision.predict_yolo_boxes_with_rules(
+            rectified,
+            conf=float(self.args.conf),
+            imgsz=int(self.args.imgsz),
+            exclusion_zones=calibration.get("exclusion_zones"),
+            exclusion_max_overlap=float(
+                calibration.get(
+                    "exclusion_max_box_overlap",
+                    vision.EXCLUSION_ZONE_MAX_BOX_OVERLAP,
+                )
+            ),
+        )
 
         rect_h, rect_w = rectified.shape[:2]
         src_h, src_w = original.shape[:2]
-        calibration = vision.load_measurement_calibration()
         pieces, measurement_summary = vision.analyze_piece_boxes(
             rectified,
             boxes,
@@ -568,6 +617,7 @@ class LiveProcessor:
             "original_image": img_to_b64(original_viz, quality=80),
             "rectified_image": img_to_b64(rectified_viz, quality=82),
             "boxes": boxes,
+            "box_rules": box_rules,
             "count": len(boxes),
             "pieces": pieces,
             "measurement_summary": measurement_summary,
@@ -1363,6 +1413,24 @@ function pill(el, text, tone) {
   el.className = `pill ${tone || ''}`.trim();
 }
 
+function compactMeasurement(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '-';
+  let total = Math.round(Math.abs(numeric) * 16);
+  const sign = numeric < 0 ? '-' : '';
+  const feet = Math.floor(total / 192);
+  total -= feet * 192;
+  const inches = Math.floor(total / 16);
+  let numerator = total % 16;
+  let denominator = 16;
+  while (numerator && numerator % 2 === 0) {
+    numerator /= 2;
+    denominator /= 2;
+  }
+  const inchText = numerator ? `${inches} ${numerator}/${denominator}` : `${inches}`;
+  return `${sign}${feet}' ${inchText}"`;
+}
+
 function updateDiagram(result) {
   const pieces = Array.isArray(result?.pieces) ? result.pieces : [];
   const rectWidth = Math.max(1, Number(result?.rectified_width || 1));
@@ -1385,7 +1453,7 @@ function updateDiagram(result) {
     const valid = Boolean(piece.valid);
     const color = valid ? '#16845a' : '#c5782d';
     const measurement = piece.measurement?.measurement_in;
-    const label = Number.isFinite(Number(measurement)) ? Number(measurement).toFixed(2) : '-';
+    const label = compactMeasurement(measurement);
     return `
       <g>
         <rect x="${x - width / 2}" y="68" width="${width}" height="${Math.max(8, frontY - 68)}" rx="3"
@@ -1602,14 +1670,21 @@ let editingPiece = null;
 const initialEventId = location.pathname.startsWith('/history/') ? decodeURIComponent(location.pathname.split('/').pop() || '') : '';
 
 function measurement(value) {
-  const total = Number(value);
-  if (!Number.isFinite(total)) return '-';
-  let sixteenths = Math.round(total * 16);
-  const feet = Math.floor(sixteenths / 192);
-  sixteenths -= feet * 192;
-  const inches = Math.floor(sixteenths / 16);
-  const fraction = sixteenths % 16;
-  return `${feet} ft ${inches} ${fraction}/16 in`;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '-';
+  let total = Math.round(Math.abs(numeric) * 16);
+  const sign = numeric < 0 ? '-' : '';
+  const feet = Math.floor(total / 192);
+  total -= feet * 192;
+  const inches = Math.floor(total / 16);
+  let numerator = total % 16;
+  let denominator = 16;
+  while (numerator && numerator % 2 === 0) {
+    numerator /= 2;
+    denominator /= 2;
+  }
+  const inchText = numerator ? `${inches} ${numerator}/${denominator}` : `${inches}`;
+  return `${sign}${feet}' ${inchText}"`;
 }
 
 function metric(label, value) {
@@ -1624,7 +1699,7 @@ function renderPieces(pieces, databaseMode) {
       const automatic = Number(piece.automatic_measurement_in);
       const operator = Number(piece.operator_measurement_in);
       const hasOperator = Number.isFinite(operator);
-      const difference = hasOperator && Number.isFinite(automatic) ? `${number(operator - automatic)} in` : '-';
+      const difference = hasOperator && Number.isFinite(automatic) ? measurement(operator - automatic) : '-';
       const state = piece.review_required || !piece.is_valid ? 'review' : 'ok';
       return `<tr>
         <td><strong>${esc(piece.piece_number)}</strong></td>

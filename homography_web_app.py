@@ -1060,6 +1060,7 @@ def predict_yolo_boxes_with_rules(
     conf: float = 0.10,
     imgsz: int = 960,
     exclusion_zones: list[dict] | None = None,
+    exclusion_max_overlap: float = EXCLUSION_ZONE_MAX_BOX_OVERLAP,
 ) -> tuple[list[dict], dict]:
     model = load_yolo_model()
     result = model.predict(rectified, conf=conf, imgsz=imgsz, verbose=False)[0]
@@ -1076,7 +1077,7 @@ def predict_yolo_boxes_with_rules(
             "rejected_inferred_count": 0,
             "exclusion_zone_count": len(normalized_zones),
             "removed_exclusion_count": 0,
-            "exclusion_max_overlap": EXCLUSION_ZONE_MAX_BOX_OVERLAP,
+            "exclusion_max_overlap": float(exclusion_max_overlap),
         }
 
     xyxy = result.boxes.xyxy.detach().cpu().numpy()
@@ -1097,13 +1098,13 @@ def predict_yolo_boxes_with_rules(
     filtered, removed_exclusions = filter_boxes_by_exclusion_zones(
         processed,
         normalized_zones,
-        max_overlap=EXCLUSION_ZONE_MAX_BOX_OVERLAP,
+        max_overlap=exclusion_max_overlap,
         image_shape=rectified.shape,
     )
     diagnostics.update(
         exclusion_zone_count=len(normalized_zones),
         removed_exclusion_count=len(removed_exclusions),
-        exclusion_max_overlap=EXCLUSION_ZONE_MAX_BOX_OVERLAP,
+        exclusion_max_overlap=float(exclusion_max_overlap),
         final_count=len(filtered),
     )
     return filtered, diagnostics

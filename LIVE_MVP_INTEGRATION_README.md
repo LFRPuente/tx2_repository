@@ -126,6 +126,9 @@ Responsabilidades actuales:
 
 - leer RTSP de la camara AXIS;
 - procesar el frame mas reciente en un thread separado;
+- detectar y medir cada pieza de forma independiente;
+- aplicar reglas geometricas y zonas rojas configuradas antes de Sobel;
+- conservar diagnosticos `box_rules` por snapshot;
 - leer `VisionWD` y `MeasureLength` por OPC UA;
 - iniciar clips fijos de 8 segundos con señales rising del PLC;
 - conservar ventanas cercanas como clips independientes, incluso si se solapan;
@@ -170,14 +173,14 @@ implementado como backend temporal y migrable para no detener el Live MVP.
 | Varias mediciones de calibracion | Si | Si, se cargan | Exponer version activa |
 | Linea horizontal de referencia | Si | Si | Mostrarla consistentemente |
 | Offset `475 1/16 in` | Si | Si | No hardcodearlo fuera de config |
-| Zonas rojas editables | Si | No completo | Aplicarlas antes de Sobel |
-| Tolerancia de zona de 20% | Si | No completo | Usar diagnosticos completos |
-| YOLO individual | Si | Parcial | Confirmar checkpoint y threshold |
-| Reglas geometricas | Si | Si, sin zonas | Devolver `box_rules` en live |
+| Zonas rojas editables | Si | Si, si estan configuradas | Guardar zonas para la calibracion desplegada |
+| Tolerancia de zona de 20% | Si | Si, probada | Validacion operativa |
+| YOLO individual | Si | Si | Reiniciar con checkpoint individual y validar en camara |
+| Reglas geometricas | Si | Si, con `box_rules` | Validacion operativa |
 | Sobel por pieza | Si | Si | Mantener exacto el algoritmo |
 | Frente siempre horizontal | Si | Si | Agregar prueba live |
 | Medida por pieza | Si | Si | Validacion con piezas reales |
-| Formato `40' 9 1/16"` | Si | No | Cambiar overlays y tablas |
+| Formato `40' 9 1/16"` | Si | Si | Validacion visual |
 | PLC/OPC UA | Pruebas | Si | Endurecer reconexion y metricas |
 | Clips fijos de 8 s | No aplica | Si, ventanas independientes | Validacion de duracion/retencion |
 | SQLite temporal | No | Implementado | Migrar y retirar despues de validar PostgreSQL |
@@ -199,6 +202,11 @@ runs/detect/runs_tx2/yolo11n_pieces_v1/weights/best.pt
 No se debe copiar solo el modelo ni solo la homografia. Las coordenadas de boxes,
 zonas, referencia y Sobel viven en la imagen rectificada; por eso dependen de la
 misma matriz y del mismo `output_size`.
+
+La calibracion desplegada preservada en esta rama no contiene actualmente
+`exclusion_zones`. El pipeline Live ya aplica y dibuja las zonas que reciba,
+pero no se deben recuperar coordenadas de una calibracion anterior. Las zonas
+deben guardarse nuevamente desde el tool usando la homografia desplegada.
 
 ### 5.1 Homografia actual
 
@@ -332,27 +340,18 @@ pequeno y no contiene negativos. Antes de confiar en la tasa de falsos positivos
 se deben guardar y entrenar frames sin piezas medibles. Las zonas rojas ayudan,
 pero no sustituyen ejemplos negativos.
 
-### 5.5 Diferencia critica de confianza
+### 5.5 Confianza alineada para validacion
 
-El tool prueba el modelo normalmente con:
+El tool y el launcher Live usan inicialmente:
 
 ```text
 conf = 0.10
 ```
 
-El launcher live usa actualmente:
-
-```text
-conf = 0.50
-```
-
-Esto puede hacer que el Live MVP no muestre detecciones que si aparecen en el
-tool. El threshold final debe medirse con videos y camara reales. Para la primera
-comparacion lado a lado se debe ejecutar el Live MVP con el mismo `conf` del
-tool, y luego ajustar usando precision/recall operacional.
-
-No se debe cambiar silenciosamente a `0.50` solo porque sea un valor comun en
-otros proyectos.
+El parametro es configurable con `-Confidence` en `run_live_mvp_app.ps1`. El
+threshold final debe medirse con videos y camara reales y ajustarse usando
+precision/recall operacional; `0.10` es el punto comun para comparar tool y Live,
+no una aprobacion final de produccion.
 
 ## 6. Arquitectura objetivo
 
@@ -415,21 +414,9 @@ original frame
   -> API + recorder + PostgreSQL
 ```
 
-### 7.1 Cambio obligatorio en `LiveProcessor._process`
+### 7.1 Integracion aplicada en `LiveProcessor._process`
 
-Actualmente el Live MVP llama:
-
-```python
-boxes = vision.predict_yolo_boxes(
-    rectified,
-    conf=float(self.args.conf),
-    imgsz=int(self.args.imgsz),
-)
-calibration = vision.load_measurement_calibration()
-```
-
-Esa funcion aplica reglas geometricas, pero no recibe las zonas rojas. Se debe
-cargar primero la calibracion y usar la API completa:
+El Live carga primero la calibracion y usa la API completa:
 
 ```python
 calibration = vision.load_measurement_calibration()
@@ -438,10 +425,11 @@ boxes, box_rules = vision.predict_yolo_boxes_with_rules(
     conf=float(self.args.conf),
     imgsz=int(self.args.imgsz),
     exclusion_zones=calibration.get("exclusion_zones"),
+    exclusion_max_overlap=calibration.get("exclusion_max_box_overlap", 0.20),
 )
 ```
 
-El resultado live debe incluir:
+El resultado live incluye:
 
 ```python
 {
@@ -1368,54 +1356,52 @@ temporal explicito, no una cola activada por errores de PostgreSQL.
 
 ### `homography_web_app.py`
 
-- conservar funciones actuales;
-- extraer un helper Python para formato compacto, si los overlays live lo
-  necesitan;
-- mantener `predict_yolo_boxes_with_rules`;
-- mantener `filter_boxes_by_exclusion_zones`;
-- mantener `analyze_piece_boxes`;
-- agregar tests al modificar contratos.
+- [x] Mantener `predict_yolo_boxes_with_rules`.
+- [x] Mantener `filter_boxes_by_exclusion_zones`.
+- [x] Mantener `analyze_piece_boxes`.
+- [x] Permitir el threshold de exclusion configurado por el consumidor.
+- [x] Agregar tests al modificar contratos.
 
 ### `live_mvp_app.py`
 
-- cargar calibracion antes de YOLO;
-- pasar `exclusion_zones`;
-- devolver `box_rules`;
-- dibujar zonas rojas en rectified overlay;
-- usar formato compacto;
-- agregar `frame_monotonic` al resultado;
-- crear evento DB al trigger PLC;
-- pasar `event_id` al recorder;
-- guardar snapshots y piezas;
-- convertir History a consultas PostgreSQL;
-- exponer health de DB;
-- no romper cierre por siguiente señal.
+- [x] Cargar calibracion antes de YOLO.
+- [x] Pasar `exclusion_zones`.
+- [x] Devolver `box_rules`.
+- [x] Dibujar zonas rojas en rectified overlay.
+- [x] Usar formato compacto.
+- [x] Agregar `frame_monotonic` al resultado.
+- [x] Crear evento DB al trigger PLC.
+- [x] Pasar `event_id` al recorder.
+- [x] Guardar snapshots y piezas.
+- [x] Convertir History a consultas de la base seleccionada.
+- [x] Exponer health de DB.
+- [x] No romper cierre por siguiente señal.
 
 ### `run_live_mvp_app.ps1`
 
-- validar `TX2_POSTGRES_DSN`;
-- mostrar modelo seleccionado;
-- mostrar SHA o al menos ruta de configuracion;
-- hacer configurable `conf`;
-- confirmar IP de camara;
-- conservar credenciales AXIS fuera del repo.
+- [x] Validar `TX2_POSTGRES_DSN` desde el backend al iniciar.
+- [x] Mostrar modelo seleccionado y SHA-256.
+- [x] Mostrar rutas de configuracion.
+- [x] Hacer configurable `conf`.
+- [x] Hacer visible/configurable la IP de camara.
+- [x] Conservar credenciales AXIS fuera del repo.
 
 ### `requirements.txt`
 
-- agregar `psycopg[binary,pool]`;
-- fijar rangos de versiones antes de despliegue.
+- [x] Agregar `psycopg[binary,pool]`.
+- [ ] Fijar rangos de todas las versiones antes de despliegue.
 
 ### `tests/`
 
-Agregar:
+Implementados:
 
 ```text
 test_live_vision_pipeline.py
 test_exclusion_zones_live.py
 test_measurement_format.py
-test_postgres_event_repository.py
-test_history_operator_measurement.py
-test_sidecar_postgres_migration.py
+test_postgres_integration.py
+test_history_api.py
+test_sqlite_database.py
 ```
 
 ### Nuevos archivos
@@ -1440,62 +1426,68 @@ tools/migrate_live_sidecars_to_postgres.py
 
 ### Fase 1: paridad de vision
 
-- [ ] Cambiar `LiveProcessor` a `predict_yolo_boxes_with_rules`.
-- [ ] Pasar zonas rojas.
-- [ ] Incluir `box_rules`.
-- [ ] Dibujar zonas rojas.
-- [ ] Cambiar medidas a formato compacto.
-- [ ] Alinear `conf` entre tool y live.
+- [x] Cambiar `LiveProcessor` a `predict_yolo_boxes_with_rules`.
+- [x] Pasar zonas rojas.
+- [x] Incluir `box_rules`.
+- [x] Dibujar zonas rojas.
+- [x] Cambiar medidas a formato compacto.
+- [x] Alinear `conf` entre tool y live en `0.10` para la comparacion inicial.
 - [ ] Comparar frame por frame.
-- [ ] Confirmar que Sobel no corre para boxes descartados.
+- [x] Confirmar por prueba que Sobel recibe solamente boxes filtrados.
 
 ### Fase 2: PostgreSQL base
 
-- [ ] Instalar dependencia psycopg.
-- [ ] Crear pool.
-- [ ] Crear migracion `001_initial.sql`.
-- [ ] Crear comando de migraciones.
-- [ ] Agregar health check.
-- [ ] Crear/leer `vision_configuration`.
+- [x] Agregar dependencia psycopg al entorno de aplicacion.
+- [x] Crear pool.
+- [x] Crear migracion `001_initial.sql`.
+- [x] Crear comando de migraciones.
+- [x] Agregar health check.
+- [x] Crear/leer `vision_configuration`.
 - [ ] Probar transacciones.
+
+La ultima prueba queda bloqueada hasta que TI permita instalar y configurar el
+servicio PostgreSQL. Mientras tanto no se cambia el backend temporal SQLite.
 
 ### Fase 3: persistencia de evento
 
-- [ ] Crear evento al trigger PLC.
-- [ ] Pasar UUID al recorder.
-- [ ] Guardar timestamps PLC/camara.
-- [ ] Guardar snapshots.
-- [ ] Seleccionar snapshot canonico.
-- [ ] Insertar piezas automaticas.
-- [ ] Registrar assets.
-- [ ] Finalizar estado.
-- [ ] Probar dos señales cercanas.
+- [x] Crear evento al trigger PLC.
+- [x] Pasar UUID al recorder.
+- [x] Guardar timestamps PLC/camara.
+- [x] Guardar snapshots.
+- [x] Seleccionar snapshot canonico.
+- [x] Insertar piezas automaticas.
+- [x] Registrar assets.
+- [x] Finalizar estado.
+- [x] Probar dos señales cercanas.
 
 ### Fase 4: History desde DB
 
-- [ ] Endpoint de lista paginada.
-- [ ] Endpoint de detalle.
-- [ ] Resolver video y snapshots.
-- [ ] Cambiar UI de History.
-- [ ] Mostrar automatic/effective.
-- [ ] Mantener acceso a sidecar tecnico.
+- [x] Endpoint de lista paginada.
+- [x] Endpoint de detalle.
+- [x] Resolver video y snapshots.
+- [x] Cambiar UI de History.
+- [x] Mostrar automatic/effective.
+- [x] Mantener acceso a sidecar tecnico.
 
 ### Fase 5: correccion del operador
 
-- [ ] Formulario pies/pulgadas/dieciseisavos.
-- [ ] PATCH con revision esperada.
-- [ ] Auditoria inmutable.
-- [ ] Clear correction.
-- [ ] Manejo de 409.
-- [ ] Identidad del operador.
-- [ ] Diferencia visible.
+- [x] Formulario pies/pulgadas/dieciseisavos.
+- [x] PATCH con revision esperada.
+- [x] Auditoria inmutable.
+- [x] Clear correction.
+- [x] Manejo de 409.
+- [x] Identidad explicita inicial del operador.
+- [x] Diferencia visible.
+
+La identidad actual es capturada por formulario; autenticacion corporativa
+continua pendiente.
 
 ### Fase 6: migracion y operacion
 
-- [ ] Importar sidecars previos.
+- [x] Importar sidecars previos.
 - [ ] Configurar backup.
 - [ ] Probar restore.
-- [ ] Definir retencion de assets.
+- [x] Definir retencion de 100 clips y sus eventos.
 - [ ] Definir servicio Windows.
 - [ ] Ejecutar prueba de 8 horas.
 
@@ -1780,20 +1772,20 @@ La integracion esta terminada cuando:
 
 - [ ] Live y tool producen los mismos boxes en frames de referencia.
 - [ ] Live aplica las dos zonas rojas guardadas.
-- [ ] Un solapamiento menor o igual a 20% se permite.
-- [ ] Un solapamiento mayor a 20% se elimina.
-- [ ] Cada pieza conserva box, Sobel, medicion y validez.
-- [ ] Todos los frentes son horizontales.
-- [ ] La UI muestra `40' 9 1/16"` sin `ft` ni `in`.
+- [x] Un solapamiento menor o igual a 20% se permite.
+- [x] Un solapamiento mayor a 20% se elimina.
+- [x] Cada pieza conserva box, Sobel, medicion y validez.
+- [x] Todos los frentes calculados son horizontales.
+- [x] La UI muestra `40' 9 1/16"` sin `ft` ni `in`.
 - [ ] La señal PLC crea exactamente un evento en la base seleccionada.
-- [ ] Dos señales cercanas conservan dos clips independientes de 8 segundos.
-- [ ] El evento tiene un snapshot canonico explicable.
-- [ ] History lista eventos desde la base seleccionada.
-- [ ] El operador puede corregir una pieza.
-- [ ] La medida automatica sigue intacta.
-- [ ] El historial de revisiones es visible.
-- [ ] Conflictos concurrentes regresan 409.
-- [ ] Los clips anteriores se migran idempotentemente.
+- [x] Dos señales cercanas conservan dos clips independientes de 8 segundos.
+- [x] El evento tiene un snapshot canonico explicable.
+- [x] History lista eventos desde la base seleccionada.
+- [x] El operador puede corregir una pieza.
+- [x] La medida automatica sigue intacta.
+- [x] El historial de revisiones es visible.
+- [x] Conflictos concurrentes regresan 409.
+- [x] Los clips anteriores se migran idempotentemente.
 - [ ] SQLite temporal se migra a PostgreSQL con conteos y revisiones iguales.
 - [ ] DB down deja eventos reconciliables.
 - [ ] Backups y restore estan probados.
@@ -1803,18 +1795,16 @@ La integracion esta terminada cuando:
 
 ## 31. Orden recomendado para la siguiente sesion
 
-1. Implementar paridad de vision en `LiveProcessor._process`.
-2. Agregar `box_rules` y zonas al overlay live.
-3. Cambiar todas las medidas visibles al formato compacto.
-4. Ejecutar video simulado a `conf=0.10`.
-5. Comparar tool y live en los mismos frames.
-6. Agregar psycopg y migracion inicial.
-7. Crear eventos DB desde `PLCMonitor`.
-8. Finalizar evento desde `ClipRecorder`.
-9. Implementar History de solo lectura.
-10. Implementar edicion auditada por pieza.
-11. Migrar sidecars.
-12. Probar en servidor con RTSP y PLC.
+1. Reiniciar el Live MVP con las credenciales AXIS para cargar el checkpoint
+   individual, `conf=0.10` y el codigo actualizado.
+2. Abrir la calibracion desplegada en el tool y guardar las zonas rojas
+   vigentes; el archivo actual no contiene `exclusion_zones`.
+3. Ejecutar video simulado a `conf=0.10`.
+4. Comparar tool y live en los mismos frames.
+5. Validar detecciones, zonas, Sobel y medidas con piezas reales.
+6. Ejecutar una prueba prolongada y definir servicio/backup.
+7. Cuando TI desbloquee PostgreSQL, instalar el servicio, aplicar migraciones y
+   ejecutar la migracion idempotente desde SQLite.
 
 ## 32. Resumen de handoff
 

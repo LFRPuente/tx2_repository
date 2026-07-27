@@ -1,6 +1,9 @@
 param(
     [switch]$DatabaseDisabled,
-    [string]$SqlitePath
+    [string]$SqlitePath,
+    [ValidateRange(0.01, 1.0)]
+    [double]$Confidence = 0.10,
+    [string]$CameraIp = "10.14.115.241"
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,11 +16,18 @@ $datasetDir = Join-Path $root "dataset_pieces"
 $pieceModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt"
 $legacyModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_tubos_v1\weights\best.pt"
 $modelPath = if (Test-Path -LiteralPath $pieceModelPath) { $pieceModelPath } else { $legacyModelPath }
-$cameraIp = "10.14.115.241"
-
 if ($modelPath -eq $legacyModelPath) {
     Write-Warning "Individual-piece model not found. Live inference is using the legacy package model."
 }
+else {
+    $modelHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $modelPath).Hash
+    Write-Host "Model: individual pieces ($modelPath)"
+    Write-Host "Model SHA-256: $modelHash"
+}
+Write-Host "Camera: $CameraIp"
+Write-Host "YOLO confidence: $Confidence"
+Write-Host "Homography: $(Join-Path $outputDir 'homography_selection.json')"
+Write-Host "Calibration: $(Join-Path $outputDir 'table_measurement_calibration.json')"
 
 $candidates = @(
     (Get-Command python -ErrorAction SilentlyContinue).Source
@@ -80,13 +90,13 @@ else {
 # To test with a file temporarily, change --source rtsp to --source video and pass --video.
 & $pythonExe $scriptPath `
   --source rtsp `
-  --camera-ip $cameraIp `
+  --camera-ip $CameraIp `
   --codec h264 `
   --camera-resolution 1920x1080 `
   --output-dir $outputDir `
   --dataset-dir $datasetDir `
   --model $modelPath `
-  --conf 0.50 `
+  --conf $Confidence `
   --capture-fps 10 `
   --process-fps 10 `
   --buffer-seconds 2 `
