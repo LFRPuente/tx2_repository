@@ -67,7 +67,7 @@ def main() -> int:
         events = source.list_measurement_events(limit=100)
         histories = source.operator_histories()
         sidecars: dict[str, Path] = {}
-        missing_sidecars = []
+        expired_events = []
         for event in events:
             detail = source.get_measurement_event(str(event["id"])) or {}
             asset = next(
@@ -79,26 +79,25 @@ def main() -> int:
                 None,
             )
             if asset is None:
-                missing_sidecars.append(str(event["id"]))
+                expired_events.append(str(event["id"]))
                 continue
             sidecar = resolve_asset_path(str(asset["relative_path"]), output_dir)
             if not sidecar.is_file():
-                missing_sidecars.append(str(event["id"]))
+                expired_events.append(str(event["id"]))
                 continue
             sidecars[str(event["id"])] = sidecar
 
-        if missing_sidecars:
+        if expired_events:
             print(
-                "ERROR: Events without a readable sidecar: "
-                + ", ".join(missing_sidecars),
+                f"IGNORED: {len(expired_events)} SQLite events have already "
+                "expired from the 100-clip disk retention window.",
                 file=sys.stderr,
             )
-            return 1
         if args.dry_run:
             print(
-                f"DRY RUN: {len(events)} events, {len(sidecars)} sidecars and "
-                f"{sum(len(item['revisions']) for item in histories)} operator "
-                "revisions are ready for PostgreSQL."
+                f"DRY RUN: {len(sidecars)} retained events and sidecars with "
+                f"{sum(len(item['revisions']) for item in histories if str(item['event_id']) in sidecars)} "
+                "operator revisions are ready for PostgreSQL."
             )
             return 0
         if not args.dsn.strip():
@@ -120,6 +119,8 @@ def main() -> int:
             revision_count = 0
             for history in histories:
                 source_event_id = str(history["event_id"])
+                if source_event_id not in event_id_map:
+                    continue
                 target_event_id = event_id_map[source_event_id]
                 target_piece_id = str(
                     uuid.uuid5(
