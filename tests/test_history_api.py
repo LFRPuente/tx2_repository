@@ -88,6 +88,16 @@ class HistoryApiTests(unittest.TestCase):
         self.assertEqual(payload["database_mode"], "postgresql")
         self.assertEqual(payload["count"], 1)
 
+    def test_history_reports_temporary_sqlite_mode(self) -> None:
+        live._database.backend_name = "sqlite"
+
+        response = self.client.get("/api/history/events?limit=20")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["database_mode"], "sqlite")
+        self.assertIn("migrated", payload["warning"])
+
     def test_operator_measurement_converts_units_and_records_identity(self) -> None:
         response = self.client.patch(
             "/api/history/events/11111111-1111-1111-1111-111111111111/"

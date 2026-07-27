@@ -256,6 +256,7 @@ class DatabaseHealth:
     database: str | None = None
     user: str | None = None
     timezone: str | None = None
+    backend: str = "postgresql"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -265,10 +266,13 @@ class DatabaseHealth:
             "database": self.database,
             "user": self.user,
             "timezone": self.timezone,
+            "backend": self.backend,
         }
 
 
 class DatabaseRepository:
+    backend_name = "postgresql"
+
     def __init__(self, dsn: str, *, min_size: int = 1, max_size: int = 4) -> None:
         if not dsn.strip():
             raise ValueError("TX2_POSTGRES_DSN is required unless --db-disabled is used")
@@ -313,9 +317,15 @@ class DatabaseRepository:
                 database=row["database"],
                 user=row["user"],
                 timezone=row["timezone"],
+                backend=self.backend_name,
             )
         except Exception as exc:
-            return DatabaseHealth(enabled=True, ok=False, error=str(exc))
+            return DatabaseHealth(
+                enabled=True,
+                ok=False,
+                error=str(exc),
+                backend=self.backend_name,
+            )
 
     def validate_schema(self) -> None:
         required = {
@@ -1047,6 +1057,78 @@ class DatabaseRepository:
             raise
         except Exception as exc:
             raise DatabaseUnavailable(f"Could not clear operator measurement: {exc}") from exc
+
+    def import_operator_history(self, history: dict[str, Any]) -> None:
+        """Import an SQLite correction history without changing its audit timestamps."""
+        event_id = str(history["event_id"])
+        piece_id = str(history["piece_id"])
+        revisions = history.get("revisions")
+        if not isinstance(revisions, list):
+            raise ValueError("Operator history revisions must be a list")
+        try:
+            with self.pool.connection(timeout=5.0) as connection:
+                with connection.transaction():
+                    with connection.cursor() as cursor:
+                        piece = self._lock_piece(cursor, event_id, piece_id)
+                        for revision in revisions:
+                            cursor.execute(
+                                """
+                                INSERT INTO piece_measurement_revision (
+                                    piece_measurement_id, revision, action,
+                                    previous_operator_measurement_in,
+                                    new_operator_measurement_in,
+                                    automatic_measurement_in,
+                                    operator_id, operator_display_name,
+                                    reason, source_ip, changed_at
+                                )
+                                VALUES (
+                                    %(piece_id)s, %(revision)s, %(action)s,
+                                    %(previous)s, %(new)s, %(automatic)s,
+                                    %(operator_id)s, %(operator_display_name)s,
+                                    %(reason)s, %(source_ip)s, %(changed_at)s
+                                )
+                                ON CONFLICT (piece_measurement_id, revision) DO NOTHING
+                                """,
+                                {
+                                    "piece_id": piece["id"],
+                                    "revision": int(revision["revision"]),
+                                    "action": revision["action"],
+                                    "previous": revision.get(
+                                        "previous_operator_measurement_in"
+                                    ),
+                                    "new": revision.get("new_operator_measurement_in"),
+                                    "automatic": revision.get(
+                                        "automatic_measurement_in"
+                                    ),
+                                    "operator_id": revision["operator_id"],
+                                    "operator_display_name": revision.get(
+                                        "operator_display_name"
+                                    ),
+                                    "reason": revision["reason"],
+                                    "source_ip": revision.get("source_ip"),
+                                    "changed_at": revision["changed_at"],
+                                },
+                            )
+                        cursor.execute(
+                            """
+                            UPDATE piece_measurement
+                            SET operator_measurement_in = %s,
+                                operator_revision = %s,
+                                updated_at = now()
+                            WHERE id = %s
+                            """,
+                            (
+                                history.get("operator_measurement_in"),
+                                int(history.get("operator_revision") or 0),
+                                piece["id"],
+                            ),
+                        )
+        except (RecordNotFound, ValueError):
+            raise
+        except Exception as exc:
+            raise DatabaseUnavailable(
+                f"Could not import operator correction history: {exc}"
+            ) from exc
 
     @staticmethod
     def _lock_piece(cursor: Any, event_id: str, piece_id: str) -> dict[str, Any]:

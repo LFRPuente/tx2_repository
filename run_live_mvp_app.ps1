@@ -1,5 +1,6 @@
 param(
-    [switch]$DatabaseDisabled
+    [switch]$DatabaseDisabled,
+    [string]$SqlitePath
 )
 
 $ErrorActionPreference = "Stop"
@@ -7,6 +8,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $scriptPath = Join-Path $root "live_mvp_app.py"
 $outputDir = Join-Path $root "outputs"
+$defaultSqlitePath = Join-Path $outputDir "tx2_live_mvp.sqlite3"
 $datasetDir = Join-Path $root "dataset_pieces"
 $pieceModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt"
 $legacyModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_tubos_v1\weights\best.pt"
@@ -57,14 +59,20 @@ if (-not $env:AXIS_PASSWORD) {
     }
 }
 
-if (-not $DatabaseDisabled -and -not $env:TX2_POSTGRES_DSN) {
-    throw "TX2_POSTGRES_DSN is required. Use -DatabaseDisabled only for explicit simulation."
-}
-
 $databaseArgs = @()
 if ($DatabaseDisabled) {
     $databaseArgs += "--db-disabled"
-    Write-Warning "PostgreSQL is disabled explicitly. History persistence is in simulation mode."
+    Write-Warning "The database is disabled explicitly. History persistence is in simulation mode."
+}
+elseif ($env:TX2_POSTGRES_DSN) {
+    Write-Host "Database: PostgreSQL"
+}
+else {
+    if (-not $SqlitePath) {
+        $SqlitePath = if ($env:TX2_SQLITE_PATH) { $env:TX2_SQLITE_PATH } else { $defaultSqlitePath }
+    }
+    $databaseArgs += @("--sqlite-path", $SqlitePath)
+    Write-Host "Database: SQLite temporal ($SqlitePath)"
 }
 
 # This MVP is live by default: Python reads the AXIS camera directly through RTSP.

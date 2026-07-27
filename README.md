@@ -92,8 +92,10 @@ Vision API responses now include:
 The singular `sobel` and `measurement` fields remain temporarily available for
 older clients and refer to the first valid piece.
 
-In PostgreSQL, one PLC measurement event owns zero or more piece measurement
-rows. Automatic and operator-entered values remain separate for every piece.
+In either supported database backend, one PLC measurement event owns zero or
+more piece measurement rows. `measurement_event.detected_piece_count` stores
+the detected quantity and `valid_piece_count` stores the validated quantity.
+Automatic and operator-entered values remain separate for every piece.
 
 ## Python Setup
 
@@ -151,11 +153,31 @@ http://127.0.0.1:5173
 
 ## Run The Live MVP
 
-Configure the AXIS credentials in the terminal that will launch the app:
+Configure the AXIS credentials in the terminal that will launch the app.
+While PostgreSQL is pending, the launcher automatically uses the local SQLite
+database `outputs/tx2_live_mvp.sqlite3`:
 
 ```powershell
 $env:AXIS_USER="your-user"
 $env:AXIS_PASSWORD="your-password"
+.\run_live_mvp_app.ps1
+```
+
+Import existing clip sidecars before the first SQLite launch:
+
+```powershell
+python tools\import_live_sidecars_to_sqlite.py `
+  --output-dir .\outputs `
+  --model .\runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt
+```
+
+The import is idempotent. The background reconciler also registers legacy
+sidecars that have not yet been associated with the selected backend.
+
+When PostgreSQL is available, set the DSN before launching. A configured
+PostgreSQL connection is never allowed to fail over silently to SQLite:
+
+```powershell
 $env:TX2_POSTGRES_DSN="host=127.0.0.1 port=5432 dbname=tx2_vision user=tx2_vision_app connect_timeout=5"
 .\run_live_mvp_app.ps1
 ```
@@ -184,15 +206,16 @@ The MP4 itself contains the processed live camera view with the YOLO-derived
 reference and front overlays; it is not the raw camera feed.
 The history shows up to six representative processing captures per clip while
 the full processing data remains in its sidecar JSON. The app retains the 100
-most recent clips and removes older clip artifacts and their PostgreSQL events
+most recent clips and removes older clip artifacts and their database events
 automatically.
 
-PostgreSQL is the History system of record. Each PLC signal creates an
+The selected database is the History system of record. Each PLC signal creates an
 idempotent event, snapshots the active model/homography/calibration hashes,
 stores all processing snapshots, selects one canonical snapshot, and persists
 its per-piece automatic measurements. Operator corrections preserve the
 automatic value and create immutable audit revisions with optimistic
-concurrency checks.
+concurrency checks. SQLite mirrors the PostgreSQL entities so it can be migrated
+later without changing the Live or History API.
 
 The live frame buffer is capped to avoid retaining several gigabytes of raw
 images. Clips are streamed directly to disk and resampled to the configured
@@ -206,11 +229,12 @@ Live MVP data is stored directly under:
 outputs/live_plc_clips/<date>/
 ```
 
-Storage currently uses MP4, JSON, and JPEG files. SQLite is not used.
-If PostgreSQL is temporarily unavailable after startup, the MP4 and sidecar are
-kept with `db_sync_status: pending` and a background reconciler retries them.
-Production startup fails if PostgreSQL or its schema is unavailable; there is
-no silent fallback. For an explicit camera/PLC simulation only:
+MP4 and JPEG assets remain on disk; SQLite or PostgreSQL stores event, snapshot,
+piece, asset and audit metadata. Sidecars record `db_sync_backend` so the
+reconciler can idempotently register legacy clips and move between backends.
+If the configured database is temporarily unavailable after startup, the MP4
+and sidecar are kept with `db_sync_status: pending` and a background reconciler
+retries them. For an explicit camera/PLC simulation only:
 
 ```powershell
 .\run_live_mvp_app.ps1 -DatabaseDisabled
@@ -221,7 +245,8 @@ corrections are disabled.
 
 ## PostgreSQL Server Setup
 
-PostgreSQL will be the only application database. Follow the Windows server
+PostgreSQL remains the production target. SQLite is the approved temporary
+local backend while the Windows service is pending. Follow the PostgreSQL
 installation, security, credential, verification, and backup instructions in
 [`docs/postgresql_server_setup.md`](docs/postgresql_server_setup.md).
 
@@ -247,6 +272,19 @@ legacy sidecars with event/configuration identifiers, registers disk assets by
 relative path, and can be rerun safely. The schema and lifecycle contract are
 specified in
 [`LIVE_MVP_INTEGRATION_README.md`](LIVE_MVP_INTEGRATION_README.md).
+
+After SQLite has been used, validate and migrate all events and immutable
+operator revisions:
+
+```powershell
+python tools\migrate_sqlite_to_postgres.py --dry-run
+python tools\migrate_sqlite_to_postgres.py
+```
+
+The migration is idempotent. It preserves event IDs, per-piece automatic
+measurements, current operator overrides, revision numbers and audit
+timestamps. Keep the SQLite file until the PostgreSQL event and revision counts
+have been verified.
 
 ## Next Steps On The TX2 Server
 

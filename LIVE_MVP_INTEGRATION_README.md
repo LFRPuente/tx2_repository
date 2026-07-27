@@ -24,6 +24,13 @@ de datos y una secuencia de implementacion verificable.
 > aplicacion de produccion. El tool se conserva para configurar, anotar,
 > entrenar y depurar. El proceso de produccion sigue siendo
 > `live_mvp_app.py`.
+>
+> Excepcion operativa temporal aprobada: mientras TI instala PostgreSQL, el
+> Live MVP usa `outputs/tx2_live_mvp.sqlite3`. SQLite refleja las mismas
+> entidades y restricciones funcionales, no guarda los MP4 dentro de la base y
+> se migra con `tools/migrate_sqlite_to_postgres.py`. Si
+> `TX2_POSTGRES_DSN` esta definido y falla, la aplicacion se detiene; nunca cae
+> silenciosamente a SQLite.
 
 ## 1. Documentos relacionados
 
@@ -151,7 +158,8 @@ Estado actualizado el 2026-07-27 en `codex/live-mvp-integration`: la capa de
 aplicacion PostgreSQL, migracion, reconciliacion, History y auditoria ya esta
 implementada. La instalacion del servicio PostgreSQL, el login restringido,
 `pgpass.conf`, backups y la validacion end-to-end en el servidor siguen siendo
-pasos operativos y requieren permisos de administrador.
+pasos operativos y requieren permisos de administrador. SQLite esta
+implementado como backend temporal y migrable para no detener el Live MVP.
 
 | Capacidad | Tool offline | Live MVP | Trabajo pendiente |
 |---|---:|---:|---|
@@ -170,6 +178,7 @@ pasos operativos y requieren permisos de administrador.
 | Formato `40' 9 1/16"` | Si | No | Cambiar overlays y tablas |
 | PLC/OPC UA | Pruebas | Si | Endurecer reconexion y metricas |
 | Clips fijos de 8 s | No aplica | Si, ventanas independientes | Validacion de duracion/retencion |
+| SQLite temporal | No | Implementado | Migrar y retirar despues de validar PostgreSQL |
 | PostgreSQL | No | Implementado | Instalar/configurar servicio y ejecutar migraciones |
 | Edicion en History | No | Implementada | Validacion operativa y permisos |
 | Autenticacion del operador | No | Identidad explicita inicial | Integrar Azure AD |
@@ -649,19 +658,25 @@ calibracion, la medida historica debe seguir siendo explicable.
 La configuracion de un evento nunca debe apuntar solamente al archivo actual,
 porque ese archivo puede cambiar.
 
-## 10. PostgreSQL como unica base de datos
+## 10. PostgreSQL como destino de produccion
 
-PostgreSQL sera la unica base de datos de la aplicacion.
+PostgreSQL sera la base de datos final de produccion. Durante el bloqueo de
+instalacion del servicio Windows se permite una sola base SQLite local:
+
+```text
+outputs/tx2_live_mvp.sqlite3
+```
 
 No se debe agregar:
 
-- SQLite;
+- otra base SQLite ni una base por clip;
 - una base separada para History;
 - valores editables guardados solamente en JSON;
 - estado de operador dentro de `localStorage`.
 
-Los MP4 y JPEG pueden permanecer en disco. PostgreSQL guarda sus rutas,
-metadatos y hashes.
+SQLite usa las mismas entidades de eventos, snapshots, piezas, assets y
+revisiones. Los MP4 y JPEG permanecen en disco. La base seleccionada guarda sus
+rutas, metadatos y hashes.
 
 ### 10.1 Dependencia recomendada
 
@@ -1338,10 +1353,10 @@ Estrategia:
 4. reintentar con backoff;
 5. exponer contador de pendientes;
 6. reconciliar al reiniciar;
-7. no usar SQLite como cola.
+7. no cambiar automaticamente de PostgreSQL a SQLite.
 
-El sidecar de recuperacion no reemplaza PostgreSQL. Solo permite reconstruir el
-evento cuando vuelve la conexion.
+El sidecar de recuperacion permite reconstruir el evento. SQLite es un backend
+temporal explicito, no una cola activada por errores de PostgreSQL.
 
 ## 21. Cambios concretos por archivo
 
@@ -1726,10 +1741,11 @@ Si la integracion de DB falla:
 
 1. detener el servicio;
 2. conservar `outputs/live_plc_clips`;
-3. corregir o restaurar PostgreSQL;
-4. ejecutar reconciliacion;
-5. verificar conteos;
-6. reanudar.
+3. conservar y respaldar `outputs/tx2_live_mvp.sqlite3`;
+4. corregir o restaurar la base seleccionada;
+5. ejecutar reconciliacion;
+6. verificar conteos;
+7. reanudar.
 
 ## 29. Cosas que no se deben hacer
 
@@ -1743,7 +1759,7 @@ Si la integracion de DB falla:
 - No guardar `40' 9 1/16"` como unico valor.
 - No sobrescribir `automatic_measurement_in`.
 - No guardar solamente el ultimo cambio del operador.
-- No usar SQLite.
+- No dejar SQLite como backend permanente despues de validar PostgreSQL.
 - No guardar imagenes base64 en PostgreSQL.
 - No considerar `piece_id` estable entre frames sin tracking.
 - No usar `time.time()` para limites de grabacion.
@@ -1762,15 +1778,16 @@ La integracion esta terminada cuando:
 - [ ] Cada pieza conserva box, Sobel, medicion y validez.
 - [ ] Todos los frentes son horizontales.
 - [ ] La UI muestra `40' 9 1/16"` sin `ft` ni `in`.
-- [ ] La señal PLC crea exactamente un evento PostgreSQL.
+- [ ] La señal PLC crea exactamente un evento en la base seleccionada.
 - [ ] Dos señales cercanas conservan dos clips independientes de 8 segundos.
 - [ ] El evento tiene un snapshot canonico explicable.
-- [ ] History lista eventos desde PostgreSQL.
+- [ ] History lista eventos desde la base seleccionada.
 - [ ] El operador puede corregir una pieza.
 - [ ] La medida automatica sigue intacta.
 - [ ] El historial de revisiones es visible.
 - [ ] Conflictos concurrentes regresan 409.
 - [ ] Los clips anteriores se migran idempotentemente.
+- [ ] SQLite temporal se migra a PostgreSQL con conteos y revisiones iguales.
 - [ ] DB down deja eventos reconciliables.
 - [ ] Backups y restore estan probados.
 - [ ] La aplicacion pasa una prueba prolongada sin crecimiento continuo de RAM.

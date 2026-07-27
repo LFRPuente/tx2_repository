@@ -46,6 +46,7 @@ from tx2_database import (
     snapshot_pieces,
     snapshot_summary,
 )
+from tx2_sqlite_database import SQLiteDatabaseRepository
 
 DEFAULT_VIDEO = Path(r"C:\Users\luis_\Downloads\20260724_10\20260724_100105_6439.mkv")
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
@@ -141,6 +142,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plc-timeout", type=float, default=8.0)
     parser.add_argument("--plc-edge", choices=("changed", "rising", "falling", "any"), default="rising")
     parser.add_argument("--postgres-dsn", default=os.environ.get("TX2_POSTGRES_DSN", ""))
+    parser.add_argument(
+        "--sqlite-path",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "TX2_SQLITE_PATH",
+                str(DEFAULT_OUTPUT_DIR / "tx2_live_mvp.sqlite3"),
+            )
+        ),
+    )
     parser.add_argument("--db-disabled", action="store_true")
     parser.add_argument("--db-retry-seconds", type=float, default=15.0)
     return parser.parse_args()
@@ -574,7 +585,7 @@ class ClipRecorder:
         args: argparse.Namespace,
         buffer: FrameBuffer,
         processor: LiveProcessor | None = None,
-        database: DatabaseRepository | None = None,
+        database: DatabaseRepository | SQLiteDatabaseRepository | None = None,
     ) -> None:
         self.args = args
         self.buffer = buffer
@@ -845,6 +856,7 @@ class ClipRecorder:
                     else None
                 ),
                 "db_sync_status": db_sync_status,
+                "db_sync_backend": None,
                 "db_sync_error": db_sync_error,
                 "db_sync_attempts": 0,
                 "db_sync_last_attempt_at": None,
@@ -853,7 +865,7 @@ class ClipRecorder:
             if self.database is not None:
                 sidecar["db_sync_attempts"] = 1
                 sidecar["db_sync_last_attempt_at"] = utc_now()
-                sidecar["db_sync_status"] = "synced"
+                sidecar["db_sync_status"] = "pending"
                 sidecar["db_sync_error"] = ""
                 write_json_atomic(json_path, sidecar)
                 try:
@@ -866,6 +878,9 @@ class ClipRecorder:
                         sidecar["event_id"] = actual_event_id
                         write_json_atomic(json_path, sidecar)
                         self.database.sync_sidecar(json_path, self.args.output_dir)
+                    sidecar["db_sync_status"] = "synced"
+                    sidecar["db_sync_backend"] = self.database.backend_name
+                    write_json_atomic(json_path, sidecar)
                 except Exception as exc:
                     sidecar["db_sync_status"] = "pending"
                     sidecar["db_sync_error"] = str(exc)
@@ -926,17 +941,18 @@ class DatabaseReconciler:
     def __init__(
         self,
         args: argparse.Namespace,
-        database: DatabaseRepository,
+        database: DatabaseRepository | SQLiteDatabaseRepository,
     ) -> None:
         self.args = args
         self.database = database
         self.stop_event = threading.Event()
         self.thread = threading.Thread(
             target=self._run,
-            name="postgres-sidecar-reconciler",
+            name="database-sidecar-reconciler",
             daemon=True,
         )
         self.lock = threading.Lock()
+        self.vision_configuration = build_vision_configuration(args, ROOT)
         self.state: dict[str, Any] = {
             "running": False,
             "pending": 0,
@@ -962,14 +978,35 @@ class DatabaseReconciler:
         with self.lock:
             self.state.update(updates)
 
+    def _enrich_sidecar(self, data: dict[str, Any]) -> dict[str, Any]:
+        event = data.get("event") if isinstance(data.get("event"), dict) else {}
+        plc_endpoint = str(data.get("plc_endpoint") or self.args.plc_endpoint)
+        plc_event_node = str(data.get("plc_event_node") or self.args.event_node)
+        event_key = str(
+            data.get("event_key")
+            or build_event_key(event, plc_endpoint, plc_event_node)
+        )
+        data.setdefault("event_key", event_key)
+        data.setdefault("event_id", event_uuid(event_key))
+        data.setdefault("vision_configuration", self.vision_configuration)
+        data.setdefault("plc_endpoint", plc_endpoint)
+        data.setdefault("plc_event_node", plc_event_node)
+        data.setdefault("plc_watchdog_node", str(self.args.watchdog_node))
+        data.setdefault("camera_source", "legacy_live_mvp")
+        return data
+
     def sync_once(self) -> None:
         pending_paths = []
+        backend = self.database.backend_name
         for path in clip_sidecars(self.args.output_dir):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
                 data = None
-            if data and data.get("db_sync_status") == "pending":
+            if data and (
+                data.get("db_sync_status") == "pending"
+                or data.get("db_sync_backend") != backend
+            ):
                 pending_paths.append(path)
         self._set_state(running=True, pending=len(pending_paths), last_run_utc=utc_now())
         synced = 0
@@ -984,9 +1021,10 @@ class DatabaseReconciler:
                 data = None
             if not data:
                 continue
+            data = self._enrich_sidecar(data)
             data["db_sync_attempts"] = int(data.get("db_sync_attempts") or 0) + 1
             data["db_sync_last_attempt_at"] = utc_now()
-            data["db_sync_status"] = "synced"
+            data["db_sync_status"] = "pending"
             data["db_sync_error"] = ""
             write_json_atomic(path, data)
             try:
@@ -995,6 +1033,10 @@ class DatabaseReconciler:
                     data["event_id"] = actual_event_id
                     write_json_atomic(path, data)
                     self.database.sync_sidecar(path, self.args.output_dir)
+                data["db_sync_status"] = "synced"
+                data["db_sync_backend"] = backend
+                data["db_sync_error"] = ""
+                write_json_atomic(path, data)
                 synced += 1
             except Exception as exc:
                 data["db_sync_status"] = "pending"
@@ -1515,7 +1557,7 @@ function renderPieces(pieces, databaseMode) {
         <td>${esc(difference)}</td>
         <td>YOLO ${number(piece.yolo_confidence, 2)} / Edge ${number(piece.sobel_confidence, 2)}</td>
         <td><span class="state ${state}">${state === 'ok' ? 'Valid' : 'Review'}</span><br><span class="muted">rev ${esc(piece.operator_revision ?? 0)}</span></td>
-        <td>${databaseMode === 'postgresql' ? `<button class="btn edit-piece" data-piece-id="${esc(piece.id)}">Edit</button>${hasOperator ? ` <button class="btn danger clear-piece" data-piece-id="${esc(piece.id)}">Clear</button>` : ''}` : ''}</td>
+        <td>${databaseMode !== 'simulation' ? `<button class="btn edit-piece" data-piece-id="${esc(piece.id)}">Edit</button>${hasOperator ? ` <button class="btn danger clear-piece" data-piece-id="${esc(piece.id)}">Clear</button>` : ''}` : ''}</td>
       </tr>`;
     }).join('')}</tbody>
   </table>`;
@@ -1578,7 +1620,7 @@ async function loadHistory() {
   if (!response.ok) throw new Error(data.error || 'Could not load history');
   if (data.database_mode !== 'postgresql') {
     $('mode').style.display = 'block';
-    $('mode').textContent = data.warning || 'PostgreSQL is disabled.';
+    $('mode').textContent = data.warning || 'The database is disabled.';
   }
   $('event-count').textContent = `${data.count} saved events`;
   if (!data.events.length) {
@@ -1674,8 +1716,14 @@ _camera: CameraReader
 _processor: LiveProcessor
 _recorder: ClipRecorder
 _plc: PLCMonitor
-_database: DatabaseRepository | None = None
+_database: DatabaseRepository | SQLiteDatabaseRepository | None = None
 _reconciler: DatabaseReconciler | None = None
+
+
+def database_mode() -> str:
+    if _database is None:
+        return "simulation"
+    return str(getattr(_database, "backend_name", "postgresql"))
 
 
 def clips_root(output_dir: Path) -> Path:
@@ -1830,7 +1878,7 @@ def database_event_detail(event_id: str) -> dict[str, Any] | None:
         f"/api/history/events/{event_id}/assets/{video['id']}" if video else None
     )
     event["detail_url"] = f"/history/{event_id}"
-    event["database_mode"] = "postgresql"
+    event["database_mode"] = database_mode()
     return clean_value(event)
 
 
@@ -1921,23 +1969,31 @@ def api_history_events():
             events=events,
             count=len(events),
             database_mode="simulation",
-            warning="PostgreSQL is disabled explicitly; operator corrections are unavailable.",
+            warning="The database is disabled explicitly; operator corrections are unavailable.",
         )
+    mode = database_mode()
     try:
         events = _database.list_measurement_events(
             limit=limit,
             before=request.args.get("before"),
         )
     except DatabaseUnavailable as exc:
-        return jsonify(error=str(exc), database_mode="postgresql"), 503
+        return jsonify(error=str(exc), database_mode=mode), 503
     for event in events:
         event["id"] = str(event["id"])
         event["detail_url"] = f"/history/{event['id']}"
         event["video_url"] = f"/api/history/events/{event['id']}/video"
+    warning = (
+        "SQLite temporal is active. History and corrections will be migrated "
+        "to PostgreSQL when the server is available."
+        if mode == "sqlite"
+        else ""
+    )
     return jsonify(
         events=clean_value(events),
         count=len(events),
-        database_mode="postgresql",
+        database_mode=mode,
+        warning=warning,
     )
 
 
@@ -2032,7 +2088,7 @@ def operator_measurement_inches(payload: dict[str, Any]) -> Decimal:
 )
 def api_history_operator_measurement(event_id: str, piece_id: str):
     if _database is None:
-        return jsonify(error="Operator corrections require PostgreSQL"), 503
+        return jsonify(error="Operator corrections require a database"), 503
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify(error="A JSON request body is required"), 400
@@ -2123,15 +2179,11 @@ def main() -> int:
     _args = parse_args()
     configure_vision_module(_args)
     if not _args.db_disabled:
-        if not _args.postgres_dsn.strip():
-            print(
-                "ERROR: TX2_POSTGRES_DSN is required. "
-                "Use --db-disabled only for explicit simulation.",
-                file=sys.stderr,
-            )
-            return 2
         try:
-            _database = DatabaseRepository(_args.postgres_dsn)
+            if _args.postgres_dsn.strip():
+                _database = DatabaseRepository(_args.postgres_dsn)
+            else:
+                _database = SQLiteDatabaseRepository(_args.sqlite_path)
             _database.open(timeout=float(_args.plc_timeout))
             _database.validate_schema()
             _database.recover_stale_measurement_events(
@@ -2141,7 +2193,7 @@ def main() -> int:
             if _database is not None:
                 _database.close()
                 _database = None
-            print(f"ERROR: PostgreSQL startup validation failed: {exc}", file=sys.stderr)
+            print(f"ERROR: Database startup validation failed: {exc}", file=sys.stderr)
             return 2
 
     requested_buffer_frames = int(max(8, float(_args.buffer_seconds) * max(1.0, float(_args.capture_fps))))
@@ -2170,7 +2222,10 @@ def main() -> int:
     print(f"\n  TX2 Live MVP at http://127.0.0.1:{_args.port}\n")
     print(f"  Source: {_args.source}")
     print(f"  PLC: {'enabled' if _args.plc_enabled else 'disabled'}")
-    print(f"  Database: {'disabled (simulation)' if _args.db_disabled else 'PostgreSQL'}")
+    print(
+        "  Database: "
+        + ("disabled (simulation)" if _args.db_disabled else database_mode())
+    )
     try:
         app.run(host="127.0.0.1", port=_args.port, debug=False, threaded=True)
     finally:
