@@ -16,8 +16,24 @@ if str(REPO_ROOT) not in sys.path:
 import cv2
 import numpy as np
 
-from live_mvp_app import HTML, ClipRecorder, FrameBuffer, representative_snapshots
+from live_mvp_app import HTML, ClipRecorder, FrameBuffer, LiveProcessor, representative_snapshots
 from tools.plc_triggered_video_recorder import edge_matches
+
+
+class FakeOverlayProcessor:
+    def __init__(self, buffer: FrameBuffer) -> None:
+        self.buffer = buffer
+
+    def recording_frame(self) -> dict | None:
+        item = self.buffer.latest()
+        if item is None:
+            return None
+        processed = item.copy()
+        processed["frame"] = np.full_like(item["frame"], (0, 0, 240))
+        return processed
+
+    def snapshot(self, include_images: bool = False) -> dict:
+        return {"result": None}
 
 
 class FrameBufferTests(unittest.TestCase):
@@ -39,6 +55,27 @@ class FrameBufferTests(unittest.TestCase):
             buffer.stats(),
             {"count": 8, "first_index": 12, "last_index": 19},
         )
+
+
+class LiveProcessorTests(unittest.TestCase):
+    def test_recording_frame_is_available_without_entering_api_payloads(self) -> None:
+        processor = LiveProcessor(SimpleNamespace(process_fps=10.0), FrameBuffer(maxlen=8))
+        recording_frame = {
+            "index": 7,
+            "utc": "frame-7",
+            "monotonic": 7.0,
+            "frame": np.zeros((8, 8, 3), dtype=np.uint8),
+        }
+        processor._set_state(
+            result={
+                "frame_index": 7,
+                "original_image": "encoded",
+                "_recording_frame": recording_frame,
+            }
+        )
+
+        self.assertEqual(processor.recording_frame()["index"], 7)
+        self.assertNotIn("_recording_frame", processor.snapshot(include_images=True)["result"])
 
 
 class PlcEdgeTests(unittest.TestCase):
@@ -78,7 +115,7 @@ class ClipRecorderTests(unittest.TestCase):
                 max_clips=10,
             )
             buffer = FrameBuffer(maxlen=20)
-            recorder = ClipRecorder(args, buffer)
+            recorder = ClipRecorder(args, buffer, FakeOverlayProcessor(buffer))
             stop_feeder = threading.Event()
 
             def feed_frames() -> None:
@@ -136,6 +173,7 @@ class ClipRecorderTests(unittest.TestCase):
                 data = json.loads(sidecar_path.read_text(encoding="utf-8"))
                 self.assertEqual(data["frames_written"], 4)
                 self.assertAlmostEqual(data["video_duration_seconds"], 0.4, places=3)
+                self.assertEqual(data["video_content"], "yolo_processed_overlay")
 
                 video = cv2.VideoCapture(data["video_path"])
                 try:
@@ -146,6 +184,11 @@ class ClipRecorderTests(unittest.TestCase):
                     codec = "".join(chr((fourcc >> (8 * index)) & 0xFF) for index in range(4))
                     self.assertIn(codec.lower(), {"avc1", "h264"})
                     self.assertEqual(data["video_codec"], "h264")
+                    ok, encoded_frame = video.read()
+                    self.assertTrue(ok)
+                    blue, green, red = encoded_frame.mean(axis=(0, 1))
+                    self.assertGreater(red, blue + 100)
+                    self.assertGreater(red, green + 100)
                 finally:
                     video.release()
 

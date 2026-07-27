@@ -380,7 +380,11 @@ class LiveProcessor:
             result = self.state.get("result")
             if isinstance(result, dict):
                 if include_images:
-                    data["result"] = result.copy()
+                    data["result"] = {
+                        key: value
+                        for key, value in result.items()
+                        if key != "_recording_frame"
+                    }
                 else:
                     data["result"] = {
                         "frame_index": result.get("frame_index"),
@@ -392,6 +396,14 @@ class LiveProcessor:
                         "conf": result.get("conf"),
                     }
         return data
+
+    def recording_frame(self) -> dict[str, Any] | None:
+        with self.lock:
+            result = self.state.get("result")
+            if not isinstance(result, dict):
+                return None
+            item = result.get("_recording_frame")
+            return item.copy() if isinstance(item, dict) else None
 
     def _set_state(self, **updates: Any) -> None:
         with self.lock:
@@ -485,6 +497,12 @@ class LiveProcessor:
             "front_y_ratio": (float(sobel["line"]["y"]) / float(rect_h)) if sobel.get("line") else None,
             "model": str(self.args.model),
             "conf": float(self.args.conf),
+            "_recording_frame": {
+                "index": int(item["index"]),
+                "utc": item["utc"],
+                "monotonic": float(item["monotonic"]),
+                "frame": original_viz,
+            },
         }
 
 
@@ -520,6 +538,11 @@ class ClipRecorder:
             self.active_recordings.add(clip_index)
         thread = threading.Thread(target=self._record_clip, args=(clip_index, event), daemon=True)
         thread.start()
+
+    def _latest_recording_frame(self) -> dict[str, Any] | None:
+        if self.processor is not None:
+            return self.processor.recording_frame()
+        return self.buffer.latest()
 
     def _capture_processing_snapshot(
         self,
@@ -577,9 +600,6 @@ class ClipRecorder:
         last_written_source: dict[str, Any] | None = None
         writer: cv2.VideoWriter | None = None
         video_path: Path | None = None
-        latest = self.buffer.latest()
-        if latest:
-            last_index = int(latest["index"]) - 1
 
         try:
             day_dir = self.args.output_dir / "live_plc_clips" / datetime.now().strftime("%Y-%m-%d")
@@ -592,44 +612,42 @@ class ClipRecorder:
             json_path = day_dir / f"{base}.json"
 
             while time.perf_counter() < deadline:
-                new_frames = self.buffer.frames_since(last_index)
-                if new_frames:
-                    last_index = int(new_frames[-1]["index"])
-                for item in new_frames:
+                item = self._latest_recording_frame()
+                if item is not None and int(item["index"]) > last_index:
+                    last_index = int(item["index"])
                     item_mono = float(item["monotonic"])
-                    if item_mono < event_mono:
-                        continue
-                    source_frames_seen += 1
-                    if writer is None:
-                        height, width = item["frame"].shape[:2]
-                        writer_args = (
-                            str(video_path),
-                            cv2.VideoWriter_fourcc(*"avc1"),
-                            fps,
-                            (width, height),
-                        )
-                        if os.name == "nt":
-                            writer = cv2.VideoWriter(
-                                writer_args[0],
-                                cv2.CAP_MSMF,
-                                *writer_args[1:],
+                    if item_mono >= event_mono:
+                        source_frames_seen += 1
+                        if writer is None:
+                            height, width = item["frame"].shape[:2]
+                            writer_args = (
+                                str(video_path),
+                                cv2.VideoWriter_fourcc(*"avc1"),
+                                fps,
+                                (width, height),
                             )
-                        else:
-                            writer = cv2.VideoWriter(*writer_args)
-                        if not writer.isOpened():
-                            raise RuntimeError(f"Could not open VideoWriter: {video_path}")
-                    if last_source is None:
-                        last_source = item
+                            if os.name == "nt":
+                                writer = cv2.VideoWriter(
+                                    writer_args[0],
+                                    cv2.CAP_MSMF,
+                                    *writer_args[1:],
+                                )
+                            else:
+                                writer = cv2.VideoWriter(*writer_args)
+                            if not writer.isOpened():
+                                raise RuntimeError(f"Could not open VideoWriter: {video_path}")
+                        if last_source is None:
+                            last_source = item
 
-                    while frames_written < target_frame_count:
-                        sample_mono = event_mono + (frames_written / fps)
-                        if sample_mono > item_mono:
-                            break
-                        writer.write(last_source["frame"])
-                        first_written_source = first_written_source or last_source
-                        last_written_source = last_source
-                        frames_written += 1
-                    last_source = item
+                        while frames_written < target_frame_count:
+                            sample_mono = event_mono + (frames_written / fps)
+                            if sample_mono > item_mono:
+                                break
+                            writer.write(last_source["frame"])
+                            first_written_source = first_written_source or last_source
+                            last_written_source = last_source
+                            frames_written += 1
+                        last_source = item
                 self._capture_processing_snapshot(analysis_dir, processing_snapshots, seen_processing_frames)
                 time.sleep(0.025)
             self._capture_processing_snapshot(analysis_dir, processing_snapshots, seen_processing_frames)
@@ -655,6 +673,7 @@ class ClipRecorder:
                 "record_seconds": record_seconds,
                 "video_fps": fps,
                 "video_codec": "h264",
+                "video_content": "yolo_processed_overlay" if self.processor is not None else "raw_fallback",
                 "video_duration_seconds": frames_written / fps,
                 "frames_captured": source_frames_seen,
                 "frames_written": frames_written,

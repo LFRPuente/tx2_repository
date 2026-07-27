@@ -79,6 +79,8 @@ http://127.0.0.1:8767/history
 
 Each history entry contains a browser-compatible H.264 MP4, PLC event metadata,
 processing snapshots, and the overlays produced while the clip was recorded.
+The MP4 itself contains the processed live camera view with the YOLO-derived
+reference and front overlays; it is not the raw camera feed.
 The history shows up to six representative processing captures per clip while
 the full processing data remains in its sidecar JSON. The app retains the 100
 most recent clips and removes older clip artifacts automatically.
