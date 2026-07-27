@@ -958,6 +958,7 @@ class DatabaseReconciler:
             "pending": 0,
             "synced": 0,
             "failed": 0,
+            "pruned": 0,
             "last_run_utc": None,
             "last_error": "",
         }
@@ -1044,11 +1045,34 @@ class DatabaseReconciler:
                 last_error = str(exc)
                 failed += 1
                 write_json_atomic(path, data)
+        pruned = 0
+        all_event_ids = getattr(
+            self.database,
+            "all_measurement_event_ids",
+            None,
+        )
+        if callable(all_event_ids):
+            retained_event_ids: set[str] = set()
+            can_prune = True
+            for path in clip_sidecars(self.args.output_dir):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    can_prune = False
+                    break
+                event_id = data.get("event_id")
+                if event_id:
+                    retained_event_ids.add(str(event_id))
+            if can_prune:
+                for stale_event_id in all_event_ids() - retained_event_ids:
+                    self.database.delete_measurement_event(stale_event_id)
+                    pruned += 1
         self._set_state(
             running=False,
             pending=max(0, len(pending_paths) - synced),
             synced=int(self.state.get("synced") or 0) + synced,
             failed=int(self.state.get("failed") or 0) + failed,
+            pruned=int(self.state.get("pruned") or 0) + pruned,
             last_error=last_error,
         )
 

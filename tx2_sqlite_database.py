@@ -818,6 +818,18 @@ class SQLiteDatabaseRepository:
                 f"Could not list SQLite measurement events: {exc}"
             ) from exc
 
+    def all_measurement_event_ids(self) -> set[str]:
+        connection = self._connect(timeout=5.0)
+        try:
+            return {
+                str(row["id"])
+                for row in connection.execute(
+                    "SELECT id FROM measurement_event"
+                ).fetchall()
+            }
+        finally:
+            connection.close()
+
     def get_measurement_event(self, event_id: str) -> dict[str, Any] | None:
         try:
             connection = self._connect(timeout=5.0)

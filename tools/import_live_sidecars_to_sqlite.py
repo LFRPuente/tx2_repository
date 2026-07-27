@@ -93,9 +93,21 @@ def main() -> int:
     try:
         repository.open()
         repository.validate_schema()
+        existing_event_ids = repository.all_measurement_event_ids()
+        retained_event_ids: set[str] = set()
         imported = 0
+        skipped = 0
         failed = 0
         for path, data in prepared:
+            event_id = str(data["event_id"])
+            if (
+                data.get("db_sync_status") == "synced"
+                and data.get("db_sync_backend") == "sqlite"
+                and event_id in existing_event_ids
+            ):
+                retained_event_ids.add(event_id)
+                skipped += 1
+                continue
             data["db_sync_status"] = "pending"
             data["db_sync_backend"] = None
             data["db_sync_error"] = ""
@@ -106,6 +118,7 @@ def main() -> int:
                 data["db_sync_status"] = "synced"
                 data["db_sync_backend"] = "sqlite"
                 write_sidecar(path, data)
+                retained_event_ids.add(actual_event_id)
                 imported += 1
                 print(f"IMPORTED {path.relative_to(output_dir)}")
             except Exception as exc:
@@ -117,11 +130,23 @@ def main() -> int:
                     f"PENDING {path.relative_to(output_dir)}: {exc}",
                     file=sys.stderr,
                 )
+        pruned = 0
+        if failed == 0:
+            for stale_event_id in (
+                repository.all_measurement_event_ids() - retained_event_ids
+            ):
+                repository.delete_measurement_event(stale_event_id)
+                pruned += 1
         print(
-            f"Imported {imported}/{len(candidates)} sidecars into SQLite; "
-            f"{failed} pending."
+            f"SQLite is current for {imported + skipped}/{len(candidates)} "
+            f"sidecars ({imported} imported, {skipped} unchanged, "
+            f"{pruned} expired events pruned); {failed} pending."
         )
-        return 0 if failed == 0 and imported == len(candidates) else 1
+        return (
+            0
+            if failed == 0 and imported + skipped == len(candidates)
+            else 1
+        )
     except Exception as exc:
         print(f"ERROR: SQLite import failed: {exc}", file=sys.stderr)
         return 1
