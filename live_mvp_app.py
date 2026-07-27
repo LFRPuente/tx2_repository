@@ -40,6 +40,7 @@ DEFAULT_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_tubos_v1" / "we
 DEFAULT_ENDPOINT = "opc.tcp://10.14.6.48:49320"
 DEFAULT_WATCHDOG_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.VisionWD"
 DEFAULT_EVENT_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.MeasureLength"
+HISTORY_SNAPSHOT_LIMIT = 6
 
 
 def utc_now() -> str:
@@ -64,6 +65,18 @@ def clean_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [clean_value(item) for item in value]
     return str(value)
+
+
+def representative_snapshots(snapshots: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if limit <= 0 or not snapshots:
+        return []
+    if len(snapshots) <= limit:
+        return snapshots.copy()
+    if limit == 1:
+        return [snapshots[0]]
+    last_index = len(snapshots) - 1
+    indices = [round(position * last_index / (limit - 1)) for position in range(limit)]
+    return [snapshots[index] for index in indices]
 
 
 def img_to_b64(img: np.ndarray, quality: int = 82) -> str:
@@ -1103,13 +1116,14 @@ async function loadClip(clipId) {
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || 'Could not load clip');
   $('detail-title').textContent = data.clip_id;
+  const snapshotsShown = data.processing_snapshots_shown ?? data.processing_snapshots?.length ?? 0;
   $('viewer').innerHTML = `
     <video controls src="${data.video_url}"></video>
     <div class="meta">
       ${metric('Saved', data.saved_at || '-')}
       ${metric('Duration', `${data.record_seconds ?? '-'} s`)}
       ${metric('PLC edge', data.event?.event_edge || '-')}
-      ${metric('Snapshots', data.processing_snapshot_count ?? 0)}
+      ${metric('Captures', `${snapshotsShown} of ${data.processing_snapshot_count ?? snapshotsShown}`)}
     </div>
     ${renderSnapshots(data.processing_snapshots)}
   `;
@@ -1173,16 +1187,22 @@ def path_is_inside(path: Path, root: Path) -> bool:
     return resolved == resolved_root or resolved_root in resolved.parents
 
 
-def read_clip_sidecar(json_path: Path) -> dict[str, Any] | None:
+def read_clip_sidecar(json_path: Path, snapshot_limit: int | None = None) -> dict[str, Any] | None:
     try:
         data = json.loads(json_path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    snapshots = data.get("processing_snapshots", []) or []
+    data["processing_snapshot_count"] = int(data.get("processing_snapshot_count", len(snapshots)))
+    if snapshot_limit is not None:
+        snapshots = representative_snapshots(snapshots, snapshot_limit)
+        data["processing_snapshots"] = snapshots
+    data["processing_snapshots_shown"] = len(snapshots)
     data["clip_id"] = json_path.stem
     data["json_path"] = str(json_path)
     data["video_url"] = f"/api/live/clips/{json_path.stem}/video"
     data["detail_url"] = f"/history/{json_path.stem}"
-    for snapshot in data.get("processing_snapshots", []) or []:
+    for snapshot in snapshots:
         if snapshot.get("original_overlay_file"):
             snapshot["original_overlay_url"] = f"/api/live/clips/{json_path.stem}/asset/{snapshot['original_overlay_file']}"
         if snapshot.get("rectified_overlay_file"):
@@ -1199,7 +1219,7 @@ def find_clip_json(clip_id: str) -> Path | None:
 
 def delete_clip_artifacts(output_dir: Path, json_path: Path) -> None:
     root = clips_root(output_dir)
-    data = read_clip_sidecar(json_path) or {}
+    data = read_clip_sidecar(json_path, snapshot_limit=0) or {}
     candidates: list[Path] = [json_path]
     for key in ("video_path", "analysis_dir"):
         value = data.get(key)
@@ -1259,7 +1279,7 @@ def api_live_frame():
 def api_live_clips():
     clips = []
     for json_path in clip_sidecars(_args.output_dir):
-        data = read_clip_sidecar(json_path)
+        data = read_clip_sidecar(json_path, snapshot_limit=0)
         if data is not None:
             clips.append(data)
     return jsonify(clips=clips[:100], count=len(clips))
@@ -1270,7 +1290,7 @@ def api_live_clip(clip_id: str):
     json_path = find_clip_json(clip_id)
     if json_path is None:
         return jsonify(error="Clip not found"), 404
-    data = read_clip_sidecar(json_path)
+    data = read_clip_sidecar(json_path, snapshot_limit=HISTORY_SNAPSHOT_LIMIT)
     if data is None:
         return jsonify(error="Clip metadata could not be read"), 500
     return jsonify(data)
@@ -1281,7 +1301,7 @@ def api_live_clip_video(clip_id: str):
     json_path = find_clip_json(clip_id)
     if json_path is None:
         abort(404)
-    data = read_clip_sidecar(json_path) or {}
+    data = read_clip_sidecar(json_path, snapshot_limit=0) or {}
     video_path = Path(str(data.get("video_path", "")))
     if not video_path.exists() or not path_is_inside(video_path, clips_root(_args.output_dir)):
         abort(404)
@@ -1293,7 +1313,7 @@ def api_live_clip_asset(clip_id: str, asset_name: str):
     json_path = find_clip_json(clip_id)
     if json_path is None:
         abort(404)
-    data = read_clip_sidecar(json_path) or {}
+    data = read_clip_sidecar(json_path, snapshot_limit=0) or {}
     analysis_dir = Path(str(data.get("analysis_dir", "")))
     asset_path = analysis_dir / asset_name
     if not asset_path.exists() or not path_is_inside(asset_path, analysis_dir) or not path_is_inside(asset_path, clips_root(_args.output_dir)):

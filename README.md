@@ -79,8 +79,9 @@ http://127.0.0.1:8767/history
 
 Each history entry contains a browser-compatible H.264 MP4, PLC event metadata,
 processing snapshots, and the overlays produced while the clip was recorded.
-The app retains the 100 most recent clips and removes older clip artifacts
-automatically.
+The history shows up to six representative processing captures per clip while
+the full processing data remains in its sidecar JSON. The app retains the 100
+most recent clips and removes older clip artifacts automatically.
 
 The live frame buffer is capped to avoid retaining several gigabytes of raw
 images. Clips are streamed directly to disk and resampled to the configured

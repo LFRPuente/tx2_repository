@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 import cv2
 import numpy as np
 
-from live_mvp_app import HTML, ClipRecorder, FrameBuffer
+from live_mvp_app import HTML, ClipRecorder, FrameBuffer, representative_snapshots
 from tools.plc_triggered_video_recorder import edge_matches
 
 
@@ -53,6 +53,18 @@ class PlcEdgeTests(unittest.TestCase):
         self.assertIn("PLC signal received", HTML)
         self.assertNotIn("TX2 Vision", HTML)
         self.assertNotIn("<h1>Live MVP</h1>", HTML)
+
+
+class HistoryTests(unittest.TestCase):
+    def test_representative_snapshots_include_the_full_clip_range(self) -> None:
+        snapshots = [{"index": index} for index in range(64)]
+
+        selected = representative_snapshots(snapshots, 6)
+
+        self.assertEqual(len(selected), 6)
+        self.assertEqual(selected[0]["index"], 0)
+        self.assertEqual(selected[-1]["index"], 63)
+        self.assertEqual(len({item["index"] for item in selected}), 6)
 
 
 class ClipRecorderTests(unittest.TestCase):
