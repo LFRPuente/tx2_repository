@@ -94,20 +94,34 @@ def main() -> int:
         repository.open()
         repository.validate_schema()
         imported = 0
+        failed = 0
         for path, data in prepared:
             data["db_sync_status"] = "pending"
             data["db_sync_backend"] = None
             data["db_sync_error"] = ""
             write_sidecar(path, data)
-            actual_event_id = repository.sync_sidecar(path, output_dir)
-            data["event_id"] = actual_event_id
-            data["db_sync_status"] = "synced"
-            data["db_sync_backend"] = "sqlite"
-            write_sidecar(path, data)
-            imported += 1
-            print(f"IMPORTED {path.relative_to(output_dir)}")
-        print(f"Imported {imported}/{len(candidates)} sidecars into SQLite.")
-        return 0 if imported == len(candidates) else 1
+            try:
+                actual_event_id = repository.sync_sidecar(path, output_dir)
+                data["event_id"] = actual_event_id
+                data["db_sync_status"] = "synced"
+                data["db_sync_backend"] = "sqlite"
+                write_sidecar(path, data)
+                imported += 1
+                print(f"IMPORTED {path.relative_to(output_dir)}")
+            except Exception as exc:
+                data["db_sync_status"] = "pending"
+                data["db_sync_error"] = str(exc)
+                write_sidecar(path, data)
+                failed += 1
+                print(
+                    f"PENDING {path.relative_to(output_dir)}: {exc}",
+                    file=sys.stderr,
+                )
+        print(
+            f"Imported {imported}/{len(candidates)} sidecars into SQLite; "
+            f"{failed} pending."
+        )
+        return 0 if failed == 0 and imported == len(candidates) else 1
     except Exception as exc:
         print(f"ERROR: SQLite import failed: {exc}", file=sys.stderr)
         return 1
