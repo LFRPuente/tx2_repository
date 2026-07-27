@@ -192,7 +192,9 @@ The Live MVP provides a light interface with the live camera view and
 measurement diagram. It keeps the AXIS stream at `1920x1080` and targets 10 FPS
 for capture, processing, browser updates, and saved clips. It connects to the
 PLC through OPC UA and records one 8-second clip when `MeasureLength` changes
-from `False` to `True`.
+from `False` to `True`. The recording is provisional until the window closes:
+if YOLO did not detect any piece during those 8 seconds, the MP4, processing
+captures, sidecar, and pending database event are discarded.
 
 Open the saved clip history at:
 

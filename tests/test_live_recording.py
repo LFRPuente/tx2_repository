@@ -21,8 +21,9 @@ from tools.plc_triggered_video_recorder import edge_matches
 
 
 class FakeOverlayProcessor:
-    def __init__(self, buffer: FrameBuffer) -> None:
+    def __init__(self, buffer: FrameBuffer, *, detects_piece: bool = True) -> None:
         self.buffer = buffer
+        self.detects_piece = detects_piece
 
     def recording_frame(self) -> dict | None:
         item = self.buffer.latest()
@@ -33,7 +34,35 @@ class FakeOverlayProcessor:
         return processed
 
     def snapshot(self, include_images: bool = False) -> dict:
-        return {"result": None}
+        item = self.buffer.latest()
+        if item is None:
+            return {"result": None}
+        pieces = (
+            [
+                {
+                    "piece_id": 1,
+                    "valid": False,
+                    "box": {"x": 1, "y": 1, "w": 4, "h": 4, "conf": 0.9},
+                    "sobel": {},
+                    "measurement": None,
+                }
+            ]
+            if self.detects_piece
+            else []
+        )
+        return {
+            "result": {
+                "frame_index": int(item["index"]),
+                "frame_utc": item["utc"],
+                "frame_monotonic": float(item["monotonic"]),
+                "pieces": pieces,
+                "measurement_summary": {
+                    "detected_count": len(pieces),
+                    "valid_count": 0,
+                    "invalid_count": len(pieces),
+                },
+            }
+        }
 
 
 class FakeSnapshotProcessor:
@@ -45,6 +74,22 @@ class FakeSnapshotProcessor:
 
     def snapshot(self, include_images: bool = False) -> dict:
         return {"result": self.result}
+
+
+class FakeDatabase:
+    backend_name = "sqlite"
+
+    def __init__(self) -> None:
+        self.created_event_ids: list[str] = []
+        self.deleted_event_ids: list[str] = []
+
+    def create_measurement_event(self, **kwargs) -> str:
+        event_id = str(kwargs["event_id"])
+        self.created_event_ids.append(event_id)
+        return event_id
+
+    def delete_measurement_event(self, event_id: str) -> None:
+        self.deleted_event_ids.append(event_id)
 
 
 class FrameBufferTests(unittest.TestCase):
@@ -235,7 +280,7 @@ class ClipRecorderTests(unittest.TestCase):
                 max_clips=10,
             )
             buffer = FrameBuffer(maxlen=20)
-            recorder = ClipRecorder(args, buffer)
+            recorder = ClipRecorder(args, buffer, FakeOverlayProcessor(buffer))
             stop_feeder = threading.Event()
 
             def feed_frames() -> None:
@@ -286,6 +331,81 @@ class ClipRecorderTests(unittest.TestCase):
             self.assertEqual(snapshot["failed_recording_count"], 1)
             self.assertIn("No frames were available", snapshot["error"])
             self.assertEqual(len(list(Path(temp_dir).rglob("*.json"))), 1)
+
+    def test_clip_without_detected_pieces_is_removed_from_disk_and_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = SimpleNamespace(
+                output_dir=Path(temp_dir),
+                source="video",
+                video=Path("test.mp4"),
+                plc_endpoint="opc.tcp://test",
+                event_node="ns=2;s=MeasureLength",
+                watchdog_node="ns=2;s=VisionWD",
+                record_seconds=0.3,
+                record_fps=10.0,
+                capture_fps=30.0,
+                max_clips=10,
+            )
+            buffer = FrameBuffer(maxlen=20)
+            database = FakeDatabase()
+            recorder = ClipRecorder(
+                args,
+                buffer,
+                FakeOverlayProcessor(buffer, detects_piece=False),
+                database,
+            )
+            recorder.vision_configuration = {"configuration_hash": "test"}
+            stop_feeder = threading.Event()
+
+            def feed_frames() -> None:
+                index = 0
+                while not stop_feeder.is_set():
+                    buffer.append(
+                        {
+                            "index": index,
+                            "utc": f"frame-{index}",
+                            "monotonic": time.perf_counter(),
+                            "frame": np.zeros((48, 64, 3), dtype=np.uint8),
+                        }
+                    )
+                    index += 1
+                    time.sleep(0.01)
+
+            feeder = threading.Thread(target=feed_frames, daemon=True)
+            feeder.start()
+            self.addCleanup(stop_feeder.set)
+            self.addCleanup(feeder.join, 1.0)
+
+            deadline = time.perf_counter() + 1.0
+            while buffer.latest() is None and time.perf_counter() < deadline:
+                time.sleep(0.01)
+
+            recorder.start_event_clip(
+                {
+                    "event_edge": "rising",
+                    "event_read_monotonic": time.perf_counter(),
+                }
+            )
+
+            deadline = time.perf_counter() + 3.0
+            while recorder.snapshot()["recording"] and time.perf_counter() < deadline:
+                time.sleep(0.02)
+            stop_feeder.set()
+            feeder.join(timeout=1.0)
+
+            snapshot = recorder.snapshot()
+            self.assertFalse(snapshot["recording"])
+            self.assertEqual(snapshot["discarded_clip_count"], 1)
+            self.assertEqual(
+                snapshot["last_discarded_clip"]["reason"],
+                "no_piece_detected",
+            )
+            self.assertEqual(snapshot["failed_recording_count"], 0)
+            self.assertEqual(snapshot["error"], "")
+            self.assertEqual(database.deleted_event_ids, database.created_event_ids)
+            self.assertEqual(list(Path(temp_dir).rglob("*.mp4")), [])
+            self.assertEqual(list(Path(temp_dir).rglob("*.json")), [])
+            self.assertEqual(list(Path(temp_dir).rglob("*_analysis")), [])
 
 
 if __name__ == "__main__":

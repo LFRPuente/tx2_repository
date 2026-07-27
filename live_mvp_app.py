@@ -104,6 +104,18 @@ def representative_snapshots(snapshots: list[dict[str, Any]], limit: int) -> lis
     return [snapshots[index] for index in indices]
 
 
+def snapshots_contain_piece(snapshots: list[dict[str, Any]]) -> bool:
+    for snapshot in snapshots:
+        if snapshot_pieces(snapshot):
+            return True
+        try:
+            if int(snapshot_summary(snapshot).get("detected_count") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def img_to_b64(img: np.ndarray, quality: int = 82) -> str:
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
     if not ok:
@@ -597,6 +609,8 @@ class ClipRecorder:
         self.active_recordings: set[int] = set()
         self.clip_index = 0
         self.last_clip: dict[str, Any] | None = None
+        self.discarded_clip_count = 0
+        self.last_discarded_clip: dict[str, Any] | None = None
         self.failed_recordings: deque[dict[str, Any]] = deque(maxlen=20)
         self.error = ""
 
@@ -607,6 +621,8 @@ class ClipRecorder:
                 "active_recordings": len(self.active_recordings),
                 "clip_index": self.clip_index,
                 "last_clip": self.last_clip,
+                "discarded_clip_count": self.discarded_clip_count,
+                "last_discarded_clip": self.last_discarded_clip,
                 "failed_recording_count": len(self.failed_recordings),
                 "failed_recordings": [failure.copy() for failure in self.failed_recordings],
                 "error": self.error,
@@ -741,6 +757,8 @@ class ClipRecorder:
         last_written_source: dict[str, Any] | None = None
         writer: cv2.VideoWriter | None = None
         video_path: Path | None = None
+        analysis_dir: Path | None = None
+        json_path: Path | None = None
 
         try:
             day_dir = self.args.output_dir / "live_plc_clips" / datetime.now().strftime("%Y-%m-%d")
@@ -819,6 +837,42 @@ class ClipRecorder:
             if first_written_source is None or last_written_source is None:
                 raise RuntimeError("No frames were written to the clip.")
 
+            if not snapshots_contain_piece(processing_snapshots):
+                database_cleanup_error = ""
+                if self.database is not None:
+                    try:
+                        self.database.delete_measurement_event(measurement_event_id)
+                    except Exception as exc:
+                        database_cleanup_error = str(exc)
+                artifact_cleanup_errors = delete_clip_paths(
+                    self.args.output_dir,
+                    [video_path, analysis_dir, json_path],
+                )
+                discarded = {
+                    "clip_index": clip_index,
+                    "discarded_at": utc_now(),
+                    "event_id": measurement_event_id,
+                    "event": clean_value(event),
+                    "reason": "no_piece_detected",
+                    "processing_snapshot_count": len(processing_snapshots),
+                    "database_cleanup_error": database_cleanup_error,
+                    "artifact_cleanup_errors": artifact_cleanup_errors,
+                }
+                with self.lock:
+                    self.discarded_clip_count += 1
+                    self.last_discarded_clip = discarded
+                    cleanup_errors = [
+                        error
+                        for error in [database_cleanup_error, *artifact_cleanup_errors]
+                        if error
+                    ]
+                    if cleanup_errors:
+                        self.error = (
+                            "The empty clip was discarded with cleanup errors: "
+                            + "; ".join(cleanup_errors)
+                        )
+                return
+
             canonical_snapshot = select_canonical_snapshot(
                 processing_snapshots,
                 event_monotonic=event_mono,
@@ -892,11 +946,10 @@ class ClipRecorder:
             if writer is not None:
                 writer.release()
                 writer = None
-            if video_path is not None and video_path.exists():
-                try:
-                    video_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            delete_clip_paths(
+                self.args.output_dir,
+                [video_path, analysis_dir, json_path],
+            )
             failure = {
                 "clip_index": clip_index,
                 "failed_at": utc_now(),
@@ -1776,6 +1829,27 @@ def path_is_inside(path: Path, root: Path) -> bool:
     return resolved == resolved_root or resolved_root in resolved.parents
 
 
+def delete_clip_paths(output_dir: Path, candidates: list[Path | None]) -> list[str]:
+    root = clips_root(output_dir)
+    errors = []
+    for candidate in candidates:
+        if candidate is None or not path_is_inside(candidate, root):
+            continue
+        try:
+            if candidate.is_dir():
+                for child in sorted(candidate.rglob("*"), reverse=True):
+                    if child.is_file():
+                        child.unlink(missing_ok=True)
+                    elif child.is_dir():
+                        child.rmdir()
+                candidate.rmdir()
+            else:
+                candidate.unlink(missing_ok=True)
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+    return errors
+
+
 def read_clip_sidecar(json_path: Path, snapshot_limit: int | None = None) -> dict[str, Any] | None:
     try:
         data = json.loads(json_path.read_text(encoding="utf-8"))
@@ -1907,28 +1981,13 @@ def database_event_detail(event_id: str) -> dict[str, Any] | None:
 
 
 def delete_clip_artifacts(output_dir: Path, json_path: Path) -> None:
-    root = clips_root(output_dir)
     data = read_clip_sidecar(json_path, snapshot_limit=0) or {}
     candidates: list[Path] = [json_path]
     for key in ("video_path", "analysis_dir"):
         value = data.get(key)
         if value:
             candidates.append(Path(value))
-    for candidate in candidates:
-        if not path_is_inside(candidate, root):
-            continue
-        try:
-            if candidate.is_dir():
-                for child in sorted(candidate.rglob("*"), reverse=True):
-                    if child.is_file():
-                        child.unlink(missing_ok=True)
-                    elif child.is_dir():
-                        child.rmdir()
-                candidate.rmdir()
-            else:
-                candidate.unlink(missing_ok=True)
-        except Exception:
-            pass
+    delete_clip_paths(output_dir, candidates)
 
 
 @app.route("/")

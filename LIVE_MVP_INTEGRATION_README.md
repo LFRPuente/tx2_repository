@@ -62,9 +62,11 @@ Cuando esta integracion termine, un ciclo de produccion debe verse asi:
     grabacion independiente de 8 segundos.
 12. Una nueva señal crea otra ventana fija de 8 segundos. Si ambas ventanas
     coinciden en el tiempo, se conservan como clips separados sin truncarlas.
-13. El evento, sus piezas, snapshots y rutas de assets se guardan en PostgreSQL.
-14. En `History`, el operador puede capturar una medida real para cada pieza.
-15. La medida automatica nunca se sobrescribe. Cada cambio del operador queda
+13. La ventana solo se conserva si YOLO detecta al menos una pieza. Si no
+    detecta ninguna, se eliminan el MP4, los snapshots temporales y el evento.
+14. El evento, sus piezas, snapshots y rutas de assets se guardan en PostgreSQL.
+15. En `History`, el operador puede capturar una medida real para cada pieza.
+16. La medida automatica nunca se sobrescribe. Cada cambio del operador queda
     auditado con usuario, hora, valor anterior, valor nuevo y motivo.
 
 ## 3. Aplicaciones del repositorio y responsabilidad de cada una
@@ -984,13 +986,17 @@ nueva fila por cada reconexion.
 ### 13.3 Al cerrar el clip
 
 1. Cerrar correctamente `VideoWriter`.
-2. Elegir un snapshot canonico.
-3. Insertar sus piezas en `piece_measurement`.
-4. Insertar rutas en `event_asset`.
-5. Actualizar conteos y timestamps del evento.
-6. Marcar `complete` si todas las piezas son validas.
-7. Marcar `needs_review` si hay piezas invalidas o no hay snapshot confiable.
-8. Hacer commit de la transaccion.
+2. Verificar si YOLO detecto al menos una pieza en cualquier snapshot de los
+   8 segundos.
+3. Si no hubo piezas, eliminar MP4, snapshots temporales y evento pendiente;
+   no mostrar esa ventana en `History`.
+4. Elegir un snapshot canonico.
+5. Insertar sus piezas en `piece_measurement`.
+6. Insertar rutas en `event_asset`.
+7. Actualizar conteos y timestamps del evento.
+8. Marcar `complete` si todas las piezas son validas.
+9. Marcar `needs_review` si hay piezas invalidas o no hay snapshot confiable.
+10. Hacer commit de la transaccion.
 
 Si falla el procesamiento, guardar el evento como `failed` y conservar
 `error_text` y los assets recuperables.
@@ -1526,6 +1532,7 @@ tools/migrate_live_sidecars_to_postgres.py
 - un segundo rising edge crea otra ventana sin cerrar la anterior;
 - cada ventana contiene solo frames desde su señal hasta su limite de 8 segundos;
 - cada MP4 reporta 80 frames a 10 FPS y 8 segundos;
+- una ventana sin ninguna pieza detectada se descarta y no aparece en History;
 - dos ventanas cercanas se conservan como clips independientes;
 - sidecar conserva source/server/app timestamps.
 
