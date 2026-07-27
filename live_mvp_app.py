@@ -17,13 +17,14 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import cv2
 import numpy as np
-from flask import Flask, abort, jsonify, render_template_string, send_file
+from flask import Flask, abort, jsonify, render_template_string, request, send_file
 
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000")
 
@@ -32,6 +33,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import homography_web_app as vision
+from tx2_database import (
+    DatabaseRepository,
+    DatabaseUnavailable,
+    RecordNotFound,
+    RevisionConflict,
+    build_event_key,
+    build_vision_configuration,
+    event_uuid,
+    resolve_asset_path,
+    select_canonical_snapshot,
+    snapshot_pieces,
+    snapshot_summary,
+)
 
 DEFAULT_VIDEO = Path(r"C:\Users\luis_\Downloads\20260724_10\20260724_100105_6439.mkv")
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
@@ -60,6 +74,8 @@ def clean_value(value: Any) -> Any:
         return value.hex()
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, Decimal):
+        return float(value)
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     if isinstance(value, dict):
@@ -67,6 +83,12 @@ def clean_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [clean_value(item) for item in value]
     return str(value)
+
+
+def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
 
 
 def representative_snapshots(snapshots: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -118,6 +140,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plc-poll-interval", type=float, default=0.01)
     parser.add_argument("--plc-timeout", type=float, default=8.0)
     parser.add_argument("--plc-edge", choices=("changed", "rising", "falling", "any"), default="rising")
+    parser.add_argument("--postgres-dsn", default=os.environ.get("TX2_POSTGRES_DSN", ""))
+    parser.add_argument("--db-disabled", action="store_true")
+    parser.add_argument("--db-retry-seconds", type=float, default=15.0)
     return parser.parse_args()
 
 
@@ -544,11 +569,20 @@ class LiveProcessor:
 
 
 class ClipRecorder:
-    def __init__(self, args: argparse.Namespace, buffer: FrameBuffer, processor: LiveProcessor | None = None) -> None:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        buffer: FrameBuffer,
+        processor: LiveProcessor | None = None,
+        database: DatabaseRepository | None = None,
+    ) -> None:
         self.args = args
         self.buffer = buffer
         self.processor = processor
+        self.database = database
         self.lock = threading.Lock()
+        self.configuration_lock = threading.Lock()
+        self.vision_configuration: dict[str, Any] | None = None
         self.active_recordings: set[int] = set()
         self.clip_index = 0
         self.last_clip: dict[str, Any] | None = None
@@ -566,6 +600,7 @@ class ClipRecorder:
                 "failed_recordings": [failure.copy() for failure in self.failed_recordings],
                 "error": self.error,
                 "record_seconds": self.args.record_seconds,
+                "database_enabled": self.database is not None,
             }
 
     def start_event_clip(self, event: dict[str, Any]) -> None:
@@ -580,6 +615,32 @@ class ClipRecorder:
         if self.processor is not None:
             return self.processor.recording_frame()
         return self.buffer.latest()
+
+    def _configuration_snapshot(self) -> dict[str, Any] | None:
+        with self.configuration_lock:
+            if self.vision_configuration is not None:
+                return self.vision_configuration
+            try:
+                self.vision_configuration = build_vision_configuration(self.args, ROOT)
+            except (AttributeError, FileNotFoundError, ValueError):
+                if self.database is not None:
+                    raise
+                return None
+            return self.vision_configuration
+
+    def validate_configuration(self) -> dict[str, Any]:
+        configuration = self._configuration_snapshot()
+        if configuration is None:
+            raise RuntimeError("The vision configuration could not be snapshotted")
+        return configuration
+
+    def _camera_source(self) -> str:
+        source = str(getattr(self.args, "source", "unknown"))
+        if source == "rtsp":
+            return f"rtsp://{getattr(self.args, 'camera_ip', 'camera')}"
+        if source == "video":
+            return str(getattr(self.args, "video", "video"))
+        return source
 
     def _capture_processing_snapshot(
         self,
@@ -613,6 +674,7 @@ class ClipRecorder:
             if key not in ("original_image", "rectified_image")
         }
         snapshot["snapshot_index"] = snap_index
+        snapshot["processing_duration_ms"] = clean_value(processor_data.get("last_duration_ms"))
 
         for image_key, suffix in (("original_image", "original_overlay"), ("rectified_image", "rectified_overlay")):
             image_b64 = result.get(image_key)
@@ -630,6 +692,32 @@ class ClipRecorder:
         processing_snapshots: list[dict[str, Any]] = []
         seen_processing_frames: set[int] = set()
         event_mono = float(event.get("event_read_monotonic") or time.perf_counter())
+        event_key = build_event_key(
+            event,
+            str(getattr(self.args, "plc_endpoint", "")),
+            str(getattr(self.args, "event_node", "")),
+        )
+        measurement_event_id = event_uuid(event_key)
+        vision_configuration: dict[str, Any] | None = None
+        db_sync_status = "disabled" if self.database is None else "pending"
+        db_sync_error = ""
+        try:
+            vision_configuration = self._configuration_snapshot()
+            if self.database is not None and vision_configuration is not None:
+                measurement_event_id = self.database.create_measurement_event(
+                    event_id=measurement_event_id,
+                    event_key=event_key,
+                    event=event,
+                    configuration=vision_configuration,
+                    plc_endpoint=str(getattr(self.args, "plc_endpoint", "")),
+                    plc_event_node=str(getattr(self.args, "event_node", "")),
+                    plc_watchdog_node=str(getattr(self.args, "watchdog_node", "")),
+                    camera_source=self._camera_source(),
+                )
+                db_sync_status = "recording"
+        except Exception as exc:
+            db_sync_status = "pending"
+            db_sync_error = str(exc)
         record_seconds = max(0.1, float(self.args.record_seconds))
         deadline = event_mono + record_seconds
         fps = max(1.0, min(float(self.args.record_fps or self.args.capture_fps or 10.0), 60.0))
@@ -720,10 +808,21 @@ class ClipRecorder:
             if first_written_source is None or last_written_source is None:
                 raise RuntimeError("No frames were written to the clip.")
 
+            canonical_snapshot = select_canonical_snapshot(
+                processing_snapshots,
+                event_monotonic=event_mono,
+            )
             sidecar = {
                 "clip_index": clip_index,
                 "saved_at": utc_now(),
+                "event_id": measurement_event_id,
+                "event_key": event_key,
                 "event": event,
+                "plc_endpoint": str(getattr(self.args, "plc_endpoint", "")),
+                "plc_event_node": str(getattr(self.args, "event_node", "")),
+                "plc_watchdog_node": str(getattr(self.args, "watchdog_node", "")),
+                "camera_source": self._camera_source(),
+                "vision_configuration": vision_configuration,
                 "record_seconds": record_seconds,
                 "video_fps": fps,
                 "video_codec": "h264",
@@ -740,8 +839,37 @@ class ClipRecorder:
                 "analysis_dir": str(analysis_dir),
                 "processing_snapshots": processing_snapshots,
                 "processing_snapshot_count": len(processing_snapshots),
+                "canonical_snapshot_frame_index": (
+                    int(canonical_snapshot["frame_index"])
+                    if canonical_snapshot is not None
+                    else None
+                ),
+                "db_sync_status": db_sync_status,
+                "db_sync_error": db_sync_error,
+                "db_sync_attempts": 0,
+                "db_sync_last_attempt_at": None,
             }
-            json_path.write_text(json.dumps(sidecar, indent=2, ensure_ascii=False), encoding="utf-8")
+            write_json_atomic(json_path, sidecar)
+            if self.database is not None:
+                sidecar["db_sync_attempts"] = 1
+                sidecar["db_sync_last_attempt_at"] = utc_now()
+                sidecar["db_sync_status"] = "synced"
+                sidecar["db_sync_error"] = ""
+                write_json_atomic(json_path, sidecar)
+                try:
+                    self.database.mark_measurement_event_processing(
+                        measurement_event_id,
+                        str(sidecar["last_frame_utc"]),
+                    )
+                    actual_event_id = self.database.sync_sidecar(json_path, self.args.output_dir)
+                    if actual_event_id != sidecar["event_id"]:
+                        sidecar["event_id"] = actual_event_id
+                        write_json_atomic(json_path, sidecar)
+                        self.database.sync_sidecar(json_path, self.args.output_dir)
+                except Exception as exc:
+                    sidecar["db_sync_status"] = "pending"
+                    sidecar["db_sync_error"] = str(exc)
+                    write_json_atomic(json_path, sidecar)
             self._enforce_retention()
             with self.lock:
                 self.last_clip = sidecar
@@ -760,6 +888,14 @@ class ClipRecorder:
                 "event": clean_value(event),
                 "error": str(exc),
             }
+            if self.database is not None:
+                try:
+                    self.database.mark_measurement_event_failed(
+                        measurement_event_id,
+                        failure["error"],
+                    )
+                except Exception:
+                    pass
             with self.lock:
                 self.error = failure["error"]
                 self.failed_recordings.append(failure)
@@ -773,7 +909,115 @@ class ClipRecorder:
         max_clips = max(1, int(self.args.max_clips or 100))
         sidecars = clip_sidecars(self.args.output_dir)
         for json_path in sidecars[max_clips:]:
+            if self.database is not None:
+                try:
+                    data = json.loads(json_path.read_text(encoding="utf-8"))
+                    event_id = data.get("event_id")
+                    if event_id:
+                        self.database.delete_measurement_event(str(event_id))
+                except Exception as exc:
+                    with self.lock:
+                        self.error = f"Retention deferred for {json_path.name}: {exc}"
+                    continue
             delete_clip_artifacts(self.args.output_dir, json_path)
+
+
+class DatabaseReconciler:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        database: DatabaseRepository,
+    ) -> None:
+        self.args = args
+        self.database = database
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="postgres-sidecar-reconciler",
+            daemon=True,
+        )
+        self.lock = threading.Lock()
+        self.state: dict[str, Any] = {
+            "running": False,
+            "pending": 0,
+            "synced": 0,
+            "failed": 0,
+            "last_run_utc": None,
+            "last_error": "",
+        }
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return self.state.copy()
+
+    def _set_state(self, **updates: Any) -> None:
+        with self.lock:
+            self.state.update(updates)
+
+    def sync_once(self) -> None:
+        pending_paths = []
+        for path in clip_sidecars(self.args.output_dir):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                data = None
+            if data and data.get("db_sync_status") == "pending":
+                pending_paths.append(path)
+        self._set_state(running=True, pending=len(pending_paths), last_run_utc=utc_now())
+        synced = 0
+        failed = 0
+        last_error = ""
+        for path in pending_paths:
+            if self.stop_event.is_set():
+                break
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                data = None
+            if not data:
+                continue
+            data["db_sync_attempts"] = int(data.get("db_sync_attempts") or 0) + 1
+            data["db_sync_last_attempt_at"] = utc_now()
+            data["db_sync_status"] = "synced"
+            data["db_sync_error"] = ""
+            write_json_atomic(path, data)
+            try:
+                actual_event_id = self.database.sync_sidecar(path, self.args.output_dir)
+                if actual_event_id != data.get("event_id"):
+                    data["event_id"] = actual_event_id
+                    write_json_atomic(path, data)
+                    self.database.sync_sidecar(path, self.args.output_dir)
+                synced += 1
+            except Exception as exc:
+                data["db_sync_status"] = "pending"
+                data["db_sync_error"] = str(exc)
+                last_error = str(exc)
+                failed += 1
+                write_json_atomic(path, data)
+        self._set_state(
+            running=False,
+            pending=max(0, len(pending_paths) - synced),
+            synced=int(self.state.get("synced") or 0) + synced,
+            failed=int(self.state.get("failed") or 0) + failed,
+            last_error=last_error,
+        )
+
+    def _run(self) -> None:
+        delay = max(2.0, float(getattr(self.args, "db_retry_seconds", 15.0)))
+        while not self.stop_event.is_set():
+            try:
+                self.sync_once()
+            except Exception as exc:
+                self._set_state(running=False, last_error=str(exc), last_run_utc=utc_now())
+            self.stop_event.wait(delay)
 
 
 class PLCMonitor:
@@ -1096,9 +1340,11 @@ async function refreshStatus() {
     if (!response.ok) throw new Error(data.error || 'status error');
     const camera = data.camera || {};
     const processor = data.processor || {};
+    const database = data.database || {};
     updatePlcSignal(data.plc || {});
-    const healthy = camera.connected && processor.ok;
-    pill($('top-state'), healthy ? 'live' : 'check status', healthy ? 'ok' : 'warn');
+    const healthy = camera.connected && processor.ok && (!database.enabled || database.ok);
+    const label = database.enabled ? (healthy ? 'live' : 'check status') : 'simulation';
+    pill($('top-state'), label, healthy && database.enabled ? 'ok' : 'warn');
   } catch (err) {
     pill($('top-state'), 'error', 'err');
   }
@@ -1120,148 +1366,300 @@ HISTORY_HTML = r"""
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TX2 Clip History</title>
+<title>TX2 Measurement History</title>
 <style>
 :root { color: #172025; background: #f5f7f8; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: #f5f7f8; }
-.app { width: min(1500px, calc(100vw - 24px)); margin: 0 auto; padding: 14px 0 22px; }
-.topbar { display: flex; align-items: end; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
-h1, h2, p { margin: 0; letter-spacing: 0; }
-h1 { font-size: 27px; line-height: 1.05; }
+button, input, textarea { font: inherit; }
+.app { width: min(1580px, calc(100vw - 24px)); margin: 0 auto; padding: 14px 0 22px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
+h1, h2, h3, p { margin: 0; letter-spacing: 0; }
+h1 { font-size: 25px; line-height: 1.1; }
 h2 { font-size: 16px; }
-.eyebrow { color: #68787f; font-size: 12px; font-weight: 800; text-transform: uppercase; margin-bottom: 4px; }
-.nav a, .btn { border: 1px solid #cbd5da; border-radius: 8px; padding: 9px 12px; color: #172025; background: #ffffff; text-decoration: none; font-weight: 900; cursor: pointer; }
-.grid { display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 12px; align-items: start; }
-.panel { border: 1px solid #d8e0e4; border-radius: 8px; background: #ffffff; overflow: hidden; box-shadow: 0 14px 28px rgba(23,32,37,.08); }
+.nav a, .btn { border: 1px solid #cbd5da; border-radius: 8px; padding: 9px 12px; color: #172025; background: #fff; text-decoration: none; font-weight: 800; cursor: pointer; }
+.btn.primary { border-color: #247654; background: #247654; color: #fff; }
+.btn.danger { border-color: #c77a7a; color: #9d2d2d; }
+.mode { display: none; margin-bottom: 12px; border: 1px solid #d7a34d; border-radius: 8px; padding: 10px 12px; color: #7f550e; background: #fff8e8; font-weight: 750; overflow-wrap: anywhere; }
+.grid { display: grid; grid-template-columns: 360px minmax(0, 1fr); gap: 12px; align-items: start; }
+.panel { min-width: 0; border: 1px solid #d8e0e4; border-radius: 8px; background: #fff; overflow: hidden; box-shadow: 0 10px 24px rgba(23,32,37,.07); }
 .panel-head { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #d8e0e4; }
+.muted { color: #68787f; font-size: 12px; font-weight: 750; }
 .list { display: grid; max-height: calc(100vh - 120px); overflow: auto; }
-.clip { display: grid; gap: 5px; padding: 11px 12px; color: #2c3a40; background: transparent; border: 0; border-bottom: 1px solid rgba(23,32,37,.08); text-align: left; cursor: pointer; }
-.clip:hover, .clip.active { background: #edf5f8; }
-.clip strong { color: #172025; overflow-wrap: anywhere; }
-.clip span { color: #68787f; font-size: 12px; font-weight: 800; }
-.viewer { padding: 12px; display: grid; gap: 12px; }
-video, img { display: block; width: 100%; border-radius: 8px; background: #eef2f4; }
-.meta { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-.metric { border: 1px solid #d8e0e4; border-radius: 8px; background: #ffffff; padding: 10px; min-height: 62px; }
-.metric span { display: block; color: #68787f; font-size: 12px; font-weight: 800; }
-.metric strong { display: block; margin-top: 5px; color: #172025; font-size: 18px; overflow-wrap: anywhere; }
+.event { display: grid; gap: 5px; padding: 12px; color: #2c3a40; background: transparent; border: 0; border-bottom: 1px solid rgba(23,32,37,.08); text-align: left; cursor: pointer; }
+.event:hover, .event.active { background: #edf5f8; }
+.event strong { color: #172025; overflow-wrap: anywhere; }
+.event span { color: #68787f; font-size: 12px; font-weight: 750; }
+.viewer { padding: 12px; display: grid; gap: 14px; }
+video, img { display: block; width: 100%; border-radius: 6px; background: #eef2f4; }
+.meta { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid #d8e0e4; border-radius: 8px; overflow: hidden; }
+.metric { padding: 10px; min-height: 62px; border-right: 1px solid #d8e0e4; }
+.metric:last-child { border-right: 0; }
+.metric span { display: block; color: #68787f; font-size: 12px; font-weight: 750; }
+.metric strong { display: block; margin-top: 5px; color: #172025; font-size: 17px; overflow-wrap: anywhere; }
+.section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.pieces { width: 100%; border-collapse: collapse; border: 1px solid #d8e0e4; }
+.pieces th, .pieces td { padding: 9px 10px; border-bottom: 1px solid #e2e8eb; text-align: left; vertical-align: middle; }
+.pieces th { color: #5b6b72; background: #f6f8f9; font-size: 12px; }
+.pieces td { font-size: 13px; }
+.pieces tr:last-child td { border-bottom: 0; }
+.state { display: inline-flex; border-radius: 999px; padding: 4px 8px; background: #edf2f4; color: #4f6067; font-size: 11px; font-weight: 850; }
+.state.ok { background: #e9f8f0; color: #14784f; }
+.state.review { background: #fff4df; color: #8a5a0a; }
+.revision-log { border: 1px solid #d8e0e4; border-top: 0; }
+.revision { display: grid; grid-template-columns: 90px 150px minmax(0, 1fr); gap: 10px; padding: 8px 10px; border-bottom: 1px solid #e2e8eb; color: #4d5e65; font-size: 12px; }
+.revision:last-child { border-bottom: 0; }
 .snapshots { display: grid; gap: 10px; }
-.snapshot { border: 1px solid #d8e0e4; border-radius: 8px; overflow: hidden; background: #ffffff; }
-.snapshot-head { display: flex; justify-content: space-between; gap: 10px; padding: 9px 10px; border-bottom: 1px solid rgba(23,32,37,.08); color: #3c4d54; font-size: 13px; font-weight: 900; }
+.snapshot { border: 1px solid #d8e0e4; border-radius: 8px; overflow: hidden; background: #fff; }
+.snapshot-head { display: flex; justify-content: space-between; gap: 10px; padding: 9px 10px; border-bottom: 1px solid #e2e8eb; color: #3c4d54; font-size: 12px; font-weight: 800; }
 .snapshot-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 8px; }
-.empty { color: #68787f; font-weight: 800; padding: 44px 12px; text-align: center; }
-@media (max-width: 980px) { .grid { grid-template-columns: 1fr; } .meta { grid-template-columns: repeat(2, minmax(0, 1fr)); } .snapshot-grid { grid-template-columns: 1fr; } }
+.empty { color: #68787f; font-weight: 750; padding: 44px 12px; text-align: center; }
+dialog { width: min(520px, calc(100vw - 24px)); border: 1px solid #cbd5da; border-radius: 8px; padding: 0; box-shadow: 0 24px 60px rgba(23,32,37,.22); }
+dialog::backdrop { background: rgba(23,32,37,.35); }
+.dialog-body { display: grid; gap: 12px; padding: 16px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid #d8e0e4; }
+.measure-inputs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+label { display: grid; gap: 5px; color: #4d5e65; font-size: 12px; font-weight: 800; }
+input, textarea { width: 100%; border: 1px solid #bac7cc; border-radius: 6px; padding: 9px; color: #172025; background: #fff; }
+textarea { min-height: 78px; resize: vertical; }
+@media (max-width: 1050px) { .grid { grid-template-columns: 1fr; } .list { max-height: 340px; } }
+@media (max-width: 760px) { .meta { grid-template-columns: repeat(2, 1fr); } .metric:nth-child(2) { border-right: 0; } .pieces { display: block; overflow-x: auto; } .snapshot-grid { grid-template-columns: 1fr; } }
+@media (max-width: 520px) { .topbar h1 { font-size: 21px; } .meta { grid-template-columns: 1fr; } .metric { border-right: 0; border-bottom: 1px solid #d8e0e4; } .metric:last-child { border-bottom: 0; } .revision { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <div class="app">
   <header class="topbar">
-    <div>
-      <p class="eyebrow">TX2 Vision</p>
-      <h1>Video history</h1>
-    </div>
-    <div class="nav"><a href="/">Live</a></div>
+    <h1>Measurement history</h1>
+    <nav class="nav"><a href="/">Live</a></nav>
   </header>
+  <div id="mode" class="mode"></div>
   <main class="grid">
     <section class="panel">
       <div class="panel-head">
-        <div>
-          <p class="eyebrow">PLC clips</p>
-          <h2 id="clip-count">Loading...</h2>
-        </div>
+        <h2 id="event-count">Loading...</h2>
       </div>
-      <div class="list" id="clip-list"><div class="empty">Loading clips...</div></div>
+      <div class="list" id="event-list"><div class="empty">Loading events...</div></div>
     </section>
     <section class="panel">
       <div class="panel-head">
-        <div>
-          <p class="eyebrow">Replay</p>
-          <h2 id="detail-title">Select a clip</h2>
-        </div>
+        <h2 id="detail-title">Select an event</h2>
+        <span class="muted" id="detail-state"></span>
       </div>
-      <div class="viewer" id="viewer"><div class="empty">Select a saved PLC clip.</div></div>
+      <div class="viewer" id="viewer"><div class="empty">Select a saved PLC event.</div></div>
     </section>
   </main>
 </div>
+
+<dialog id="correction-dialog">
+  <form id="correction-form">
+    <div class="dialog-body">
+      <h2 id="correction-title">Operator measurement</h2>
+      <div class="measure-inputs">
+        <label>Feet<input id="feet" type="number" min="0" step="1" required></label>
+        <label>Inches<input id="inches" type="number" min="0" max="11" step="1" required></label>
+        <label>Sixteenths<input id="sixteenths" type="number" min="0" max="15" step="1" required></label>
+      </div>
+      <label>Operator ID<input id="operator-id" autocomplete="username" required></label>
+      <label>Display name<input id="operator-name"></label>
+      <label>Reason<textarea id="reason" required></textarea></label>
+      <div id="form-error" class="muted"></div>
+    </div>
+    <div class="dialog-actions">
+      <button type="button" class="btn" id="cancel-correction">Cancel</button>
+      <button type="submit" class="btn primary">Save correction</button>
+    </div>
+  </form>
+</dialog>
+
 <script>
 const $ = (id) => document.getElementById(id);
-const fmt = (value, digits = 3) => {
-  const n = Number(value);
-  return Number.isFinite(n) ? n.toFixed(digits) : '-';
-};
-let activeClip = '';
-const initialClipId = location.pathname.startsWith('/history/') ? decodeURIComponent(location.pathname.split('/').pop() || '') : '';
+const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));
+const number = (value, digits = 3) => Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : '-';
+const dateTime = (value) => value ? new Date(value).toLocaleString() : '-';
+let activeEventId = '';
+let activeEvent = null;
+let editingPiece = null;
+const initialEventId = location.pathname.startsWith('/history/') ? decodeURIComponent(location.pathname.split('/').pop() || '') : '';
 
-function clipLabel(clip) {
-  return clip.saved_at || clip.first_frame_utc || clip.clip_id;
+function measurement(value) {
+  const total = Number(value);
+  if (!Number.isFinite(total)) return '-';
+  let sixteenths = Math.round(total * 16);
+  const feet = Math.floor(sixteenths / 192);
+  sixteenths -= feet * 192;
+  const inches = Math.floor(sixteenths / 16);
+  const fraction = sixteenths % 16;
+  return `${feet} ft ${inches} ${fraction}/16 in`;
 }
 
 function metric(label, value) {
-  return `<div class="metric"><span>${label}</span><strong>${value ?? '-'}</strong></div>`;
+  return `<div class="metric"><span>${esc(label)}</span><strong>${esc(value ?? '-')}</strong></div>`;
+}
+
+function renderPieces(pieces, databaseMode) {
+  if (!pieces?.length) return '<div class="empty">No pieces were stored for the canonical frame.</div>';
+  const table = `<table class="pieces">
+    <thead><tr><th>Piece</th><th>Automatic</th><th>Operator</th><th>Effective</th><th>Difference</th><th>Confidence</th><th>Status</th><th></th></tr></thead>
+    <tbody>${pieces.map((piece) => {
+      const automatic = Number(piece.automatic_measurement_in);
+      const operator = Number(piece.operator_measurement_in);
+      const hasOperator = Number.isFinite(operator);
+      const difference = hasOperator && Number.isFinite(automatic) ? `${number(operator - automatic)} in` : '-';
+      const state = piece.review_required || !piece.is_valid ? 'review' : 'ok';
+      return `<tr>
+        <td><strong>${esc(piece.piece_number)}</strong></td>
+        <td>${esc(measurement(piece.automatic_measurement_in))}</td>
+        <td>${esc(hasOperator ? measurement(piece.operator_measurement_in) : '-')}</td>
+        <td><strong>${esc(measurement(piece.effective_measurement_in))}</strong></td>
+        <td>${esc(difference)}</td>
+        <td>YOLO ${number(piece.yolo_confidence, 2)} / Edge ${number(piece.sobel_confidence, 2)}</td>
+        <td><span class="state ${state}">${state === 'ok' ? 'Valid' : 'Review'}</span><br><span class="muted">rev ${esc(piece.operator_revision ?? 0)}</span></td>
+        <td>${databaseMode === 'postgresql' ? `<button class="btn edit-piece" data-piece-id="${esc(piece.id)}">Edit</button>${hasOperator ? ` <button class="btn danger clear-piece" data-piece-id="${esc(piece.id)}">Clear</button>` : ''}` : ''}</td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table>`;
+  const revisions = pieces.flatMap((piece) => (piece.revisions || []).map((revision) => ({piece, revision})));
+  if (!revisions.length) return table;
+  return `${table}<div class="revision-log">${revisions.map(({piece, revision}) => `
+    <div class="revision">
+      <strong>Piece ${esc(piece.piece_number)} / rev ${esc(revision.revision)}</strong>
+      <span>${esc(revision.action)} | ${esc(dateTime(revision.changed_at))}</span>
+      <span>${esc(revision.operator_display_name || revision.operator_id)}: ${esc(revision.reason)} (${esc(measurement(revision.previous_operator_measurement_in))} to ${esc(measurement(revision.new_operator_measurement_in))})</span>
+    </div>`).join('')}</div>`;
 }
 
 function renderSnapshots(snapshots) {
-  if (!snapshots || !snapshots.length) return '<div class="empty">No processing snapshots saved for this clip.</div>';
-  return `<div class="snapshots">${snapshots.map((snap) => {
-    const summary = snap.measurement_summary || {};
-    const minimum = summary.minimum_in != null ? `${fmt(summary.minimum_in)} in` : '-';
-    const maximum = summary.maximum_in != null ? `${fmt(summary.maximum_in)} in` : '-';
+  if (!snapshots?.length) return '<div class="empty">No processing evidence was stored.</div>';
+  return `<div class="snapshots">${snapshots.map((snapshot) => {
+    const summary = snapshot.measurement_summary || {};
     return `<article class="snapshot">
       <div class="snapshot-head">
-        <span>${snap.processed_utc || snap.frame_utc || '-'}</span>
-        <span>Pieces ${snap.count ?? 0} | Valid ${summary.valid_count ?? 0} | ${minimum} to ${maximum}</span>
+        <span>${esc(dateTime(snapshot.processed_utc || snapshot.frame_utc))}</span>
+        <span>${esc(summary.valid_count ?? snapshot.valid_piece_count ?? 0)} valid of ${esc(summary.detected_count ?? snapshot.detected_piece_count ?? 0)}</span>
       </div>
       <div class="snapshot-grid">
-        ${snap.original_overlay_url ? `<img src="${snap.original_overlay_url}" alt="Original overlay">` : '<div class="empty">No original overlay</div>'}
-        ${snap.rectified_overlay_url ? `<img src="${snap.rectified_overlay_url}" alt="Rectified overlay">` : '<div class="empty">No rectified overlay</div>'}
+        ${snapshot.original_overlay_url ? `<img src="${esc(snapshot.original_overlay_url)}" alt="Processed camera view">` : '<div class="empty">No camera evidence</div>'}
+        ${snapshot.rectified_overlay_url ? `<img src="${esc(snapshot.rectified_overlay_url)}" alt="Processed diagram view">` : '<div class="empty">No diagram evidence</div>'}
       </div>
     </article>`;
   }).join('')}</div>`;
 }
 
-async function loadClip(clipId) {
-  activeClip = clipId;
-  document.querySelectorAll('.clip').forEach((el) => el.classList.toggle('active', el.dataset.clipId === clipId));
-  const response = await fetch(`/api/live/clips/${clipId}`);
+async function loadEvent(eventId) {
+  activeEventId = eventId;
+  document.querySelectorAll('.event').forEach((element) => element.classList.toggle('active', element.dataset.eventId === eventId));
+  const response = await fetch(`/api/history/events/${encodeURIComponent(eventId)}`);
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || 'Could not load clip');
-  $('detail-title').textContent = data.clip_id;
-  const snapshotsShown = data.processing_snapshots_shown ?? data.processing_snapshots?.length ?? 0;
+  if (!response.ok) throw new Error(data.error || 'Could not load measurement event');
+  activeEvent = data;
+  $('detail-title').textContent = dateTime(data.plc_source_timestamp || data.app_received_at || data.created_at);
+  $('detail-state').textContent = data.status || '';
   $('viewer').innerHTML = `
-    <video controls src="${data.video_url}"></video>
+    ${data.video_url ? `<video controls preload="metadata" src="${esc(data.video_url)}"></video>` : '<div class="empty">No video asset is available.</div>'}
     <div class="meta">
-      ${metric('Saved', data.saved_at || '-')}
-      ${metric('Duration', `${data.record_seconds ?? '-'} s`)}
-      ${metric('PLC edge', data.event?.event_edge || '-')}
-      ${metric('Captures', `${snapshotsShown} of ${data.processing_snapshot_count ?? snapshotsShown}`)}
+      ${metric('PLC signal', dateTime(data.plc_source_timestamp || data.app_received_at))}
+      ${metric('Recording', `${dateTime(data.recording_started_at)} - ${dateTime(data.recording_ended_at)}`)}
+      ${metric('Pieces', `${data.valid_piece_count ?? 0} valid / ${data.detected_piece_count ?? 0} detected`)}
+      ${metric('Status', data.status || '-')}
     </div>
-    ${renderSnapshots(data.processing_snapshots)}
+    <div class="section-head"><h3>Piece measurements</h3><span class="muted">Canonical processed frame</span></div>
+    ${renderPieces(data.pieces, data.database_mode)}
+    <div class="section-head"><h3>Processing evidence</h3><span class="muted">Up to 6 representative captures</span></div>
+    ${renderSnapshots(data.snapshots)}
   `;
+  document.querySelectorAll('.edit-piece').forEach((button) => button.addEventListener('click', () => openCorrection(button.dataset.pieceId)));
+  document.querySelectorAll('.clear-piece').forEach((button) => button.addEventListener('click', () => clearCorrection(button.dataset.pieceId)));
 }
 
 async function loadHistory() {
-  const response = await fetch('/api/live/clips');
+  const response = await fetch('/api/history/events?limit=100');
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || 'Could not load history');
-  $('clip-count').textContent = `${data.count} saved clips`;
-  if (!data.clips.length) {
-    $('clip-list').innerHTML = '<div class="empty">No PLC videos saved yet.</div>';
+  if (data.database_mode !== 'postgresql') {
+    $('mode').style.display = 'block';
+    $('mode').textContent = data.warning || 'PostgreSQL is disabled.';
+  }
+  $('event-count').textContent = `${data.count} saved events`;
+  if (!data.events.length) {
+    $('event-list').innerHTML = '<div class="empty">No PLC events have been saved.</div>';
     return;
   }
-  $('clip-list').innerHTML = data.clips.map((clip) => `
-    <button class="clip" data-clip-id="${clip.clip_id}">
-      <strong>${clipLabel(clip)}</strong>
-      <span>${clip.record_seconds ?? '-'} s | ${clip.processing_snapshot_count ?? 0} snapshots | ${clip.event?.event_edge || 'event'}</span>
+  $('event-list').innerHTML = data.events.map((event) => `
+    <button class="event" data-event-id="${esc(event.id)}">
+      <strong>${esc(dateTime(event.plc_source_timestamp || event.app_received_at || event.created_at))}</strong>
+      <span>${esc(event.valid_piece_count ?? 0)} valid / ${esc(event.detected_piece_count ?? 0)} detected | ${esc(event.status || '-')}</span>
     </button>
   `).join('');
-  document.querySelectorAll('.clip').forEach((button) => button.addEventListener('click', () => loadClip(button.dataset.clipId)));
-  const initial = data.clips.find((clip) => clip.clip_id === initialClipId) || data.clips[0];
-  loadClip(initial.clip_id);
+  document.querySelectorAll('.event').forEach((button) => button.addEventListener('click', () => loadEvent(button.dataset.eventId)));
+  const initial = data.events.find((event) => String(event.id) === initialEventId) || data.events[0];
+  await loadEvent(String(initial.id));
 }
 
-loadHistory().catch((err) => {
-  $('clip-list').innerHTML = `<div class="empty">${err.message || err}</div>`;
+function openCorrection(pieceId) {
+  editingPiece = activeEvent?.pieces?.find((piece) => String(piece.id) === String(pieceId));
+  if (!editingPiece) return;
+  const total = Number(editingPiece.operator_measurement_in ?? editingPiece.automatic_measurement_in ?? 0);
+  let units = Math.max(0, Math.round(total * 16));
+  $('feet').value = Math.floor(units / 192);
+  units %= 192;
+  $('inches').value = Math.floor(units / 16);
+  $('sixteenths').value = units % 16;
+  $('operator-id').value = localStorage.getItem('tx2OperatorId') || '';
+  $('operator-name').value = localStorage.getItem('tx2OperatorName') || '';
+  $('reason').value = '';
+  $('form-error').textContent = '';
+  $('correction-title').textContent = `Piece ${editingPiece.piece_number} operator measurement`;
+  $('correction-dialog').showModal();
+}
+
+async function clearCorrection(pieceId) {
+  const piece = activeEvent?.pieces?.find((item) => String(item.id) === String(pieceId));
+  if (!piece || !confirm(`Clear the operator correction for piece ${piece.piece_number}?`)) return;
+  const operatorId = localStorage.getItem('tx2OperatorId') || '';
+  const reason = prompt('Reason for clearing this correction:') || '';
+  if (!operatorId || !reason) {
+    alert('Operator ID and reason are required. Open Edit once to store the operator ID.');
+    return;
+  }
+  await patchCorrection(piece, {clear: true, reason, operator_id: operatorId, operator_display_name: localStorage.getItem('tx2OperatorName') || null});
+}
+
+async function patchCorrection(piece, payload) {
+  const response = await fetch(`/api/history/events/${encodeURIComponent(activeEventId)}/pieces/${encodeURIComponent(piece.id)}/operator-measurement`, {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({...payload, expected_revision: piece.operator_revision ?? 0}),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Could not save correction');
+  await loadEvent(activeEventId);
+}
+
+$('correction-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const operatorId = $('operator-id').value.trim();
+  const operatorName = $('operator-name').value.trim();
+  localStorage.setItem('tx2OperatorId', operatorId);
+  localStorage.setItem('tx2OperatorName', operatorName);
+  try {
+    await patchCorrection(editingPiece, {
+      feet: Number($('feet').value),
+      inches: Number($('inches').value),
+      sixteenths: Number($('sixteenths').value),
+      operator_id: operatorId,
+      operator_display_name: operatorName || null,
+      reason: $('reason').value.trim(),
+    });
+    $('correction-dialog').close();
+  } catch (error) {
+    $('form-error').textContent = error.message || error;
+  }
+});
+$('cancel-correction').addEventListener('click', () => $('correction-dialog').close());
+
+loadHistory().catch((error) => {
+  $('event-list').innerHTML = `<div class="empty">${esc(error.message || error)}</div>`;
 });
 </script>
 </body>
@@ -1276,6 +1674,8 @@ _camera: CameraReader
 _processor: LiveProcessor
 _recorder: ClipRecorder
 _plc: PLCMonitor
+_database: DatabaseRepository | None = None
+_reconciler: DatabaseReconciler | None = None
 
 
 def clips_root(output_dir: Path) -> Path:
@@ -1286,7 +1686,13 @@ def clip_sidecars(output_dir: Path) -> list[Path]:
     root = clips_root(output_dir)
     if not root.exists():
         return []
-    return sorted(root.rglob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    existing = []
+    for path in root.rglob("*.json"):
+        try:
+            existing.append((path.stat().st_mtime, path))
+        except FileNotFoundError:
+            continue
+    return [path for _mtime, path in sorted(existing, reverse=True)]
 
 
 def path_is_inside(path: Path, root: Path) -> bool:
@@ -1326,6 +1732,106 @@ def find_clip_json(clip_id: str) -> Path | None:
         if json_path.stem == clip_id:
             return json_path
     return None
+
+
+def legacy_history_event(json_path: Path, *, detail: bool) -> dict[str, Any] | None:
+    data = read_clip_sidecar(
+        json_path,
+        snapshot_limit=HISTORY_SNAPSHOT_LIMIT if detail else 0,
+    )
+    if data is None:
+        return None
+    try:
+        raw = json.loads(json_path.read_text(encoding="utf-8"))
+        all_snapshots = raw.get("processing_snapshots", [])
+    except Exception:
+        all_snapshots = data.get("processing_snapshots", [])
+    canonical = select_canonical_snapshot(
+        all_snapshots,
+        event_monotonic=(data.get("event") or {}).get("event_read_monotonic"),
+    )
+    summary = snapshot_summary(canonical) if canonical else {}
+    event_id = str(data.get("event_id") or data["clip_id"])
+    result: dict[str, Any] = {
+        "id": event_id,
+        "clip_id": data["clip_id"],
+        "status": "simulation",
+        "created_at": data.get("saved_at"),
+        "app_received_at": (data.get("event") or {}).get("read_utc"),
+        "plc_source_timestamp": (data.get("event") or {}).get("event_source_timestamp"),
+        "plc_edge": (data.get("event") or {}).get("event_edge"),
+        "detected_piece_count": int(summary.get("detected_count") or 0),
+        "valid_piece_count": int(summary.get("valid_count") or 0),
+        "video_url": data.get("video_url"),
+        "detail_url": f"/history/{event_id}",
+        "database_mode": "simulation",
+    }
+    if not detail:
+        return result
+    canonical_pieces = snapshot_pieces(canonical) if canonical else []
+    result.update(
+        recording_started_at=data.get("first_frame_utc"),
+        recording_ended_at=data.get("last_frame_utc"),
+        snapshots=data.get("processing_snapshots", []),
+        pieces=[
+            {
+                "id": f"legacy-{index}",
+                "piece_number": int(piece.get("piece_id") or index),
+                "is_valid": bool(piece.get("valid")),
+                "review_required": not bool(piece.get("valid")),
+                "yolo_confidence": piece.get("confidence"),
+                "sobel_confidence": (piece.get("sobel") or {}).get("edge_confidence"),
+                "distance_to_reference_in": (piece.get("measurement") or {}).get("delta_in"),
+                "automatic_measurement_in": (piece.get("measurement") or {}).get("measurement_in"),
+                "operator_measurement_in": None,
+                "effective_measurement_in": (piece.get("measurement") or {}).get("measurement_in"),
+                "operator_revision": 0,
+                "revisions": [],
+            }
+            for index, piece in enumerate(canonical_pieces, start=1)
+        ],
+        assets=[],
+    )
+    return result
+
+
+def database_event_detail(event_id: str) -> dict[str, Any] | None:
+    if _database is None:
+        json_path = find_clip_json(event_id)
+        if json_path is None:
+            for candidate in clip_sidecars(_args.output_dir):
+                try:
+                    raw = json.loads(candidate.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if str(raw.get("event_id")) == event_id:
+                    json_path = candidate
+                    break
+        return legacy_history_event(json_path, detail=True) if json_path else None
+
+    event = _database.get_measurement_event(event_id)
+    if event is None:
+        return None
+    assets = [clean_value(asset) for asset in event.get("assets", [])]
+    asset_by_path = {asset["relative_path"]: asset for asset in assets}
+    snapshots = representative_snapshots(event.get("snapshots", []), HISTORY_SNAPSHOT_LIMIT)
+    for snapshot in snapshots:
+        for path_key, url_key in (
+            ("original_overlay_path", "original_overlay_url"),
+            ("rectified_overlay_path", "rectified_overlay_url"),
+        ):
+            asset = asset_by_path.get(snapshot.get(path_key))
+            if asset:
+                snapshot[url_key] = f"/api/history/events/{event_id}/assets/{asset['id']}"
+    video = next((asset for asset in assets if asset.get("asset_type") == "video"), None)
+    event["snapshots"] = snapshots
+    event["assets"] = assets
+    event["video_url"] = (
+        f"/api/history/events/{event_id}/assets/{video['id']}" if video else None
+    )
+    event["detail_url"] = f"/history/{event_id}"
+    event["database_mode"] = "postgresql"
+    return clean_value(event)
 
 
 def delete_clip_artifacts(output_dir: Path, json_path: Path) -> None:
@@ -1370,11 +1876,23 @@ def history_clip(clip_id: str):
 
 @app.route("/api/live/status")
 def api_live_status():
+    database_status = (
+        _database.health().as_dict()
+        if _database is not None
+        else {
+            "enabled": False,
+            "ok": False,
+            "error": "Database disabled explicitly for simulation",
+            "mode": "simulation",
+        }
+    )
     return jsonify(
         camera=_camera.snapshot(),
         processor=_processor.snapshot(include_images=False),
         plc=_plc.snapshot(),
         recorder=_recorder.snapshot(),
+        database=database_status,
+        reconciler=_reconciler.snapshot() if _reconciler is not None else None,
     )
 
 
@@ -1384,6 +1902,174 @@ def api_live_frame():
     if data.get("result") is None:
         return jsonify(error=data.get("error") or "No processed frame is available yet", processor=data), 503
     return jsonify(data)
+
+
+@app.route("/api/history/events")
+def api_history_events():
+    try:
+        limit = int(request.args.get("limit", 50))
+    except ValueError:
+        return jsonify(error="limit must be an integer"), 400
+    limit = max(1, min(limit, 100))
+    if _database is None:
+        events = []
+        for json_path in clip_sidecars(_args.output_dir)[:limit]:
+            event = legacy_history_event(json_path, detail=False)
+            if event is not None:
+                events.append(event)
+        return jsonify(
+            events=events,
+            count=len(events),
+            database_mode="simulation",
+            warning="PostgreSQL is disabled explicitly; operator corrections are unavailable.",
+        )
+    try:
+        events = _database.list_measurement_events(
+            limit=limit,
+            before=request.args.get("before"),
+        )
+    except DatabaseUnavailable as exc:
+        return jsonify(error=str(exc), database_mode="postgresql"), 503
+    for event in events:
+        event["id"] = str(event["id"])
+        event["detail_url"] = f"/history/{event['id']}"
+        event["video_url"] = f"/api/history/events/{event['id']}/video"
+    return jsonify(
+        events=clean_value(events),
+        count=len(events),
+        database_mode="postgresql",
+    )
+
+
+@app.route("/api/history/events/<event_id>")
+def api_history_event(event_id: str):
+    try:
+        event = database_event_detail(event_id)
+    except DatabaseUnavailable as exc:
+        return jsonify(error=str(exc)), 503
+    if event is None:
+        return jsonify(error="Measurement event not found"), 404
+    return jsonify(event)
+
+
+@app.route("/api/history/events/<event_id>/video")
+def api_history_event_video(event_id: str):
+    try:
+        event = database_event_detail(event_id)
+    except DatabaseUnavailable:
+        abort(503)
+    if event is None:
+        abort(404)
+    if _database is None:
+        clip_id = event.get("clip_id")
+        json_path = find_clip_json(str(clip_id)) if clip_id else None
+        if json_path is None:
+            abort(404)
+        data = read_clip_sidecar(json_path, snapshot_limit=0) or {}
+        video_path = Path(str(data.get("video_path", "")))
+    else:
+        video_asset = next(
+            (asset for asset in event.get("assets", []) if asset.get("asset_type") == "video"),
+            None,
+        )
+        if video_asset is None:
+            abort(404)
+        try:
+            video_path = resolve_asset_path(video_asset["relative_path"], _args.output_dir)
+        except ValueError:
+            abort(404)
+    if not video_path.is_file() or not path_is_inside(video_path, _args.output_dir):
+        abort(404)
+    return send_file(video_path, mimetype="video/mp4", conditional=True)
+
+
+@app.route("/api/history/events/<event_id>/assets/<int:asset_id>")
+def api_history_event_asset(event_id: str, asset_id: int):
+    if _database is None:
+        abort(404)
+    try:
+        event = database_event_detail(event_id)
+    except DatabaseUnavailable:
+        abort(503)
+    if event is None:
+        abort(404)
+    asset = next(
+        (item for item in event.get("assets", []) if int(item["id"]) == asset_id),
+        None,
+    )
+    if asset is None:
+        abort(404)
+    try:
+        asset_path = resolve_asset_path(asset["relative_path"], _args.output_dir)
+    except ValueError:
+        abort(404)
+    if not asset_path.is_file():
+        abort(404)
+    return send_file(
+        asset_path,
+        mimetype=asset.get("mime_type") or "application/octet-stream",
+        conditional=True,
+    )
+
+
+def operator_measurement_inches(payload: dict[str, Any]) -> Decimal:
+    if payload.get("measurement_in") is not None:
+        return Decimal(str(payload["measurement_in"]))
+    try:
+        feet = int(payload.get("feet", 0))
+        inches = int(payload.get("inches", 0))
+        sixteenths = int(payload.get("sixteenths", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Feet, inches and sixteenths must be integers") from exc
+    if feet < 0 or not 0 <= inches <= 11 or not 0 <= sixteenths <= 15:
+        raise ValueError("Use non-negative feet, 0-11 inches and 0-15 sixteenths")
+    return Decimal(feet * 12 + inches) + (Decimal(sixteenths) / Decimal(16))
+
+
+@app.route(
+    "/api/history/events/<event_id>/pieces/<piece_id>/operator-measurement",
+    methods=["PATCH"],
+)
+def api_history_operator_measurement(event_id: str, piece_id: str):
+    if _database is None:
+        return jsonify(error="Operator corrections require PostgreSQL"), 503
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="A JSON request body is required"), 400
+    try:
+        expected_revision = int(payload["expected_revision"])
+        common = {
+            "event_id": event_id,
+            "piece_id": piece_id,
+            "reason": str(payload.get("reason") or ""),
+            "operator_id": str(payload.get("operator_id") or ""),
+            "operator_display_name": (
+                str(payload["operator_display_name"])
+                if payload.get("operator_display_name")
+                else None
+            ),
+            "expected_revision": expected_revision,
+            "source_ip": request.remote_addr,
+        }
+        if payload.get("clear") is True:
+            _database.clear_operator_measurement(**common)
+        else:
+            _database.set_operator_measurement(
+                **common,
+                measurement_in=operator_measurement_inches(payload),
+            )
+        event = database_event_detail(event_id)
+        return jsonify(event)
+    except KeyError:
+        return jsonify(error="expected_revision is required"), 400
+    except RevisionConflict as exc:
+        return jsonify(error=str(exc), conflict=True), 409
+    except RecordNotFound as exc:
+        return jsonify(error=str(exc)), 404
+    except (ValueError, ArithmeticError) as exc:
+        return jsonify(error=str(exc)), 400
+    except DatabaseUnavailable as exc:
+        return jsonify(error=str(exc)), 503
 
 
 @app.route("/api/live/clips")
@@ -1433,26 +2119,68 @@ def api_live_clip_asset(clip_id: str, asset_name: str):
 
 
 def main() -> int:
-    global _args, _buffer, _camera, _processor, _recorder, _plc
+    global _args, _buffer, _camera, _processor, _recorder, _plc, _database, _reconciler
     _args = parse_args()
     configure_vision_module(_args)
+    if not _args.db_disabled:
+        if not _args.postgres_dsn.strip():
+            print(
+                "ERROR: TX2_POSTGRES_DSN is required. "
+                "Use --db-disabled only for explicit simulation.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            _database = DatabaseRepository(_args.postgres_dsn)
+            _database.open(timeout=float(_args.plc_timeout))
+            _database.validate_schema()
+            _database.recover_stale_measurement_events(
+                older_than_seconds=max(60, int(float(_args.record_seconds) * 3))
+            )
+        except Exception as exc:
+            if _database is not None:
+                _database.close()
+                _database = None
+            print(f"ERROR: PostgreSQL startup validation failed: {exc}", file=sys.stderr)
+            return 2
 
     requested_buffer_frames = int(max(8, float(_args.buffer_seconds) * max(1.0, float(_args.capture_fps))))
     buffer_len = min(requested_buffer_frames, max(8, int(_args.buffer_max_frames)))
     _buffer = FrameBuffer(maxlen=buffer_len)
     _camera = CameraReader(_args, _buffer)
     _processor = LiveProcessor(_args, _buffer)
-    _recorder = ClipRecorder(_args, _buffer, _processor)
+    _recorder = ClipRecorder(_args, _buffer, _processor, _database)
+    try:
+        _recorder.validate_configuration()
+    except Exception as exc:
+        if _database is not None:
+            _database.close()
+            _database = None
+        print(f"ERROR: Vision configuration validation failed: {exc}", file=sys.stderr)
+        return 2
     _plc = PLCMonitor(_args, _recorder)
+    _reconciler = DatabaseReconciler(_args, _database) if _database is not None else None
 
     _camera.start()
     _processor.start()
     _plc.start()
+    if _reconciler is not None:
+        _reconciler.start()
 
     print(f"\n  TX2 Live MVP at http://127.0.0.1:{_args.port}\n")
     print(f"  Source: {_args.source}")
     print(f"  PLC: {'enabled' if _args.plc_enabled else 'disabled'}")
-    app.run(host="127.0.0.1", port=_args.port, debug=False, threaded=True)
+    print(f"  Database: {'disabled (simulation)' if _args.db_disabled else 'PostgreSQL'}")
+    try:
+        app.run(host="127.0.0.1", port=_args.port, debug=False, threaded=True)
+    finally:
+        if _reconciler is not None:
+            _reconciler.stop()
+        _plc.stop()
+        _processor.stop()
+        _camera.stop()
+        if _database is not None:
+            _database.close()
     return 0
 
 

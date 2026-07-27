@@ -1,3 +1,7 @@
+param(
+    [switch]$DatabaseDisabled
+)
+
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -53,6 +57,16 @@ if (-not $env:AXIS_PASSWORD) {
     }
 }
 
+if (-not $DatabaseDisabled -and -not $env:TX2_POSTGRES_DSN) {
+    throw "TX2_POSTGRES_DSN is required. Use -DatabaseDisabled only for explicit simulation."
+}
+
+$databaseArgs = @()
+if ($DatabaseDisabled) {
+    $databaseArgs += "--db-disabled"
+    Write-Warning "PostgreSQL is disabled explicitly. History persistence is in simulation mode."
+}
+
 # This MVP is live by default: Python reads the AXIS camera directly through RTSP.
 # If the camera requires auth, set AXIS_USER and AXIS_PASSWORD before running.
 # To test with a file temporarily, change --source rtsp to --source video and pass --video.
@@ -74,4 +88,5 @@ if (-not $env:AXIS_PASSWORD) {
   --max-clips 100 `
   --plc-enabled `
   --plc-edge rising `
-  --port 8767
+  --port 8767 `
+  @databaseArgs

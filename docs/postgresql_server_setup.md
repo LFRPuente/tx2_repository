@@ -150,8 +150,8 @@ $env:TX2_POSTGRES_DSN = "host=127.0.0.1 port=5432 dbname=tx2_vision user=tx2_vis
 )
 ```
 
-The current application does not read `TX2_POSTGRES_DSN` yet. This variable is
-the agreed connection setting for the upcoming PostgreSQL integration.
+The Live MVP reads `TX2_POSTGRES_DSN` at startup. The password remains outside
+the DSN and is resolved through `pgpass.conf`.
 
 ## 5. Verify The Installation
 
@@ -214,6 +214,19 @@ The server is ready for the next development step when all of these are true:
 - The `TX2_POSTGRES_DSN` variable is available to the Windows account that will
   run the MVP.
 
-After that, the application migration will create the PLC event, automatic
-measurement, operator measurement, asset path, and configuration tables. One
-PLC event can reference multiple independently measured pieces.
+After that, apply the versioned application schema and validate the existing
+sidecars from the repository root:
+
+```powershell
+python tools\apply_postgres_migrations.py
+
+python tools\migrate_live_sidecars_to_postgres.py `
+  --dry-run `
+  --output-dir .\outputs `
+  --model .\runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt
+```
+
+Remove `--dry-run` only after reviewing the validation result. The import is
+idempotent and one PLC event can reference multiple independently measured
+pieces. Production Live startup intentionally fails until the database is
+reachable and all required tables exist.

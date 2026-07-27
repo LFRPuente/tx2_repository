@@ -51,9 +51,10 @@ Cuando esta integracion termine, un ciclo de produccion debe verse asi:
 8. Cada frente se fuerza a una linea horizontal.
 9. Cada pieza se mide contra la linea de referencia usando la escala vigente.
 10. El frontend muestra la imagen original, el esquema y la tabla de piezas.
-11. Una señal del PLC crea un evento de medicion y comienza una grabacion.
-12. La siguiente señal cierra la grabacion anterior e inicia la nueva; si no
-    llega otra señal, la grabacion termina a los 10 segundos.
+11. Una señal rising del PLC crea un evento de medicion y comienza una
+    grabacion independiente de 8 segundos.
+12. Una nueva señal crea otra ventana fija de 8 segundos. Si ambas ventanas
+    coinciden en el tiempo, se conservan como clips separados sin truncarlas.
 13. El evento, sus piezas, snapshots y rutas de assets se guardan en PostgreSQL.
 14. En `History`, el operador puede capturar una medida real para cada pieza.
 15. La medida automatica nunca se sobrescribe. Cada cambio del operador queda
@@ -117,8 +118,8 @@ Responsabilidades actuales:
 - leer RTSP de la camara AXIS;
 - procesar el frame mas reciente en un thread separado;
 - leer `VisionWD` y `MeasureLength` por OPC UA;
-- iniciar y cerrar clips con señales del PLC;
-- impedir clips solapados;
+- iniciar clips fijos de 8 segundos con señales rising del PLC;
+- conservar ventanas cercanas como clips independientes, incluso si se solapan;
 - guardar MP4, JSON y snapshots JPEG;
 - servir una interfaz ligera en ingles;
 - mostrar historia de clips guardados.
@@ -146,9 +147,15 @@ No se deben mezclar los dos MVP sin una decision explicita:
 
 ## 4. Estado actual: que ya esta y que falta
 
+Estado actualizado el 2026-07-27 en `codex/live-mvp-integration`: la capa de
+aplicacion PostgreSQL, migracion, reconciliacion, History y auditoria ya esta
+implementada. La instalacion del servicio PostgreSQL, el login restringido,
+`pgpass.conf`, backups y la validacion end-to-end en el servidor siguen siendo
+pasos operativos y requieren permisos de administrador.
+
 | Capacidad | Tool offline | Live MVP | Trabajo pendiente |
 |---|---:|---:|---|
-| Homografia guardada | Si | Si | Agregar version/hash al evento |
+| Homografia guardada | Si | Si | Validacion operativa |
 | ROI de trabajo extendido | Si | Si, por archivo | Validar dimensiones al iniciar |
 | Varias mediciones de calibracion | Si | Si, se cargan | Exponer version activa |
 | Linea horizontal de referencia | Si | Si | Mostrarla consistentemente |
@@ -159,13 +166,13 @@ No se deben mezclar los dos MVP sin una decision explicita:
 | Reglas geometricas | Si | Si, sin zonas | Devolver `box_rules` en live |
 | Sobel por pieza | Si | Si | Mantener exacto el algoritmo |
 | Frente siempre horizontal | Si | Si | Agregar prueba live |
-| Medida por pieza | Si | Si | Persistir snapshot canonico |
+| Medida por pieza | Si | Si | Validacion con piezas reales |
 | Formato `40' 9 1/16"` | Si | No | Cambiar overlays y tablas |
 | PLC/OPC UA | Pruebas | Si | Endurecer reconexion y metricas |
-| Clip no solapado | No aplica | Si | Conservar comportamiento |
-| PostgreSQL | No | No | Implementar migraciones y repositorio |
-| Edicion en History | No | No | API, UI y auditoria |
-| Autenticacion del operador | No | No | Definir identidad inicial/Azure AD |
+| Clips fijos de 8 s | No aplica | Si, ventanas independientes | Validacion de duracion/retencion |
+| PostgreSQL | No | Implementado | Instalar/configurar servicio y ejecutar migraciones |
+| Edicion en History | No | Implementada | Validacion operativa y permisos |
+| Autenticacion del operador | No | Identidad explicita inicial | Integrar Azure AD |
 
 ## 5. Artefactos vigentes
 
@@ -712,9 +719,9 @@ erDiagram
 - Las rutas se guardan relativas a `outputs/`, no como paths absolutos de una
   maquina especifica.
 
-## 12. Migracion SQL inicial propuesta
+## 12. Migracion SQL inicial
 
-Crear en una futura implementacion:
+Implementada en:
 
 ```text
 db/migrations/001_initial.sql
@@ -977,7 +984,7 @@ Si falla el procesamiento, guardar el evento como `failed` y conservar
 
 El `piece_id` actual se asigna de izquierda a derecha en cada frame. No es un
 tracking persistente entre frames. Por eso no se deben insertar todas las
-apariciones de `P1` durante 10 segundos como si fueran la misma pieza fisica.
+apariciones de `P1` durante 8 segundos como si fueran la misma pieza fisica.
 
 Para el primer MVP se recomienda:
 
@@ -1501,10 +1508,10 @@ tools/migrate_live_sidecars_to_postgres.py
 - `VisionWD` cambia aproximadamente cada 69-70 ms;
 - se lee `MeasureLength` al cambiar watchdog;
 - rising edge crea un evento;
-- segundo rising edge cierra el clip anterior;
-- no existen frames posteriores al limite del primer evento;
-- sin segunda señal, termina a 10 segundos;
-- MP4 reporta duracion consistente;
+- un segundo rising edge crea otra ventana sin cerrar la anterior;
+- cada ventana contiene solo frames desde su señal hasta su limite de 8 segundos;
+- cada MP4 reporta 80 frames a 10 FPS y 8 segundos;
+- dos ventanas cercanas se conservan como clips independientes;
 - sidecar conserva source/server/app timestamps.
 
 ### 23.4 PostgreSQL
@@ -1647,7 +1654,7 @@ El tiempo monotonico no debe persistirse como una hora absoluta entre reinicios,
 pero si debe usarse para:
 
 - separar clips;
-- evitar solapamiento;
+- delimitar cada ventana independiente de 8 segundos;
 - seleccionar frames cercanos a la señal;
 - medir latencias.
 
@@ -1756,7 +1763,7 @@ La integracion esta terminada cuando:
 - [ ] Todos los frentes son horizontales.
 - [ ] La UI muestra `40' 9 1/16"` sin `ft` ni `in`.
 - [ ] La señal PLC crea exactamente un evento PostgreSQL.
-- [ ] Dos señales cercanas no generan clips solapados.
+- [ ] Dos señales cercanas conservan dos clips independientes de 8 segundos.
 - [ ] El evento tiene un snapshot canonico explicable.
 - [ ] History lista eventos desde PostgreSQL.
 - [ ] El operador puede corregir una pieza.

@@ -92,9 +92,8 @@ Vision API responses now include:
 The singular `sobel` and `measurement` fields remain temporarily available for
 older clients and refer to the first valid piece.
 
-For the upcoming PostgreSQL integration, one PLC measurement event will own
-zero or more piece measurement rows. Automatic and operator-entered values will
-remain separate for every piece.
+In PostgreSQL, one PLC measurement event owns zero or more piece measurement
+rows. Automatic and operator-entered values remain separate for every piece.
 
 ## Python Setup
 
@@ -157,6 +156,7 @@ Configure the AXIS credentials in the terminal that will launch the app:
 ```powershell
 $env:AXIS_USER="your-user"
 $env:AXIS_PASSWORD="your-password"
+$env:TX2_POSTGRES_DSN="host=127.0.0.1 port=5432 dbname=tx2_vision user=tx2_vision_app connect_timeout=5"
 .\run_live_mvp_app.ps1
 ```
 
@@ -184,7 +184,15 @@ The MP4 itself contains the processed live camera view with the YOLO-derived
 reference and front overlays; it is not the raw camera feed.
 The history shows up to six representative processing captures per clip while
 the full processing data remains in its sidecar JSON. The app retains the 100
-most recent clips and removes older clip artifacts automatically.
+most recent clips and removes older clip artifacts and their PostgreSQL events
+automatically.
+
+PostgreSQL is the History system of record. Each PLC signal creates an
+idempotent event, snapshots the active model/homography/calibration hashes,
+stores all processing snapshots, selects one canonical snapshot, and persists
+its per-piece automatic measurements. Operator corrections preserve the
+automatic value and create immutable audit revisions with optimistic
+concurrency checks.
 
 The live frame buffer is capped to avoid retaining several gigabytes of raw
 images. Clips are streamed directly to disk and resampled to the configured
@@ -199,6 +207,17 @@ outputs/live_plc_clips/<date>/
 ```
 
 Storage currently uses MP4, JSON, and JPEG files. SQLite is not used.
+If PostgreSQL is temporarily unavailable after startup, the MP4 and sidecar are
+kept with `db_sync_status: pending` and a background reconciler retries them.
+Production startup fails if PostgreSQL or its schema is unavailable; there is
+no silent fallback. For an explicit camera/PLC simulation only:
+
+```powershell
+.\run_live_mvp_app.ps1 -DatabaseDisabled
+```
+
+The Live and History pages visibly report simulation mode and operator
+corrections are disabled.
 
 ## PostgreSQL Server Setup
 
@@ -207,10 +226,26 @@ installation, security, credential, verification, and backup instructions in
 [`docs/postgresql_server_setup.md`](docs/postgresql_server_setup.md).
 
 The guide prepares the database service, `tx2_vision` database, and restricted
-`tx2_vision_app` login. The current MVP does not write to PostgreSQL yet; the
-tables and application persistence will be added in the next integration step.
-The target schema, PLC event lifecycle, per-piece measurement records, History
-APIs, operator corrections, audit trail, and migration plan are specified in
+`tx2_vision_app` login. After the service, password file, and
+`TX2_POSTGRES_DSN` are ready, apply the versioned schema:
+
+```powershell
+python tools\apply_postgres_migrations.py
+```
+
+Validate all existing sidecars without changing them:
+
+```powershell
+python tools\migrate_live_sidecars_to_postgres.py `
+  --dry-run `
+  --output-dir .\outputs `
+  --model .\runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt
+```
+
+Then run the idempotent import by removing `--dry-run`. The import enriches
+legacy sidecars with event/configuration identifiers, registers disk assets by
+relative path, and can be rerun safely. The schema and lifecycle contract are
+specified in
 [`LIVE_MVP_INTEGRATION_README.md`](LIVE_MVP_INTEGRATION_README.md).
 
 ## Next Steps On The TX2 Server
@@ -236,6 +271,9 @@ runs/detect/runs_tx2/yolo11n_pieces_v1/weights/best.pt
 Use this checklist for the on-machine validation:
 
 - [ ] Set `AXIS_USER` and `AXIS_PASSWORD`, then run `run_live_mvp_app.ps1`.
+- [ ] Confirm `TX2_POSTGRES_DSN` and `%APPDATA%\postgresql\pgpass.conf` belong to the Windows account running the MVP.
+- [ ] Run `tools\apply_postgres_migrations.py` and confirm the schema checksum is recorded.
+- [ ] Run the sidecar migrator in `--dry-run`, then import the existing clips.
 - [ ] Open `http://127.0.0.1:8767` and confirm the original camera image remains at its native resolution.
 - [ ] Confirm YOLO detects each piece independently in the rectified image and Sobel Y runs only inside each piece ROI.
 - [ ] Confirm boxes with more than 20% overlap in a saved red zone are discarded before Sobel.
@@ -249,6 +287,7 @@ Use this checklist for the on-machine validation:
 - [ ] Verify PostgreSQL stores one event with zero or more per-piece automatic measurements.
 - [ ] Verify History can save and clear an operator measurement without changing the automatic value.
 - [ ] Verify every operator change creates an immutable audit revision.
+- [ ] Stop PostgreSQL during a test event, confirm the sidecar becomes `pending`, restart PostgreSQL, and confirm reconciliation changes it to `synced`.
 - [ ] Leave the app running for at least 30 minutes and confirm the frame buffer stays capped and process memory does not grow continuously.
 
 After the live validation, decide the production host binding, Windows service
