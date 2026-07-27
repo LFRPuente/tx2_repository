@@ -3,7 +3,7 @@ Live MVP for TX2 vision measurement.
 
 This app is intentionally separate from the existing React MVP. It runs a small
 Flask UI plus a background camera reader, live processor, optional PLC monitor,
-and PLC-triggered clip recorder.
+and PLC-triggered 8 second clip recorder.
 """
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import argparse
 import asyncio
 import base64
 import json
-import math
 import os
 import sys
 import threading
@@ -94,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--process-fps", type=float, default=10.0)
     parser.add_argument("--buffer-seconds", type=float, default=2.0)
     parser.add_argument("--buffer-max-frames", type=int, default=60)
-    parser.add_argument("--record-seconds", type=float, default=10.0)
+    parser.add_argument("--record-seconds", type=float, default=8.0)
     parser.add_argument("--record-fps", type=float, default=10.0)
     parser.add_argument("--max-clips", type=int, default=100)
     parser.add_argument("--plc-enabled", action="store_true")
@@ -482,8 +481,7 @@ class ClipRecorder:
         self.buffer = buffer
         self.processor = processor
         self.lock = threading.Lock()
-        self.active_recording: dict[str, Any] | None = None
-        self.running_recordings: set[int] = set()
+        self.active_recordings: set[int] = set()
         self.clip_index = 0
         self.last_clip: dict[str, Any] | None = None
         self.failed_recordings: deque[dict[str, Any]] = deque(maxlen=20)
@@ -492,8 +490,8 @@ class ClipRecorder:
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             return {
-                "recording": bool(self.running_recordings),
-                "active_recordings": 1 if self.active_recording is not None else 0,
+                "recording": bool(self.active_recordings),
+                "active_recordings": len(self.active_recordings),
                 "clip_index": self.clip_index,
                 "last_clip": self.last_clip,
                 "failed_recording_count": len(self.failed_recordings),
@@ -503,46 +501,12 @@ class ClipRecorder:
             }
 
     def start_event_clip(self, event: dict[str, Any]) -> None:
-        event_mono = float(event.get("event_read_monotonic") or time.perf_counter())
         with self.lock:
-            if self.active_recording is not None:
-                self.active_recording["stop_monotonic"] = event_mono
-                self.active_recording["stop_reason"] = "next_plc_signal"
-                self.active_recording["next_event"] = clean_value(event)
-                self.active_recording["stop_event"].set()
-
             self.clip_index += 1
             clip_index = self.clip_index
-            control = {
-                "clip_index": clip_index,
-                "event_monotonic": event_mono,
-                "stop_monotonic": None,
-                "stop_reason": None,
-                "next_event": None,
-                "stop_event": threading.Event(),
-            }
-            self.active_recording = control
-            self.running_recordings.add(clip_index)
-        thread = threading.Thread(
-            target=self._record_clip,
-            args=(clip_index, event, control),
-            name=f"plc-clip-{clip_index}",
-            daemon=True,
-        )
+            self.active_recordings.add(clip_index)
+        thread = threading.Thread(target=self._record_clip, args=(clip_index, event), daemon=True)
         thread.start()
-
-    def _recording_end(
-        self,
-        control: dict[str, Any],
-        max_deadline: float,
-    ) -> tuple[float, str, dict[str, Any] | None]:
-        with self.lock:
-            stop_monotonic = control.get("stop_monotonic")
-            stop_reason = control.get("stop_reason")
-            next_event = control.get("next_event")
-        if stop_monotonic is not None and float(stop_monotonic) < max_deadline:
-            return float(stop_monotonic), str(stop_reason or "next_plc_signal"), next_event
-        return max_deadline, "max_duration", None
 
     def _capture_processing_snapshot(
         self,
@@ -584,18 +548,14 @@ class ClipRecorder:
 
         snapshots.append(snapshot)
 
-    def _record_clip(
-        self,
-        clip_index: int,
-        event: dict[str, Any],
-        control: dict[str, Any],
-    ) -> None:
+    def _record_clip(self, clip_index: int, event: dict[str, Any]) -> None:
         processing_snapshots: list[dict[str, Any]] = []
         seen_processing_frames: set[int] = set()
-        event_mono = float(control["event_monotonic"])
-        max_record_seconds = max(0.1, float(self.args.record_seconds))
-        max_deadline = event_mono + max_record_seconds
+        event_mono = float(event.get("event_read_monotonic") or time.perf_counter())
+        record_seconds = max(0.1, float(self.args.record_seconds))
+        deadline = event_mono + record_seconds
         fps = max(1.0, min(float(self.args.record_fps or self.args.capture_fps or 10.0), 60.0))
+        target_frame_count = max(1, int(round(record_seconds * fps)))
         frames_written = 0
         source_frames_seen = 0
         last_index = -1
@@ -618,10 +578,7 @@ class ClipRecorder:
             video_path = day_dir / f"{base}.mp4"
             json_path = day_dir / f"{base}.json"
 
-            while True:
-                recording_end, _, _ = self._recording_end(control, max_deadline)
-                if time.perf_counter() >= recording_end:
-                    break
+            while time.perf_counter() < deadline:
                 new_frames = self.buffer.frames_since(last_index)
                 if new_frames:
                     last_index = int(new_frames[-1]["index"])
@@ -629,26 +586,31 @@ class ClipRecorder:
                     item_mono = float(item["monotonic"])
                     if item_mono < event_mono:
                         continue
-                    recording_end, _, _ = self._recording_end(control, max_deadline)
-                    if item_mono >= recording_end:
-                        break
                     source_frames_seen += 1
                     if writer is None:
                         height, width = item["frame"].shape[:2]
-                        writer = cv2.VideoWriter(
+                        writer_args = (
                             str(video_path),
-                            cv2.VideoWriter_fourcc(*"mp4v"),
+                            cv2.VideoWriter_fourcc(*"avc1"),
                             fps,
                             (width, height),
                         )
+                        if os.name == "nt":
+                            writer = cv2.VideoWriter(
+                                writer_args[0],
+                                cv2.CAP_MSMF,
+                                *writer_args[1:],
+                            )
+                        else:
+                            writer = cv2.VideoWriter(*writer_args)
                         if not writer.isOpened():
                             raise RuntimeError(f"Could not open VideoWriter: {video_path}")
                     if last_source is None:
                         last_source = item
 
-                    while True:
+                    while frames_written < target_frame_count:
                         sample_mono = event_mono + (frames_written / fps)
-                        if sample_mono >= recording_end or sample_mono > item_mono:
+                        if sample_mono > item_mono:
                             break
                         writer.write(last_source["frame"])
                         first_written_source = first_written_source or last_source
@@ -656,15 +618,12 @@ class ClipRecorder:
                         frames_written += 1
                     last_source = item
                 self._capture_processing_snapshot(analysis_dir, processing_snapshots, seen_processing_frames)
-                control["stop_event"].wait(0.025)
+                time.sleep(0.025)
             self._capture_processing_snapshot(analysis_dir, processing_snapshots, seen_processing_frames)
 
             if writer is None or last_source is None:
                 raise RuntimeError("No frames were available to record the clip.")
 
-            recording_end, stop_reason, next_event = self._recording_end(control, max_deadline)
-            actual_record_seconds = max(0.0, recording_end - event_mono)
-            target_frame_count = max(1, int(math.ceil((actual_record_seconds * fps) - 1e-9)))
             while frames_written < target_frame_count:
                 writer.write(last_source["frame"])
                 first_written_source = first_written_source or last_source
@@ -680,11 +639,9 @@ class ClipRecorder:
                 "clip_index": clip_index,
                 "saved_at": utc_now(),
                 "event": event,
-                "record_seconds": round(actual_record_seconds, 3),
-                "max_record_seconds": max_record_seconds,
-                "stop_reason": stop_reason,
-                "next_event": next_event,
+                "record_seconds": record_seconds,
                 "video_fps": fps,
+                "video_codec": "h264",
                 "video_duration_seconds": frames_written / fps,
                 "frames_captured": source_frames_seen,
                 "frames_written": frames_written,
@@ -724,9 +681,7 @@ class ClipRecorder:
             if writer is not None:
                 writer.release()
             with self.lock:
-                self.running_recordings.discard(clip_index)
-                if self.active_recording is control:
-                    self.active_recording = None
+                self.active_recordings.discard(clip_index)
 
     def _enforce_retention(self) -> None:
         max_clips = max(1, int(self.args.max_clips or 100))

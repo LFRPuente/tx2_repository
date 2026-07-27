@@ -68,9 +68,8 @@ http://127.0.0.1:8767
 The Live MVP provides a light interface with the live camera view and
 measurement diagram. It keeps the AXIS stream at `1920x1080` and targets 10 FPS
 for capture, processing, browser updates, and saved clips. It connects to the
-PLC through OPC UA and starts a clip when `MeasureLength` changes from `False`
-to `True`. The next signal closes that clip and starts the following one; if no
-new signal arrives, recording stops after 10 seconds.
+PLC through OPC UA and records one 8-second clip when `MeasureLength` changes
+from `False` to `True`.
 
 Open the saved clip history at:
 
@@ -78,16 +77,16 @@ Open the saved clip history at:
 http://127.0.0.1:8767/history
 ```
 
-Each history entry contains the MP4, PLC event metadata, processing snapshots,
-and the overlays produced while the clip was recorded. The app retains the 100
-most recent clips and removes older clip artifacts automatically.
+Each history entry contains a browser-compatible H.264 MP4, PLC event metadata,
+processing snapshots, and the overlays produced while the clip was recorded.
+The app retains the 100 most recent clips and removes older clip artifacts
+automatically.
 
 The live frame buffer is capped to avoid retaining several gigabytes of raw
 images. Clips are streamed directly to disk and resampled to the configured
 output FPS, so their playback duration matches the PLC recording window. If a
-second PLC event arrives while a clip is active, the current clip ends at that
-event boundary and the next clip begins there, so saved recordings do not
-overlap.
+second PLC event arrives while another clip is active, both recording windows
+are preserved as separate clips.
 
 Live MVP data is stored directly under:
 
@@ -125,10 +124,10 @@ Use this checklist for the on-machine validation:
 - [ ] Confirm the detected front is horizontal and its projection spans the full original image.
 - [ ] Confirm the reference line, distance to reference, and total measurement are correct in inches.
 - [ ] Confirm OPC UA connects to `opc.tcp://10.14.6.48:49320` and `VisionWD` keeps changing.
-- [ ] Trigger a `MeasureLength` rising edge and verify that one clip of at most 10 seconds appears in `/history`.
-- [ ] Trigger two events less than 10 seconds apart and verify that the first clip ends when the second begins, with no overlap.
+- [ ] Trigger a `MeasureLength` rising edge and verify that exactly one 8-second clip appears in `/history`.
+- [ ] Trigger two events less than eight seconds apart and verify that neither event is lost.
 - [ ] Verify each sidecar JSON contains the PLC source timestamp, watchdog value, frame timestamps, and processing snapshots.
-- [ ] Verify each saved MP4 keeps the camera resolution and reports at most 100 frames at 10 FPS.
+- [ ] Verify each saved MP4 keeps the camera resolution and reports 80 frames at 10 FPS for an 8-second window.
 - [ ] Leave the app running for at least 30 minutes and confirm the frame buffer stays capped and process memory does not grow continuously.
 
 After the live validation, decide the production host binding, Windows service
