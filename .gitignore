@@ -7,6 +7,10 @@ __pycache__/
 .venv/
 venv/
 env/
+.env
+.env.*
+!.env.example
+pgpass.conf
 .vscode/
 .uv-cache-check/
 
@@ -35,7 +39,10 @@ mvp_react_app/dist/
 # Keep curated YOLO datasets in Git.
 !dataset/images/**/*.jpg
 !dataset_yolo11/images/**/*.jpg
+!dataset_pieces/images/**/*.jpg
+!dataset_pieces_yolo11/images/**/*.jpg
 dataset_yolo11/**/*.cache
+dataset_pieces_yolo11/**/*.cache
 
 # Generated outputs. Keep calibration/config JSON needed by the local apps.
 outputs/*
@@ -55,3 +62,8 @@ runs/**
 !runs/detect/runs_tx2/yolo11n_tubos_v1/results.csv
 !runs/detect/runs_tx2/yolo11n_tubos_v1/weights/
 !runs/detect/runs_tx2/yolo11n_tubos_v1/weights/best.pt
+!runs/detect/runs_tx2/yolo11n_pieces_v1/
+!runs/detect/runs_tx2/yolo11n_pieces_v1/args.yaml
+!runs/detect/runs_tx2/yolo11n_pieces_v1/results.csv
+!runs/detect/runs_tx2/yolo11n_pieces_v1/weights/
+!runs/detect/runs_tx2/yolo11n_pieces_v1/weights/best.pt

@@ -29,7 +29,9 @@ if str(REPO_ROOT) not in sys.path:
 import homography_web_app as tx2_app  # noqa: E402
 
 
-DEFAULT_MODEL = REPO_ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_tubos_v1" / "weights" / "best.pt"
+DEFAULT_PIECE_MODEL = REPO_ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v1" / "weights" / "best.pt"
+DEFAULT_LEGACY_MODEL = REPO_ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_tubos_v1" / "weights" / "best.pt"
+DEFAULT_MODEL = DEFAULT_PIECE_MODEL if DEFAULT_PIECE_MODEL.exists() else DEFAULT_LEGACY_MODEL
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--password", default=os.getenv("AXIS_PASSWORD"), help="AXIS password")
     parser.add_argument("--codec", choices=("h264", "jpeg"), default="h264")
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "outputs")
-    parser.add_argument("--dataset-dir", type=Path, default=REPO_ROOT / "dataset")
+    parser.add_argument("--dataset-dir", type=Path, default=REPO_ROOT / "dataset_pieces")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--conf", type=float, default=0.10, help="YOLO confidence threshold")
     parser.add_argument("--imgsz", type=int, default=960, help="YOLO inference image size")
@@ -93,21 +95,29 @@ def process_frame(frame: np.ndarray, frame_idx: int, started_at: float, conf: fl
     matrix, out_size, _homography = tx2_app.load_homography()
     rectified = cv2.warpPerspective(frame, matrix, out_size)
     boxes = tx2_app.predict_yolo_boxes(rectified, conf=conf, imgsz=imgsz)
-    box = max(
-        boxes,
-        key=lambda item: float(item["w"]) * float(item["h"]) * float(item.get("conf", 1.0)),
-        default=None,
-    )
     time_sec = time.time() - started_at
-    sobel = empty_sobel(frame_idx, time_sec) if box is None else tx2_app.sobel_projection_for_box(rectified, box)
-    sobel.update(frame_idx=frame_idx, time_sec=time_sec)
     calibration = tx2_app.load_measurement_calibration()
-    measurement = tx2_app.measurement_from_sobel(sobel, calibration, rectified.shape[1])
-    original_overlay = tx2_app.mvp_original_overlay(sobel, calibration, matrix, rectified.shape[1])
+    pieces, measurement_summary = tx2_app.analyze_piece_boxes(
+        rectified,
+        boxes,
+        calibration,
+        frame_idx=frame_idx,
+        time_sec=time_sec,
+    )
+    primary = tx2_app.primary_piece_analysis(pieces)
+    sobel = primary["sobel"] if primary else empty_sobel(frame_idx, time_sec)
+    measurement = primary["measurement"] if primary else None
+    original_overlay = tx2_app.mvp_original_overlay_for_pieces(
+        pieces,
+        calibration,
+        matrix,
+        rectified.shape[1],
+    )
     return {
         "rectified": rectified,
         "boxes": boxes,
-        "box": box,
+        "pieces": pieces,
+        "measurement_summary": measurement_summary,
         "sobel": sobel,
         "measurement": measurement,
         "original_overlay": original_overlay,
@@ -118,31 +128,30 @@ def process_frame(frame: np.ndarray, frame_idx: int, started_at: float, conf: fl
 def draw_overlay(rectified: np.ndarray, result: dict | None, fps: float) -> np.ndarray:
     vis = rectified.copy()
     if result:
-        for box in result["boxes"]:
+        for piece in result.get("pieces") or []:
+            box = piece["box"]
+            piece_id = int(piece["piece_id"])
+            color = (83, 182, 137) if piece.get("valid") else (72, 180, 255)
             x, y, w, h = (int(round(float(box[key]))) for key in ("x", "y", "w", "h"))
-            cv2.rectangle(vis, (x, y), (x + w, y + h), (83, 182, 137), 2)
+            cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
             cv2.putText(
                 vis,
-                f"{float(box.get('conf', 0.0)):.2f}",
+                f"P{piece_id} {float(box.get('conf', 0.0)):.2f}",
                 (x, max(18, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
-                (83, 182, 137),
+                color,
                 2,
                 cv2.LINE_AA,
             )
+            line = (piece.get("sobel") or {}).get("line")
+            if line:
+                p1 = (int(round(line["x1"])), int(round(line["y1"])))
+                p2 = (int(round(line["x2"])), int(round(line["y2"])))
+                cv2.line(vis, p1, p2, color, 3, cv2.LINE_AA)
 
-        line = (result.get("sobel") or {}).get("line")
-        if line:
-            p1 = (int(round(line["x1"])), int(round(line["y1"])))
-            p2 = (int(round(line["x2"])), int(round(line["y2"])))
-            cv2.line(vis, p1, p2, (72, 180, 255), 3, cv2.LINE_AA)
-
-        measurement = result.get("measurement")
-        if measurement:
-            text = f"{float(measurement['measurement_in']):.3f} in"
-        else:
-            text = "no calibrated measurement"
+        summary = result.get("measurement_summary") or {}
+        text = f"{int(summary.get('valid_count', 0))}/{len(result.get('pieces') or [])} valid piece measurements"
     else:
         text = "waiting for first processing pass"
 
@@ -158,21 +167,22 @@ def draw_original_overlay(original: np.ndarray, result: dict | None, fps: float)
     if result:
         overlay = result.get("original_overlay") or {}
         reference_line = overlay.get("reference_line")
-        front_line = overlay.get("front_line")
+        piece_fronts = overlay.get("piece_fronts") or []
         if reference_line:
             p1 = (int(round(reference_line["x1"])), int(round(reference_line["y1"])))
             p2 = (int(round(reference_line["x2"])), int(round(reference_line["y2"])))
             cv2.line(vis, p1, p2, (83, 182, 137), 2, cv2.LINE_AA)
-        if front_line:
+        for item in piece_fronts:
+            front_line = item.get("line")
+            if not front_line:
+                continue
+            color = (83, 182, 137) if item.get("valid") else (72, 180, 255)
             p1 = (int(round(front_line["x1"])), int(round(front_line["y1"])))
             p2 = (int(round(front_line["x2"])), int(round(front_line["y2"])))
-            cv2.line(vis, p1, p2, (72, 180, 255), 3, cv2.LINE_AA)
+            cv2.line(vis, p1, p2, color, 3, cv2.LINE_AA)
 
-        measurement = result.get("measurement")
-        if measurement:
-            text = f"{float(measurement['measurement_in']):.3f} in"
-        else:
-            text = "no calibrated measurement"
+        summary = result.get("measurement_summary") or {}
+        text = f"{int(summary.get('valid_count', 0))}/{len(result.get('pieces') or [])} valid piece measurements"
 
     cv2.rectangle(vis, (12, 12), (500, 78), (17, 19, 21), -1)
     cv2.putText(vis, "full original view", (24, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (169, 176, 173), 1, cv2.LINE_AA)
@@ -225,7 +235,14 @@ def main() -> int:
                 last_result = process_frame(frame, frame_idx, started_at, args.conf, args.imgsz)
             except Exception as exc:
                 print(f"Error processing frame {frame_idx}: {exc}")
-                last_result = {"rectified": frame, "boxes": [], "sobel": empty_sobel(frame_idx, time.time() - started_at), "measurement": None}
+                last_result = {
+                    "rectified": frame,
+                    "boxes": [],
+                    "pieces": [],
+                    "measurement_summary": {},
+                    "sobel": empty_sobel(frame_idx, time.time() - started_at),
+                    "measurement": None,
+                }
 
         now = time.time()
         fps = 0.9 * fps + 0.1 * (1.0 / max(1e-6, now - last_tick)) if fps else 1.0 / max(1e-6, now - last_tick)

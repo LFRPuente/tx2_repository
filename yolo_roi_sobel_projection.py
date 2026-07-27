@@ -14,7 +14,9 @@ from ultralytics import YOLO
 ROOT = Path(__file__).resolve().parent
 DEFAULT_VIDEO = Path(r"C:\Users\luis_\Downloads\20260508_000307_7F66.mkv")
 DEFAULT_HOMOGRAPHY = ROOT / "outputs" / "homography_selection.json"
-DEFAULT_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_tubos_v1" / "weights" / "best.pt"
+DEFAULT_PIECE_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v1" / "weights" / "best.pt"
+DEFAULT_LEGACY_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_tubos_v1" / "weights" / "best.pt"
+DEFAULT_MODEL = DEFAULT_PIECE_MODEL if DEFAULT_PIECE_MODEL.exists() else DEFAULT_LEGACY_MODEL
 DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "yolo_sobel_projection"
 
 
@@ -35,6 +37,7 @@ class ProjectionConfig:
     edge_percentile: float = 88.0
     edge_band_start: float = 0.0
     edge_band_end: float = 1.0
+    edge_polarity: str = "absolute"
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,7 +127,12 @@ def edge_response_from_roi(roi: np.ndarray, cfg: ProjectionConfig) -> tuple[np.n
     gray = cv2.createCLAHE(clipLimit=cfg.clahe_clip, tileGridSize=(8, 8)).apply(gray)
     gray = cv2.GaussianBlur(gray, cfg.blur_ksize, 0)
     grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=cfg.sobel_ksize)
-    edge = np.abs(grad_y)
+    if cfg.edge_polarity == "falling":
+        edge = np.maximum(-grad_y, 0.0)
+    elif cfg.edge_polarity == "rising":
+        edge = np.maximum(grad_y, 0.0)
+    else:
+        edge = np.abs(grad_y)
     return gray, edge
 
 

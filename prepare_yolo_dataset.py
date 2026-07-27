@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import argparse
 import random
 import shutil
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-SOURCE = ROOT / "dataset"
-OUT = ROOT / "dataset_yolo11"
-SEED = 42
-VAL_RATIO = 0.2
+DEFAULT_SOURCE = ROOT / "dataset_pieces"
+DEFAULT_OUTPUT = ROOT / "dataset_pieces_yolo11"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Prepare a stratified YOLO train/validation dataset.")
+    parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--class-name", default="piece")
+    parser.add_argument("--yaml-name", default="tx2_pieces.yaml")
+    parser.add_argument("--val-ratio", type=float, default=0.20)
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
 
 
 def has_boxes(label_path: Path) -> bool:
@@ -18,18 +28,21 @@ def has_boxes(label_path: Path) -> bool:
     return any(line.strip() for line in label_path.read_text(encoding="utf-8").splitlines())
 
 
-def split_items(items: list[Path]) -> tuple[list[Path], list[Path]]:
-    rng = random.Random(SEED)
+def split_items(
+    items: list[Path],
+    rng: random.Random,
+    val_ratio: float,
+) -> tuple[list[Path], list[Path]]:
     shuffled = items[:]
     rng.shuffle(shuffled)
-    val_count = max(1, round(len(shuffled) * VAL_RATIO)) if len(shuffled) > 1 else 0
+    val_count = max(1, round(len(shuffled) * val_ratio)) if len(shuffled) > 1 else 0
     return shuffled[val_count:], shuffled[:val_count]
 
 
-def copy_pair(image_path: Path, split: str) -> None:
-    label_path = SOURCE / "labels" / f"{image_path.stem}.txt"
-    dst_img = OUT / "images" / split / image_path.name
-    dst_lbl = OUT / "labels" / split / f"{image_path.stem}.txt"
+def copy_pair(source: Path, output: Path, image_path: Path, split: str) -> None:
+    label_path = source / "labels" / f"{image_path.stem}.txt"
+    dst_img = output / "images" / split / image_path.name
+    dst_lbl = output / "labels" / split / f"{image_path.stem}.txt"
     dst_img.parent.mkdir(parents=True, exist_ok=True)
     dst_lbl.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(image_path, dst_img)
@@ -39,41 +52,79 @@ def copy_pair(image_path: Path, split: str) -> None:
         dst_lbl.write_text("", encoding="utf-8")
 
 
-def main() -> None:
-    images = sorted((SOURCE / "images").glob("*.jpg"))
-    positives = [p for p in images if has_boxes(SOURCE / "labels" / f"{p.stem}.txt")]
-    negatives = [p for p in images if p not in positives]
+def validate_paths(source: Path, output: Path) -> tuple[Path, Path]:
+    source = source.resolve()
+    output = output.resolve()
+    if source == output:
+        raise ValueError("Source and output directories must be different.")
+    if not (source / "images").is_dir() or not (source / "labels").is_dir():
+        raise FileNotFoundError(f"Expected images/ and labels/ under {source}")
+    try:
+        output.relative_to(ROOT.resolve())
+    except ValueError as exc:
+        raise ValueError("The generated dataset output must remain inside the repository.") from exc
+    if output == ROOT.resolve():
+        raise ValueError("The repository root cannot be used as the generated dataset output.")
+    return source, output
 
-    pos_train, pos_val = split_items(positives)
-    neg_train, neg_val = split_items(negatives)
+
+def main() -> None:
+    args = parse_args()
+    source, output = validate_paths(args.source, args.output)
+    val_ratio = float(args.val_ratio)
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError("--val-ratio must be between 0 and 1.")
+
+    images = sorted((source / "images").glob("*.jpg"))
+    if not images:
+        raise RuntimeError(f"No annotated JPG frames were found under {source / 'images'}")
+    positives = [path for path in images if has_boxes(source / "labels" / f"{path.stem}.txt")]
+    negatives = [path for path in images if path not in positives]
+
+    rng = random.Random(int(args.seed))
+    pos_train, pos_val = split_items(positives, rng, val_ratio)
+    neg_train, neg_val = split_items(negatives, rng, val_ratio)
     train = sorted(pos_train + neg_train)
     val = sorted(pos_val + neg_val)
 
-    if OUT.exists():
-        shutil.rmtree(OUT)
+    if output.exists():
+        shutil.rmtree(output)
     for item in train:
-        copy_pair(item, "train")
+        copy_pair(source, output, item, "train")
     for item in val:
-        copy_pair(item, "val")
+        copy_pair(source, output, item, "val")
 
-    yaml = OUT / "tx2_tubes.yaml"
-    yaml.write_text(
+    yaml_path = output / str(args.yaml_name)
+    yaml_path.write_text(
         "\n".join(
             [
-                f"path: {OUT.as_posix()}",
+                f"path: {output.as_posix()}",
                 "train: images/train",
                 "val: images/val",
                 "names:",
-                "  0: tubo",
+                f"  0: {args.class_name}",
                 "",
             ]
         ),
         encoding="utf-8",
     )
 
-    print(f"source_images={len(images)} positives={len(positives)} negatives={len(negatives)}")
+    box_count = sum(
+        len(
+            [
+                line
+                for line in (source / "labels" / f"{image.stem}.txt").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        )
+        for image in positives
+    )
+    print(
+        f"source_images={len(images)} positives={len(positives)} "
+        f"negatives={len(negatives)} boxes={box_count}"
+    )
     print(f"train={len(train)} val={len(val)}")
-    print(f"yaml={yaml}")
+    print(f"yaml={yaml_path}")
 
 
 if __name__ == "__main__":

@@ -17,25 +17,47 @@ import numpy as np
 from flask import Flask, jsonify, render_template_string, request
 
 
-DEFAULT_VIDEO = Path(r"C:\Users\luis_\Downloads\20260508_000307_7F66.mkv")
-DEFAULT_SECOND = 155.0
-DEFAULT_OUTPUT_DIR = Path(r"C:\Users\luis_\Desktop\tx2_cv_2026-05-11\outputs")
-DEFAULT_DATASET_DIR = Path(r"C:\Users\luis_\Desktop\tx2_cv_2026-05-11\dataset")
-DEFAULT_MODEL = Path(
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_VIDEO_DIR = Path(r"C:\Users\luis_\Downloads\20260724_10")
+DEFAULT_VIDEO = DEFAULT_VIDEO_DIR / "20260724_100105_6439.mkv"
+DEFAULT_SECOND = 30.0
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs"
+DEFAULT_DATASET_DIR = Path(r"C:\Users\luis_\Desktop\tx2_cv_2026-05-11\dataset_pieces")
+DEFAULT_PIECE_MODEL = Path(
+    r"C:\Users\luis_\Desktop\tx2_cv_2026-05-11\runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt"
+)
+DEFAULT_LEGACY_MODEL = Path(
     r"C:\Users\luis_\Desktop\tx2_cv_2026-05-11\runs\detect\runs_tx2\yolo11n_tubos_v1\weights\best.pt"
 )
+DEFAULT_MODEL = DEFAULT_PIECE_MODEL if DEFAULT_PIECE_MODEL.exists() else DEFAULT_LEGACY_MODEL
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", type=Path)
-    parser.add_argument("--video", type=Path, default=DEFAULT_VIDEO)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--video", type=Path)
+    source.add_argument("--video-dir", type=Path)
     parser.add_argument("--second", type=float, default=DEFAULT_SECOND)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
+    parser.add_argument(
+        "--legacy-candidates-dir",
+        type=Path,
+        help="Optional legacy dataset whose frames should appear as pending annotation candidates.",
+    )
+    parser.add_argument(
+        "--candidate-samples-per-video",
+        type=int,
+        default=12,
+        help="Evenly spaced pending annotation candidates generated for each playlist video.",
+    )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--port", type=int, default=5050)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.video is None and args.video_dir is None:
+        args.video_dir = DEFAULT_VIDEO_DIR
+    return args
 
 
 def open_video(video_path: Path) -> cv2.VideoCapture:
@@ -59,6 +81,137 @@ def video_meta(video_path: Path) -> dict:
         "width": width,
         "height": height,
     }
+
+
+def discover_video_paths(args: argparse.Namespace) -> list[Path]:
+    video_dir = getattr(args, "video_dir", None)
+    video = getattr(args, "video", None)
+    if video_dir is not None:
+        extensions = {".mkv", ".mp4", ".avi", ".mov", ".m4v"}
+        paths = sorted(
+            path
+            for path in video_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in extensions
+        )
+        if not paths:
+            raise RuntimeError(f"No se encontraron videos en: {video_dir}")
+        return paths
+    return [Path(video or DEFAULT_VIDEO)]
+
+
+def build_video_playlist(video_paths: list[Path]) -> dict:
+    if not video_paths:
+        raise RuntimeError("La playlist no contiene videos")
+
+    segments = []
+    start_frame = 0
+    expected = None
+    for path in video_paths:
+        meta = video_meta(path)
+        signature = (int(meta["width"]), int(meta["height"]), float(meta["fps"]))
+        if expected is None:
+            expected = signature
+        elif signature[:2] != expected[:2] or abs(signature[2] - expected[2]) > 1e-3:
+            raise RuntimeError(
+                f"El video {path.name} no coincide con la playlist "
+                f"({signature[0]}x{signature[1]} @ {signature[2]:.3f} FPS)"
+            )
+        total_frames = int(meta["total_frames"])
+        segments.append(
+            {
+                "path": path,
+                "name": path.name,
+                "stem": path.stem,
+                "start_frame": start_frame,
+                "end_frame": start_frame + total_frames,
+                "total_frames": total_frames,
+                "duration_sec": float(meta["duration_sec"]),
+            }
+        )
+        start_frame += total_frames
+
+    assert expected is not None
+    fps = expected[2]
+    return {
+        "segments": segments,
+        "fps": fps,
+        "total_frames": start_frame,
+        "duration_sec": start_frame / fps if fps else 0.0,
+        "width": expected[0],
+        "height": expected[1],
+    }
+
+
+def public_playlist_meta(playlist: dict) -> dict:
+    return {
+        "fps": float(playlist["fps"]),
+        "total_frames": int(playlist["total_frames"]),
+        "duration_sec": float(playlist["duration_sec"]),
+        "width": int(playlist["width"]),
+        "height": int(playlist["height"]),
+        "video_count": len(playlist["segments"]),
+        "videos": [
+            {
+                "name": segment["name"],
+                "start_frame": int(segment["start_frame"]),
+                "end_frame": int(segment["end_frame"]),
+                "total_frames": int(segment["total_frames"]),
+                "duration_sec": float(segment["duration_sec"]),
+            }
+            for segment in playlist["segments"]
+        ],
+    }
+
+
+def playlist_segment_for_frame(playlist: dict, frame_idx: int) -> tuple[dict, int, int]:
+    total = int(playlist["total_frames"])
+    global_idx = max(0, min(int(frame_idx), max(0, total - 1)))
+    for segment in playlist["segments"]:
+        if global_idx < int(segment["end_frame"]):
+            return segment, global_idx - int(segment["start_frame"]), global_idx
+    segment = playlist["segments"][-1]
+    return segment, int(segment["total_frames"]) - 1, global_idx
+
+
+def playlist_source_for_frame(playlist: dict, frame_idx: int) -> dict:
+    segment, source_frame_idx, _global_idx = playlist_segment_for_frame(playlist, frame_idx)
+    fps = float(playlist["fps"])
+    return {
+        "video": str(segment["path"]),
+        "video_name": str(segment["name"]),
+        "video_stem": str(segment["stem"]),
+        "source_frame_idx": int(source_frame_idx),
+        "source_time_sec": source_frame_idx / fps,
+    }
+
+
+def read_playlist_frame_by_index(
+    playlist: dict,
+    frame_idx: int,
+) -> tuple[np.ndarray, int, float, dict]:
+    segment, source_frame_idx, global_idx = playlist_segment_for_frame(playlist, frame_idx)
+    frame, source_frame_idx, source_time_sec = read_frame_by_index(
+        Path(segment["path"]),
+        source_frame_idx,
+    )
+    fps = float(playlist["fps"])
+    source = playlist_source_for_frame(playlist, global_idx)
+    source["source_frame_idx"] = int(source_frame_idx)
+    source["source_time_sec"] = float(source_time_sec)
+    return frame, global_idx, global_idx / fps, source
+
+
+def read_active_frame_by_index(frame_idx: int) -> tuple[np.ndarray, int, float, dict]:
+    if _video_playlist is None:
+        raise RuntimeError("La playlist de videos no esta inicializada")
+    return read_playlist_frame_by_index(_video_playlist, frame_idx)
+
+
+def read_active_frame_by_second(second: float) -> tuple[np.ndarray, int, float, dict]:
+    if _video_playlist is None:
+        raise RuntimeError("La playlist de videos no esta inicializada")
+    frame_idx = int(round(max(0.0, second) * float(_video_playlist["fps"])))
+    return read_playlist_frame_by_index(_video_playlist, frame_idx)
 
 
 def read_frame_by_second(video_path: Path, second: float) -> tuple[np.ndarray, int, float]:
@@ -93,8 +246,12 @@ def load_reference_image(args: argparse.Namespace) -> tuple[np.ndarray, str, int
         if image is None:
             raise RuntimeError(f"No se pudo abrir: {args.image}")
         return image, str(args.image), 0, 0.0
-    frame, frame_idx, time_sec = read_frame_by_second(args.video, args.second)
-    return frame, f"{args.video} @ {time_sec:.3f}s", frame_idx, time_sec
+    frame, frame_idx, time_sec, source = read_active_frame_by_second(args.second)
+    label = (
+        f"{source['video']} @ {source['source_time_sec']:.3f}s "
+        f"(playlist {time_sec:.3f}s)"
+    )
+    return frame, label, frame_idx, time_sec
 
 
 def order_points(points: np.ndarray) -> np.ndarray:
@@ -226,6 +383,7 @@ def player_capture_dir() -> Path:
 
 
 MEASUREMENT_REFERENCE_OFFSET_IN = 475.0 + (1.0 / 16.0)
+EXCLUSION_ZONE_MAX_BOX_OVERLAP = 0.20
 
 
 def load_measurement_calibration() -> dict:
@@ -236,10 +394,14 @@ def load_measurement_calibration() -> dict:
             "inch_per_px": None,
             "reference_y": None,
             "reference_offset_in": MEASUREMENT_REFERENCE_OFFSET_IN,
+            "exclusion_zones": [],
+            "exclusion_max_box_overlap": EXCLUSION_ZONE_MAX_BOX_OVERLAP,
             "path": str(path),
         }
     data = json.loads(path.read_text(encoding="utf-8"))
     data.setdefault("reference_offset_in", MEASUREMENT_REFERENCE_OFFSET_IN)
+    data.setdefault("exclusion_zones", [])
+    data.setdefault("exclusion_max_box_overlap", EXCLUSION_ZONE_MAX_BOX_OVERLAP)
     data["path"] = str(path)
     return data
 
@@ -269,7 +431,9 @@ def measurement_from_sobel(sobel: dict, calibration: dict, width: int) -> dict |
     line = sobel["line"]
     x1, y1 = float(line["x1"]), float(line["y1"])
     x2, y2 = float(line["x2"]), float(line["y2"])
-    x_mid = (width - 1) / 2.0
+    x_mid = (x1 + x2) / 2.0
+    if not np.isfinite(x_mid):
+        x_mid = (width - 1) / 2.0
     if abs(x2 - x1) < 1e-6:
         y_mid = (y1 + y2) / 2.0
     else:
@@ -328,6 +492,35 @@ def mvp_original_overlay(sobel: dict, calibration: dict, matrix: np.ndarray, rec
     }
 
 
+def mvp_original_overlay_for_pieces(
+    pieces: list[dict],
+    calibration: dict,
+    matrix: np.ndarray,
+    rect_width: int,
+) -> dict:
+    overlay = mvp_original_overlay({}, calibration, matrix, rect_width)
+    piece_fronts = []
+    for piece in pieces:
+        sobel = piece.get("sobel") if isinstance(piece.get("sobel"), dict) else {}
+        mapped_line = rectified_line_to_original(sobel.get("line"), matrix)
+        if mapped_line is None:
+            continue
+        piece_fronts.append(
+            {
+                "piece_id": int(piece["piece_id"]),
+                "line": mapped_line,
+                "valid": bool(piece.get("valid")),
+                "measurement": piece.get("measurement"),
+            }
+        )
+    overlay["piece_fronts"] = piece_fronts
+    overlay["front_line"] = next(
+        (item["line"] for item in piece_fronts if item["valid"]),
+        piece_fronts[0]["line"] if piece_fronts else None,
+    )
+    return overlay
+
+
 def load_homography() -> tuple[np.ndarray, tuple[int, int], dict]:
     path = homography_json_path()
     if not path.exists():
@@ -360,8 +553,6 @@ def saved_frame_metadata(frame_idx: int) -> dict | None:
 def dataset_history() -> list[dict]:
     images_dir = _args.dataset_dir / "images"
     labels_dir = _args.dataset_dir / "labels"
-    if not images_dir.exists():
-        return []
 
     items = []
     for image_path in sorted(images_dir.glob("frame_*.jpg")):
@@ -385,9 +576,394 @@ def dataset_history() -> list[dict]:
                 "image": str(image_path),
                 "label": str(label_path),
                 "saved_at": image_path.stat().st_mtime,
+                "candidate": False,
+                "source": meta.get("source") if isinstance(meta.get("source"), dict) else None,
             }
         )
+
+    existing_frames = {int(item["frame_idx"]) for item in items}
+    sample_count = max(0, int(getattr(_args, "candidate_samples_per_video", 0)))
+    if _video_playlist is not None and sample_count:
+        fps = float(_video_playlist["fps"])
+        for segment in _video_playlist["segments"]:
+            segment_total = int(segment["total_frames"])
+            for sample_index in range(sample_count):
+                local_idx = int(round((sample_index + 1) * segment_total / (sample_count + 1)))
+                local_idx = max(0, min(local_idx, max(0, segment_total - 1)))
+                frame_idx = int(segment["start_frame"]) + local_idx
+                if frame_idx in existing_frames:
+                    continue
+                items.append(
+                    {
+                        "frame_idx": frame_idx,
+                        "time_sec": frame_idx / fps,
+                        "box_count": 0,
+                        "image": "",
+                        "label": "",
+                        "saved_at": 0.0,
+                        "candidate": True,
+                        "source": playlist_source_for_frame(_video_playlist, frame_idx),
+                    }
+                )
+                existing_frames.add(frame_idx)
+
+    legacy_dataset = _args.legacy_candidates_dir
+    try:
+        use_legacy_candidates = (
+            legacy_dataset is not None
+            and legacy_dataset.resolve() != _args.dataset_dir.resolve()
+        )
+    except OSError:
+        use_legacy_candidates = False
+    if legacy_dataset is not None and use_legacy_candidates and (legacy_dataset / "images").exists():
+        for image_path in sorted((legacy_dataset / "images").glob("frame_*.jpg")):
+            try:
+                frame_idx = int(image_path.stem.replace("frame_", ""))
+            except ValueError:
+                continue
+            if frame_idx in existing_frames:
+                continue
+            meta_path = legacy_dataset / "labels" / f"{image_path.stem}.json"
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+            except json.JSONDecodeError:
+                meta = {}
+            items.append(
+                {
+                    "frame_idx": frame_idx,
+                    "time_sec": float(meta.get("time_sec", frame_idx / 30.0)),
+                    "box_count": 0,
+                    "image": str(image_path),
+                    "label": "",
+                    "saved_at": image_path.stat().st_mtime,
+                    "candidate": True,
+                }
+            )
     return sorted(items, key=lambda item: item["frame_idx"])
+
+
+def saved_piece_annotation_count(items: list[dict] | None = None) -> int:
+    history = items if items is not None else dataset_history()
+    return sum(1 for item in history if not item.get("candidate"))
+
+
+def load_piece_box_geometry_profile(dataset_dir: Path | None = None) -> dict:
+    global _piece_box_profile_cache
+    if dataset_dir is None and _piece_box_profile_cache is not None:
+        return dict(_piece_box_profile_cache)
+
+    target_dir = dataset_dir
+    if target_dir is None:
+        args = globals().get("_args")
+        target_dir = Path(args.dataset_dir) if args is not None else DEFAULT_DATASET_DIR
+
+    width_ratios: list[float] = []
+    height_ratios: list[float] = []
+    pitch_ratios: list[float] = []
+    frame_count = 0
+    labels_dir = Path(target_dir) / "labels"
+    for metadata_path in sorted(labels_dir.glob("*.json")):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            image_width = float(metadata.get("img_w", 0))
+            image_height = float(metadata.get("img_h", 0))
+            boxes = [
+                box
+                for box in (metadata.get("boxes") or [])
+                if not box.get("inferred") and float(box.get("w", 0)) > 0 and float(box.get("h", 0)) > 0
+            ]
+            if image_width <= 0 or image_height <= 0 or not boxes:
+                continue
+            frame_count += 1
+            widths = [float(box["w"]) for box in boxes]
+            width_ratios.extend(width / image_width for width in widths)
+            height_ratios.extend(float(box["h"]) / image_height for box in boxes)
+            centers = sorted(float(box["x"]) + float(box["w"]) / 2.0 for box in boxes)
+            frame_width = float(np.median(widths))
+            for left, right in zip(centers, centers[1:]):
+                gap = right - left
+                if frame_width * 0.55 <= gap <= frame_width * 1.60:
+                    pitch_ratios.append(gap / image_width)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+
+    profile = {
+        "source": "annotations" if len(width_ratios) >= 8 else "frame",
+        "frame_count": frame_count,
+        "sample_count": len(width_ratios),
+        "median_width_ratio": float(np.median(width_ratios)) if width_ratios else None,
+        "median_height_ratio": float(np.median(height_ratios)) if height_ratios else None,
+        "median_pitch_ratio": float(np.median(pitch_ratios)) if pitch_ratios else None,
+    }
+    if dataset_dir is None:
+        _piece_box_profile_cache = dict(profile)
+    return profile
+
+
+def piece_box_overlap_fraction(first: dict, second: dict) -> float:
+    first_x1 = float(first["x"])
+    first_y1 = float(first["y"])
+    first_x2 = first_x1 + float(first["w"])
+    first_y2 = first_y1 + float(first["h"])
+    second_x1 = float(second["x"])
+    second_y1 = float(second["y"])
+    second_x2 = second_x1 + float(second["w"])
+    second_y2 = second_y1 + float(second["h"])
+    intersection_width = max(0.0, min(first_x2, second_x2) - max(first_x1, second_x1))
+    intersection_height = max(0.0, min(first_y2, second_y2) - max(first_y1, second_y1))
+    intersection = intersection_width * intersection_height
+    smaller_area = min(
+        max(0.0, float(first["w"]) * float(first["h"])),
+        max(0.0, float(second["w"]) * float(second["h"])),
+    )
+    return intersection / smaller_area if smaller_area > 0 else 0.0
+
+
+def sanitize_piece_boxes(boxes: list[dict], image_shape: tuple[int, ...]) -> list[dict]:
+    image_height, image_width = image_shape[:2]
+    sanitized = []
+    for box in boxes:
+        try:
+            x0 = float(np.clip(float(box["x"]), 0.0, float(max(0, image_width - 2))))
+            y0 = float(np.clip(float(box["y"]), 0.0, float(max(0, image_height - 2))))
+            x1 = float(
+                np.clip(float(box["x"]) + float(box["w"]), x0 + 2.0, float(max(2, image_width - 1)))
+            )
+            y1 = float(
+                np.clip(float(box["y"]) + float(box["h"]), y0 + 2.0, float(max(2, image_height - 1)))
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if x1 - x0 < 4.0 or y1 - y0 < 4.0:
+            continue
+        sanitized.append(
+            {
+                **box,
+                "x": x0,
+                "y": y0,
+                "w": x1 - x0,
+                "h": y1 - y0,
+                "conf": float(box.get("conf", 1.0)),
+            }
+        )
+    return sanitized
+
+
+def suppress_overlapping_piece_boxes(
+    boxes: list[dict],
+    overlap_threshold: float = 0.35,
+) -> tuple[list[dict], list[dict]]:
+    kept: list[dict] = []
+    removed: list[dict] = []
+    ordered = sorted(
+        boxes,
+        key=lambda box: (float(box.get("conf", 1.0)), float(box["w"]) * float(box["h"])),
+        reverse=True,
+    )
+    for candidate in ordered:
+        if any(piece_box_overlap_fraction(candidate, existing) >= overlap_threshold for existing in kept):
+            removed.append(candidate)
+        else:
+            kept.append(candidate)
+    return sorted(kept, key=lambda box: float(box["x"]) + float(box["w"]) / 2.0), removed
+
+
+def resolve_piece_box_reference(
+    boxes: list[dict],
+    image_shape: tuple[int, ...],
+    profile: dict | None = None,
+) -> dict:
+    image_height, image_width = image_shape[:2]
+    active_profile = profile or load_piece_box_geometry_profile()
+    widths = [float(box["w"]) for box in boxes]
+    heights = [float(box["h"]) for box in boxes]
+    frame_width = float(np.median(widths)) if widths else max(8.0, image_width * 0.08)
+    frame_height = float(np.median(heights)) if heights else max(8.0, image_height * 0.13)
+
+    profile_width = active_profile.get("median_width_ratio")
+    profile_height = active_profile.get("median_height_ratio")
+    profile_pitch = active_profile.get("median_pitch_ratio")
+    typical_width = float(profile_width) * image_width if profile_width else frame_width
+    typical_height = float(profile_height) * image_height if profile_height else frame_height
+
+    if widths and 0.60 <= frame_width / max(typical_width, 1e-6) <= 1.60:
+        typical_width = float(np.median([typical_width, frame_width]))
+    if heights and 0.45 <= frame_height / max(typical_height, 1e-6) <= 2.00:
+        typical_height = float(np.median([typical_height, frame_height]))
+
+    centers = sorted(float(box["x"]) + float(box["w"]) / 2.0 for box in boxes)
+    close_gaps = [
+        right - left
+        for left, right in zip(centers, centers[1:])
+        if typical_width * 0.55 <= right - left <= typical_width * 1.60
+    ]
+    if profile_pitch:
+        typical_pitch = float(profile_pitch) * image_width
+    elif close_gaps:
+        typical_pitch = float(np.median(close_gaps))
+    else:
+        typical_pitch = typical_width * 1.10
+    if close_gaps and 0.70 <= float(np.median(close_gaps)) / max(typical_pitch, 1e-6) <= 1.35:
+        typical_pitch = float(np.median([typical_pitch, float(np.median(close_gaps))]))
+
+    return {
+        "source": active_profile.get("source", "frame"),
+        "sample_count": int(active_profile.get("sample_count", 0)),
+        "typical_width": typical_width,
+        "typical_height": typical_height,
+        "typical_pitch": typical_pitch,
+    }
+
+
+def infer_missing_piece_boxes(
+    boxes: list[dict],
+    image_shape: tuple[int, ...],
+    reference: dict,
+    max_missing_per_gap: int = 3,
+) -> list[dict]:
+    if len(boxes) < 4:
+        return []
+
+    ordered = sorted(boxes, key=lambda box: float(box["x"]) + float(box["w"]) / 2.0)
+    centers_x = [float(box["x"]) + float(box["w"]) / 2.0 for box in ordered]
+    typical_width = float(reference["typical_width"])
+    typical_pitch = float(reference["typical_pitch"])
+    image_height, image_width = image_shape[:2]
+    inferred: list[dict] = []
+
+    for index in range(len(ordered) - 1):
+        center_gap = centers_x[index + 1] - centers_x[index]
+        if center_gap < typical_pitch * 1.75:
+            continue
+        left_supported = (
+            index > 0
+            and typical_pitch * 0.55 <= centers_x[index] - centers_x[index - 1] <= typical_pitch * 1.45
+        )
+        right_supported = (
+            index + 2 < len(ordered)
+            and typical_pitch * 0.55
+            <= centers_x[index + 2] - centers_x[index + 1]
+            <= typical_pitch * 1.45
+        )
+        if not (left_supported and right_supported):
+            continue
+
+        missing_count = min(max_missing_per_gap, max(0, int(round(center_gap / typical_pitch)) - 1))
+        if missing_count == 0:
+            continue
+
+        left_box = ordered[index]
+        right_box = ordered[index + 1]
+        left_center_y = float(left_box["y"]) + float(left_box["h"]) / 2.0
+        right_center_y = float(right_box["y"]) + float(right_box["h"]) / 2.0
+        inferred_height = float(np.median([left_box["h"], right_box["h"], reference["typical_height"]]))
+        inferred_width = float(np.median([left_box["w"], right_box["w"], typical_width]))
+
+        for missing_index in range(1, missing_count + 1):
+            ratio = missing_index / float(missing_count + 1)
+            center_x = centers_x[index] + center_gap * ratio
+            center_y = left_center_y + (right_center_y - left_center_y) * ratio
+            candidate = {
+                "x": float(np.clip(center_x - inferred_width / 2.0, 0.0, max(0.0, image_width - inferred_width))),
+                "y": float(
+                    np.clip(center_y - inferred_height / 2.0, 0.0, max(0.0, image_height - inferred_height))
+                ),
+                "w": inferred_width,
+                "h": inferred_height,
+                "conf": min(float(left_box.get("conf", 1.0)), float(right_box.get("conf", 1.0))) * 0.5,
+                "inferred": True,
+                "source": "geometry",
+                "geometry_gap_px": center_gap,
+                "geometry_pitch_px": typical_pitch,
+            }
+            if not any(
+                piece_box_overlap_fraction(candidate, existing) >= 0.15
+                for existing in [*ordered, *inferred]
+            ):
+                inferred.append(candidate)
+    return inferred
+
+
+def apply_piece_box_rules(
+    rectified: np.ndarray,
+    boxes: list[dict],
+    *,
+    verify_inferred: bool = True,
+    profile: dict | None = None,
+) -> tuple[list[dict], dict]:
+    sanitized = sanitize_piece_boxes(boxes, rectified.shape)
+    deduplicated, removed_overlaps = suppress_overlapping_piece_boxes(sanitized)
+    reference = resolve_piece_box_reference(deduplicated, rectified.shape, profile=profile)
+    typical_width = max(float(reference["typical_width"]), 1e-6)
+    typical_height = max(float(reference["typical_height"]), 1e-6)
+
+    size_outliers = []
+    for box in deduplicated:
+        width_ratio = float(box["w"]) / typical_width
+        height_ratio = float(box["h"]) / typical_height
+        box["size_outlier"] = not (0.70 <= width_ratio <= 1.35 and 0.55 <= height_ratio <= 1.65)
+        if box["size_outlier"]:
+            size_outliers.append(box)
+
+    median_width = float(np.median([box["w"] for box in deduplicated])) if deduplicated else 0.0
+    median_height = float(np.median([box["h"] for box in deduplicated])) if deduplicated else 0.0
+    looks_like_individual_pieces = (
+        len(deduplicated) >= 3
+        and 0.55 <= median_width / typical_width <= 1.60
+        and 0.40 <= median_height / typical_height <= 2.00
+    )
+    removed_size = []
+    size_filtered = []
+    for box in deduplicated:
+        width_ratio = float(box["w"]) / typical_width
+        height_ratio = float(box["h"]) / typical_height
+        severe_size_outlier = not (0.65 <= width_ratio <= 1.40 and 0.60 <= height_ratio <= 1.60)
+        if looks_like_individual_pieces and severe_size_outlier:
+            removed_size.append(box)
+        else:
+            size_filtered.append(box)
+
+    proposals = (
+        infer_missing_piece_boxes(size_filtered, rectified.shape, reference)
+        if looks_like_individual_pieces
+        else []
+    )
+
+    accepted_inferred = []
+    rejected_inferred = []
+    for candidate in proposals:
+        if verify_inferred:
+            sobel = sobel_projection_for_piece(rectified, candidate)
+            candidate["geometry_verified"] = bool(sobel.get("is_valid"))
+            candidate["geometry_edge_confidence"] = float(sobel.get("edge_confidence", 0.0))
+            candidate["geometry_crm_px"] = float(sobel.get("crm_px", 0.0))
+        else:
+            candidate["geometry_verified"] = None
+        if not verify_inferred or candidate["geometry_verified"]:
+            accepted_inferred.append(candidate)
+        else:
+            rejected_inferred.append(candidate)
+
+    processed = sorted(
+        [*size_filtered, *accepted_inferred],
+        key=lambda box: float(box["x"]) + float(box["w"]) / 2.0,
+    )
+    diagnostics = {
+        "raw_count": len(boxes),
+        "kept_yolo_count": len(size_filtered),
+        "removed_overlap_count": len(removed_overlaps),
+        "removed_size_count": len(removed_size),
+        "size_outlier_count": len(size_outliers),
+        "missing_candidate_count": len(proposals),
+        "inferred_count": len(accepted_inferred),
+        "rejected_inferred_count": len(rejected_inferred),
+        "profile_source": reference["source"],
+        "profile_sample_count": reference["sample_count"],
+        "typical_width_px": reference["typical_width"],
+        "typical_height_px": reference["typical_height"],
+        "typical_pitch_px": reference["typical_pitch"],
+    }
+    return processed, diagnostics
 
 
 def load_yolo_model():
@@ -401,11 +977,107 @@ def load_yolo_model():
     return _yolo_model
 
 
-def predict_yolo_boxes(rectified: np.ndarray, conf: float = 0.10, imgsz: int = 960) -> list[dict]:
+def normalize_exclusion_zones(
+    zones: list[dict] | None,
+    image_shape: tuple[int, ...] | None = None,
+) -> list[dict]:
+    height = float(image_shape[0]) if image_shape and len(image_shape) >= 2 else None
+    width = float(image_shape[1]) if image_shape and len(image_shape) >= 2 else None
+    normalized = []
+    for zone in zones or []:
+        if not isinstance(zone, dict):
+            continue
+        try:
+            x1 = float(zone.get("x", 0.0))
+            y1 = float(zone.get("y", 0.0))
+            x2 = x1 + float(zone.get("w", 0.0))
+            y2 = y1 + float(zone.get("h", 0.0))
+        except (TypeError, ValueError):
+            continue
+        x0, x1 = sorted((x1, x2))
+        y0, y1 = sorted((y1, y2))
+        if width is not None:
+            x0 = float(np.clip(x0, 0.0, width))
+            x1 = float(np.clip(x1, 0.0, width))
+        if height is not None:
+            y0 = float(np.clip(y0, 0.0, height))
+            y1 = float(np.clip(y1, 0.0, height))
+        if x1 - x0 < 2.0 or y1 - y0 < 2.0:
+            continue
+        normalized.append({"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0})
+    return normalized
+
+
+def box_exclusion_overlap_ratio(box: dict, zone: dict) -> float:
+    box_x0 = float(box.get("x", 0.0))
+    box_y0 = float(box.get("y", 0.0))
+    box_x1 = box_x0 + max(0.0, float(box.get("w", 0.0)))
+    box_y1 = box_y0 + max(0.0, float(box.get("h", 0.0)))
+    box_area = max(0.0, box_x1 - box_x0) * max(0.0, box_y1 - box_y0)
+    if box_area <= 0.0:
+        return 0.0
+    zone_x0 = float(zone["x"])
+    zone_y0 = float(zone["y"])
+    zone_x1 = zone_x0 + float(zone["w"])
+    zone_y1 = zone_y0 + float(zone["h"])
+    intersection_w = max(0.0, min(box_x1, zone_x1) - max(box_x0, zone_x0))
+    intersection_h = max(0.0, min(box_y1, zone_y1) - max(box_y0, zone_y0))
+    return (intersection_w * intersection_h) / box_area
+
+
+def filter_boxes_by_exclusion_zones(
+    boxes: list[dict],
+    zones: list[dict] | None,
+    *,
+    max_overlap: float = EXCLUSION_ZONE_MAX_BOX_OVERLAP,
+    image_shape: tuple[int, ...] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    normalized_zones = normalize_exclusion_zones(zones, image_shape=image_shape)
+    overlap_limit = float(np.clip(float(max_overlap), 0.0, 1.0))
+    if not normalized_zones:
+        return list(boxes), []
+
+    kept = []
+    removed = []
+    for box in boxes:
+        overlaps = [box_exclusion_overlap_ratio(box, zone) for zone in normalized_zones]
+        largest_overlap = max(overlaps, default=0.0)
+        if largest_overlap > overlap_limit:
+            removed.append(
+                {
+                    "box": box,
+                    "overlap_ratio": largest_overlap,
+                    "zone_index": overlaps.index(largest_overlap),
+                }
+            )
+        else:
+            kept.append(box)
+    return kept, removed
+
+
+def predict_yolo_boxes_with_rules(
+    rectified: np.ndarray,
+    conf: float = 0.10,
+    imgsz: int = 960,
+    exclusion_zones: list[dict] | None = None,
+) -> tuple[list[dict], dict]:
     model = load_yolo_model()
     result = model.predict(rectified, conf=conf, imgsz=imgsz, verbose=False)[0]
+    normalized_zones = normalize_exclusion_zones(exclusion_zones, image_shape=rectified.shape)
     if result.boxes is None or len(result.boxes) == 0:
-        return []
+        return [], {
+            "raw_count": 0,
+            "kept_yolo_count": 0,
+            "removed_overlap_count": 0,
+            "removed_size_count": 0,
+            "size_outlier_count": 0,
+            "missing_candidate_count": 0,
+            "inferred_count": 0,
+            "rejected_inferred_count": 0,
+            "exclusion_zone_count": len(normalized_zones),
+            "removed_exclusion_count": 0,
+            "exclusion_max_overlap": EXCLUSION_ZONE_MAX_BOX_OVERLAP,
+        }
 
     xyxy = result.boxes.xyxy.detach().cpu().numpy()
     scores = result.boxes.conf.detach().cpu().numpy()
@@ -421,7 +1093,25 @@ def predict_yolo_boxes(rectified: np.ndarray, conf: float = 0.10, imgsz: int = 9
                 "conf": float(score),
             }
         )
-    return sorted(boxes, key=lambda item: item["w"] * item["h"] * item["conf"], reverse=True)
+    processed, diagnostics = apply_piece_box_rules(rectified, boxes)
+    filtered, removed_exclusions = filter_boxes_by_exclusion_zones(
+        processed,
+        normalized_zones,
+        max_overlap=EXCLUSION_ZONE_MAX_BOX_OVERLAP,
+        image_shape=rectified.shape,
+    )
+    diagnostics.update(
+        exclusion_zone_count=len(normalized_zones),
+        removed_exclusion_count=len(removed_exclusions),
+        exclusion_max_overlap=EXCLUSION_ZONE_MAX_BOX_OVERLAP,
+        final_count=len(filtered),
+    )
+    return filtered, diagnostics
+
+
+def predict_yolo_boxes(rectified: np.ndarray, conf: float = 0.10, imgsz: int = 960) -> list[dict]:
+    boxes, _diagnostics = predict_yolo_boxes_with_rules(rectified, conf=conf, imgsz=imgsz)
+    return boxes
 
 
 def best_box_for_projection(rectified: np.ndarray, boxes: list[dict], conf: float) -> dict | None:
@@ -431,16 +1121,26 @@ def best_box_for_projection(rectified: np.ndarray, boxes: list[dict], conf: floa
     return max(candidates, key=lambda item: float(item["w"]) * float(item["h"]) * float(item.get("conf", 1.0)))
 
 
-def sobel_projection_for_box(rectified: np.ndarray, box: dict) -> dict:
+def sobel_projection_for_box(
+    rectified: np.ndarray,
+    box: dict,
+    line_x_range: tuple[float, float] | None = None,
+    config_overrides: dict | None = None,
+    require_projection_valid: bool = True,
+) -> dict:
     from yolo_roi_sobel_projection import ProjectionConfig, edge_response_from_roi, project_edge_line
 
+    config = {
+        "roi_pad_x": 0,
+        "roi_pad_y": 0,
+        "score_keep_percentile": 35.0,
+        "min_points": 12,
+        "line_inlier_tol": 8.0,
+        "max_abs_slope": 0.35,
+    }
+    config.update(config_overrides or {})
     cfg = ProjectionConfig(
-        roi_pad_x=0,
-        roi_pad_y=0,
-        score_keep_percentile=35.0,
-        min_points=12,
-        line_inlier_tol=8.0,
-        max_abs_slope=0.35,
+        **config,
     )
     height, width = rectified.shape[:2]
     x0 = int(np.floor(float(box["x"]) - cfg.roi_pad_x))
@@ -494,8 +1194,12 @@ def sobel_projection_for_box(rectified: np.ndarray, box: dict) -> dict:
         else:
             horizontal_y_roi = float(slope) * ((float(x1 - x0) - 1.0) / 2.0) + float(intercept)
         horizontal_y_global = float(y0) + float(horizontal_y_roi)
-        global_left_x = 0.0
-        global_right_x = float(width - 1)
+        if line_x_range is None:
+            global_left_x = 0.0
+            global_right_x = float(width - 1)
+        else:
+            global_left_x = float(np.clip(min(line_x_range), 0.0, float(width - 1)))
+            global_right_x = float(np.clip(max(line_x_range), 0.0, float(width - 1)))
         line = {
             "x1": global_left_x,
             "y1": horizontal_y_global,
@@ -516,7 +1220,8 @@ def sobel_projection_for_box(rectified: np.ndarray, box: dict) -> dict:
         residual_points = [p for p in points if p.get("inlier")] or points
         residual = [float(p["y"]) - float(line["y"]) for p in residual_points]
         crm_px = float(np.sqrt(np.mean(np.square(residual)))) if residual else crm_px
-    is_valid = bool(projection["is_valid"]) and confidence >= 0.30 and crm_px <= 8.0
+    projection_valid = bool(projection["is_valid"]) if require_projection_valid else line is not None
+    is_valid = projection_valid and confidence >= 0.30 and crm_px <= 8.0
 
     return {
         "has_roi": True,
@@ -528,6 +1233,147 @@ def sobel_projection_for_box(rectified: np.ndarray, box: dict) -> dict:
         "edge_confidence": confidence,
         "crm_px": crm_px,
     }
+
+
+def sobel_projection_for_piece(rectified: np.ndarray, box: dict) -> dict:
+    height, width = rectified.shape[:2]
+    piece_x0 = float(np.clip(float(box["x"]), 0.0, float(max(0, width - 2))))
+    piece_y0 = float(np.clip(float(box["y"]), 0.0, float(max(0, height - 2))))
+    piece_x1 = float(
+        np.clip(float(box["x"]) + float(box["w"]), piece_x0 + 2.0, float(max(2, width - 1)))
+    )
+    piece_y1 = float(
+        np.clip(float(box["y"]) + float(box["h"]), piece_y0 + 2.0, float(max(2, height - 1)))
+    )
+    piece_width = piece_x1 - piece_x0
+    piece_height = piece_y1 - piece_y0
+
+    band_height = min(piece_height, max(32.0, piece_height * 0.70))
+    bottom_pad = min(12.0, max(5.0, piece_height * 0.05))
+    side_inset = min(6.0, max(1.0, piece_width * 0.06))
+    analysis_x0 = piece_x0 + side_inset
+    analysis_x1 = piece_x1 - side_inset
+    if analysis_x1 - analysis_x0 < 8.0:
+        analysis_x0, analysis_x1 = piece_x0, piece_x1
+
+    analysis_box = {
+        "x": analysis_x0,
+        "y": max(piece_y0, piece_y1 - band_height),
+        "w": analysis_x1 - analysis_x0,
+        "h": min(float(height - 1), piece_y1 + bottom_pad) - max(piece_y0, piece_y1 - band_height),
+        "conf": float(box.get("conf", 1.0)),
+    }
+    analysis_width = max(8.0, float(analysis_box["w"]))
+    analysis_height = max(2.0, float(analysis_box["h"]))
+    edge_band_end = min(1.0, (band_height + min(2.0, bottom_pad)) / analysis_height)
+    bin_width = 3 if analysis_width < 90.0 else 4
+    estimated_samples = max(3, int(analysis_width // bin_width) - 1)
+    min_points = max(4, min(8, int(np.floor(estimated_samples * 0.55))))
+    blur_width = max(5, min(21, int(round(analysis_width * 0.35))))
+    if blur_width % 2 == 0:
+        blur_width += 1
+    result = sobel_projection_for_box(
+        rectified,
+        analysis_box,
+        line_x_range=(piece_x0, piece_x1),
+        config_overrides={
+            "bin_width": bin_width,
+            "min_points": min_points,
+            "blur_ksize": (blur_width, 1),
+            "profile_smooth": 7,
+            "line_inlier_tol": 4.0,
+            "edge_band_start": 0.05,
+            "edge_band_end": edge_band_end,
+            "edge_polarity": "falling",
+        },
+        require_projection_valid=False,
+    )
+    result["roi_box"] = box
+    result["analysis_box"] = analysis_box
+    result["piece_box"] = {
+        "x": piece_x0,
+        "y": piece_y0,
+        "w": piece_width,
+        "h": piece_height,
+        "conf": float(box.get("conf", 1.0)),
+    }
+    return result
+
+
+def summarize_piece_measurements(pieces: list[dict]) -> dict:
+    valid_pieces = [
+        piece
+        for piece in pieces
+        if piece.get("valid") and isinstance(piece.get("measurement"), dict)
+    ]
+    measurements = [float(piece["measurement"]["measurement_in"]) for piece in valid_pieces]
+    distances = [float(piece["measurement"]["delta_in"]) for piece in valid_pieces]
+    return {
+        "detected_count": len(pieces),
+        "valid_count": len(valid_pieces),
+        "invalid_count": len(pieces) - len(valid_pieces),
+        "minimum_in": min(measurements) if measurements else None,
+        "maximum_in": max(measurements) if measurements else None,
+        "average_in": float(np.mean(measurements)) if measurements else None,
+        "average_distance_to_reference_in": float(np.mean(distances)) if distances else None,
+    }
+
+
+def empty_sobel_result(
+    frame_idx: int | None = None,
+    time_sec: float | None = None,
+) -> dict:
+    return {
+        "frame_idx": frame_idx,
+        "time_sec": time_sec,
+        "has_roi": False,
+        "is_valid": False,
+        "roi": None,
+        "roi_box": None,
+        "line": None,
+        "points": [],
+        "edge_confidence": 0.0,
+        "crm_px": 0.0,
+    }
+
+
+def analyze_piece_boxes(
+    rectified: np.ndarray,
+    boxes: list[dict],
+    calibration: dict,
+    frame_idx: int | None = None,
+    time_sec: float | None = None,
+) -> tuple[list[dict], dict]:
+    ordered_boxes = sorted(
+        boxes,
+        key=lambda box: (
+            float(box["x"]) + float(box["w"]) / 2.0,
+            float(box["y"]) + float(box["h"]) / 2.0,
+        ),
+    )
+    pieces = []
+    for piece_id, box in enumerate(ordered_boxes, start=1):
+        sobel = sobel_projection_for_piece(rectified, box)
+        sobel.update(frame_idx=frame_idx, time_sec=time_sec)
+        measurement = measurement_from_sobel(sobel, calibration, rectified.shape[1])
+        pieces.append(
+            {
+                "piece_id": piece_id,
+                "box": box,
+                "confidence": float(box.get("conf", 1.0)),
+                "sobel": sobel,
+                "measurement": measurement,
+                "valid": bool(sobel.get("is_valid")) and measurement is not None,
+            }
+        )
+    return pieces, summarize_piece_measurements(pieces)
+
+
+def primary_piece_analysis(pieces: list[dict]) -> dict | None:
+    return next(
+        (piece for piece in pieces if piece.get("valid")),
+        pieces[0] if pieces else None,
+    )
 
 
 HTML = r"""
@@ -577,6 +1423,8 @@ button:disabled { opacity: .45; cursor: default; }
 .warn { background: var(--accent-2); color: #171006; border-color: var(--accent-2); font-weight: 700; }
 .danger { background: #442727; color: #ffd2d2; border-color: #6a3939; }
 .ghost.active { background: #334039; border-color: var(--accent); color: #bff4d8; }
+.zone-toggle { color: #ffb8b8; border-color: #733d3d; }
+.zone-toggle.active { background: #562b2b; border-color: #ef6666; color: #ffffff; }
 input[type=number] {
   width: 88px;
   height: 32px;
@@ -612,8 +1460,13 @@ input[type=range] { accent-color: var(--accent); }
   padding: 6px 14px;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
 }
+.toolbar::-webkit-scrollbar { display: none; }
 .toolbar label { color: var(--muted); font-size: 12px; }
+.timeline-range { width: clamp(180px, 24vw, 360px); flex: 0 0 auto; }
 .spacer { flex: 1; }
 .pill {
   border: 1px solid var(--line);
@@ -816,9 +1669,19 @@ canvas { display: block; width: 100%; height: 100%; }
     <button onclick="stepAnnotate(-1)" title="Retroceder 1 frame">-1f</button>
     <button onclick="stepAnnotate(1)" title="Avanzar 1 frame">+1f</button>
     <button onclick="stepAnnotate(30)" title="Avanzar 1 segundo">+1s</button>
+    <button onclick="stepAnnotateSeconds(-30)" title="Retroceder 30 segundos">-30s</button>
+    <button onclick="stepAnnotateSeconds(30)" title="Avanzar 30 segundos">+30s</button>
+    <label>Timeline</label>
+    <input type="range" id="a-timeline" class="timeline-range" min="0" max="0" step="1" value="0"
+      title="Arrastra o usa la rueda para navegar por todos los videos"
+      oninput="previewAnnotateTimeline(this.value)"
+      onchange="loadAnnotateTimeline(this.value)"
+      onwheel="scrollAnnotateTimeline(event)">
+    <span class="pill" id="a-timeline-label">00:00:00</span>
     <label>Zoom</label>
     <input type="range" id="a-zoom" min="1" max="20" step="0.1" value="1">
     <span class="pill" id="a-zoom-label">1.0x</span>
+    <button id="a-run-model" onclick="runModel()">Run model</button>
     <span class="spacer"></span>
     <button onclick="undoBox()">Deshacer</button>
     <button class="danger" onclick="clearBoxes()">Limpiar</button>
@@ -834,6 +1697,7 @@ canvas { display: block; width: 100%; height: 100%; }
     <button onclick="stepMeasure(30)" title="Avanzar 1 segundo">+1s</button>
     <button id="m-mode-segment" class="ghost active" onclick="setMeasureMode('segment')">Segmento</button>
     <button id="m-mode-ref" class="ghost" onclick="setMeasureMode('reference')">Linea Y</button>
+    <button id="m-mode-exclusion" class="zone-toggle" onclick="setMeasureMode('exclusion')">Zona roja</button>
     <label>Zoom</label>
     <input type="range" id="m-zoom" min="1" max="20" step="0.1" value="1">
     <span class="pill" id="m-zoom-label">1.0x</span>
@@ -853,6 +1717,13 @@ canvas { display: block; width: 100%; height: 100%; }
     <button onclick="stepPlayer(-1)" title="Retroceder 1 frame">-1f</button>
     <button onclick="stepPlayer(1)" title="Avanzar 1 frame">+1f</button>
     <button onclick="stepPlayer(30)" title="Avanzar 1 segundo">+1s</button>
+    <label>Timeline</label>
+    <input type="range" id="p-timeline" class="timeline-range" min="0" max="0" step="1" value="0"
+      title="Arrastra o usa la rueda para navegar por todos los videos"
+      oninput="previewPlayerTimeline(this.value)"
+      onchange="loadPlayerTimeline(this.value)"
+      onwheel="scrollPlayerTimeline(event)">
+    <span class="pill" id="p-timeline-label">00:00:00</span>
     <label>Zoom</label>
     <input type="range" id="p-zoom" min="1" max="20" step="0.1" value="1">
     <span class="pill" id="p-zoom-label">1.0x</span>
@@ -902,6 +1773,8 @@ canvas { display: block; width: 100%; height: 100%; }
       <aside class="side">
         <div class="section">
           <h2>Frame actual</h2>
+          <div class="kv"><span>Video</span><strong id="info-video">-</strong></div>
+          <div class="kv"><span>Frame origen</span><strong id="info-source-frame">-</strong></div>
           <div class="kv"><span>Frame</span><strong id="info-frame">-</strong></div>
           <div class="kv"><span>Tiempo</span><strong id="info-time">-</strong></div>
           <div class="kv"><span>Tamano</span><strong id="info-size">-</strong></div>
@@ -917,7 +1790,14 @@ canvas { display: block; width: 100%; height: 100%; }
           <div class="history-list" id="history-list"></div>
         </div>
         <div class="section">
-          <h2>Boxes</h2>
+          <h2>Run model</h2>
+          <div class="kv"><span>Detecciones</span><strong id="info-model-boxes">-</strong></div>
+          <div class="kv"><span>Coincidencias</span><strong id="info-model-matched">-</strong></div>
+          <div class="kv"><span>Omitidas</span><strong id="info-model-missed">-</strong></div>
+          <div class="box-list" id="model-box-list"></div>
+        </div>
+        <div class="section">
+          <h2>Anotaciones</h2>
           <div class="box-list" id="box-list"></div>
         </div>
       </aside>
@@ -925,7 +1805,7 @@ canvas { display: block; width: 100%; height: 100%; }
 
     <section class="view" id="measure-view">
       <div class="pane">
-        <div class="pane-title"><span>Mesa rectificada</span><span>Segmento: 2 clicks | Linea Y: click/arrastrar | rueda: zoom</span></div>
+        <div class="pane-title"><span>Mesa rectificada</span><span>Segmento/Zona roja: 2 clicks | Linea Y: click/arrastrar | rueda: zoom</span></div>
         <div class="canvas-wrap" id="m-wrap">
           <canvas id="m-canvas"></canvas>
           <div class="hud" id="m-hud">x: - y: -</div>
@@ -934,6 +1814,8 @@ canvas { display: block; width: 100%; height: 100%; }
       <aside class="side">
         <div class="section">
           <h2>Frame</h2>
+          <div class="kv"><span>Video</span><strong id="m-info-video">-</strong></div>
+          <div class="kv"><span>Frame origen</span><strong id="m-info-source-frame">-</strong></div>
           <div class="kv"><span>Frame</span><strong id="m-info-frame">-</strong></div>
           <div class="kv"><span>Tiempo</span><strong id="m-info-time">-</strong></div>
           <div class="kv"><span>Tamano</span><strong id="m-info-size">-</strong></div>
@@ -949,6 +1831,12 @@ canvas { display: block; width: 100%; height: 100%; }
           <div class="kv"><span>Linea</span><strong id="m-info-ref">-</strong></div>
         </div>
         <div class="section">
+          <h2>Zonas sin boxes</h2>
+          <div class="kv"><span>Zonas</span><strong id="m-info-zones">0</strong></div>
+          <div class="kv"><span>Solapamiento permitido</span><strong>20%</strong></div>
+          <div class="box-list" id="m-zone-list"></div>
+        </div>
+        <div class="section">
           <h2>Segmentos</h2>
           <div class="box-list" id="m-segment-list"></div>
         </div>
@@ -957,7 +1845,7 @@ canvas { display: block; width: 100%; height: 100%; }
 
     <section class="view" id="player-view">
       <div class="pane">
-        <div class="pane-title"><span>Reproductor YOLO + Sobel</span><span>calculo en ROI, linea proyectada a todo el frame</span></div>
+        <div class="pane-title"><span>Reproductor de piezas YOLO + Sobel</span><span>Sobel Y en el frente inferior de cada pieza</span></div>
         <div class="canvas-wrap" id="p-wrap" style="cursor:default">
           <canvas id="p-canvas"></canvas>
           <div class="hud" id="p-hud">x: - y: -</div>
@@ -966,6 +1854,8 @@ canvas { display: block; width: 100%; height: 100%; }
       <aside class="side">
         <div class="section">
           <h2>Frame actual</h2>
+          <div class="kv"><span>Video</span><strong id="p-info-video">-</strong></div>
+          <div class="kv"><span>Frame origen</span><strong id="p-info-source-frame">-</strong></div>
           <div class="kv"><span>Frame</span><strong id="p-info-frame">-</strong></div>
           <div class="kv"><span>Tiempo</span><strong id="p-info-time">-</strong></div>
           <div class="kv"><span>Tamano</span><strong id="p-info-size">-</strong></div>
@@ -973,19 +1863,22 @@ canvas { display: block; width: 100%; height: 100%; }
         </div>
         <div class="section">
           <h2>YOLO</h2>
-          <div class="kv"><span>Boxes</span><strong id="p-info-boxes">0</strong></div>
+          <div class="kv"><span>Piezas</span><strong id="p-info-boxes">0</strong></div>
           <div class="kv"><span>Conf</span><strong id="p-info-yolo-conf">-</strong></div>
+          <div class="kv"><span>Descartadas por zona</span><strong id="p-info-excluded">0</strong></div>
         </div>
         <div class="section">
-          <h2>Sobel projection</h2>
+          <h2>Mediciones por pieza</h2>
           <div class="kv"><span>Estado</span><strong id="p-info-sobel-state">sin correr</strong></div>
           <div class="kv"><span>Conf edge</span><strong id="p-info-sobel-conf">-</strong></div>
           <div class="kv"><span>CRM</span><strong id="p-info-sobel-crm">-</strong></div>
-          <div class="kv"><span>Medida Y</span><strong id="p-info-measure">-</strong></div>
+          <div class="kv"><span>Validas</span><strong id="p-info-measure">-</strong></div>
+          <div class="box-list" id="p-piece-list"></div>
         </div>
         <div class="section">
           <h2>Regla manual</h2>
           <div class="kv"><span>Modo</span><strong id="p-ruler-info-mode">off</strong></div>
+          <div class="kv"><span>Escala</span><strong id="p-ruler-info-scale">-</strong></div>
           <div class="kv"><span>Distancia</span><strong id="p-ruler-info-distance">-</strong></div>
           <div class="kv"><span>Delta</span><strong id="p-ruler-info-delta">-</strong></div>
         </div>
@@ -1017,16 +1910,17 @@ w.ctx = w.canvas.getContext('2d');
 const a = {
   canvas: document.getElementById('a-canvas'), wrap: document.getElementById('a-wrap'),
   img: null, imgW: 0, imgH: 0, zoom: 1, panX: 0, panY: 0,
-  frameIdx: 0, timeSec: 0, boxes: [], cornerA: null, preview: null,
-  panning: false, panAnchor: null, panStart: null, saved: 0, history: [], sobel: null
+  frameIdx: 0, timeSec: 0, source: null, boxes: [], cornerA: null, preview: null,
+  panning: false, panAnchor: null, panStart: null, saved: 0, history: [], sobel: null, pieces: [],
+  timelineTimer: null, modelBoxes: [], boxRules: null
 };
 a.ctx = a.canvas.getContext('2d');
 
 const m = {
   canvas: document.getElementById('m-canvas'), wrap: document.getElementById('m-wrap'),
   img: null, imgW: 0, imgH: 0, zoom: 1, panX: 0, panY: 0,
-  frameIdx: 0, timeSec: 0, segments: [], pending: null, preview: null,
-  referenceY: null, inchPerPx: null, mode: 'segment', draggingReference: false,
+  frameIdx: 0, timeSec: 0, source: null, segments: [], pending: null, preview: null,
+  referenceY: null, inchPerPx: null, exclusionZones: [], mode: 'segment', draggingReference: false,
   panning: false, panAnchor: null, panStart: null
 };
 m.ctx = m.canvas.getContext('2d');
@@ -1034,9 +1928,11 @@ m.ctx = m.canvas.getContext('2d');
 const p = {
   canvas: document.getElementById('p-canvas'), wrap: document.getElementById('p-wrap'),
   img: null, imgW: 0, imgH: 0, zoom: 1, panX: 0, panY: 0,
-  frameIdx: 0, timeSec: 0, boxes: [], sobel: null, calibration: null, measurement: null,
+  frameIdx: 0, timeSec: 0, source: null, boxes: [], pieces: [], measurementSummary: null,
+  sobel: null, calibration: null, measurement: null, boxRules: null,
   captures: [], rulerActive: false, rulerMode: 'free', rulerStart: null, rulerEnd: null, rulerPreview: null,
-  playing: false, speed: 1, playTask: null, panning: false, panAnchor: null, panStart: null
+  playing: false, speed: 1, playTask: null, panning: false, panAnchor: null, panStart: null,
+  calibrationStale: false, timelineTimer: null
 };
 p.ctx = p.canvas.getContext('2d');
 
@@ -1044,6 +1940,10 @@ function status(msg, cls='') {
   const el = document.getElementById('status');
   el.textContent = msg;
   el.className = 'status ' + cls;
+}
+
+function sourceName(source) {
+  return (source?.video_name || '-').replace(/^\d{8}_/, '').replace(/\.mkv$/i, '');
 }
 
 function showView(name) {
@@ -1063,7 +1963,13 @@ function showView(name) {
   fitAll();
   if (name === 'measure' && !m.img) loadMeasureSecond();
   if (name === 'annotate' && !a.img) loadAnnotateSecond();
-  if (name === 'player' && !p.img) loadPlayerSecond();
+  if (name === 'player') {
+    if (!p.img) {
+      loadPlayerSecond();
+    } else if (p.calibrationStale) {
+      loadPlayerFrame(p.frameIdx, {resetView: false});
+    }
+  }
   drawAll();
 }
 
@@ -1105,9 +2011,11 @@ function resetView(state) {
 }
 
 function clearWarpDependentViews() {
-  a.img = null; a.imgW = 0; a.imgH = 0; a.boxes = []; a.cornerA = null; a.preview = null; a.sobel = null;
+  a.img = null; a.imgW = 0; a.imgH = 0; a.boxes = []; a.pieces = [];
+  a.cornerA = null; a.preview = null; a.sobel = null;
   m.img = null; m.imgW = 0; m.imgH = 0; m.pending = null; m.preview = null;
-  p.img = null; p.imgW = 0; p.imgH = 0; p.boxes = []; p.sobel = null; p.measurement = null;
+  p.img = null; p.imgW = 0; p.imgH = 0; p.boxes = []; p.pieces = [];
+  p.measurementSummary = null; p.sobel = null; p.measurement = null; p.boxRules = null;
   updateBoxes();
   updateMeasureInfo();
   updatePlayerInfo();
@@ -1119,6 +2027,14 @@ async function loadMeta() {
   if (!r.ok) throw new Error(d.error);
   meta.fps = d.fps;
   meta.totalFrames = d.total_frames;
+  const annotateTimeline = document.getElementById('a-timeline');
+  annotateTimeline.max = Math.max(0, meta.totalFrames - 1);
+  document.getElementById('a-second').max = Math.max(0, (meta.totalFrames - 1) / meta.fps).toFixed(3);
+  document.getElementById('a-timeline-label').textContent = formatClock(0);
+  const playerTimeline = document.getElementById('p-timeline');
+  playerTimeline.max = Math.max(0, meta.totalFrames - 1);
+  document.getElementById('p-second').max = Math.max(0, (meta.totalFrames - 1) / meta.fps).toFixed(3);
+  document.getElementById('p-timeline-label').textContent = formatClock(0);
   document.getElementById('info-dataset').textContent = d.dataset_dir;
   await refreshHistory();
   await refreshPlayerCaptures();
@@ -1351,16 +2267,22 @@ async function loadAnnotateFrame(frameIdx, options = {}) {
   return await new Promise((resolve, reject) => {
     img.onload = async () => {
       a.img = img; a.imgW = d.width; a.imgH = d.height;
-      a.frameIdx = d.frame_idx; a.timeSec = d.time_sec;
-      a.boxes = (d.boxes || []).map(boxToCorners); a.cornerA = null; a.preview = null; a.sobel = null;
+      a.frameIdx = d.frame_idx; a.timeSec = d.time_sec; a.source = d.source || null;
+      a.boxes = (d.boxes || []).map(boxToCorners); a.modelBoxes = []; a.boxRules = null; a.pieces = [];
+      a.cornerA = null; a.preview = null; a.sobel = null;
       if (options.resetView !== false) resetView(a);
       document.getElementById('a-second').value = d.time_sec.toFixed(2);
+      document.getElementById('a-timeline').value = d.frame_idx;
+      document.getElementById('a-timeline-label').textContent = formatClock(d.time_sec);
       document.getElementById('a-zoom').value = a.zoom;
       document.getElementById('a-zoom-label').textContent = a.zoom.toFixed(1) + 'x';
       document.getElementById('info-frame').textContent = d.frame_idx;
       document.getElementById('info-time').textContent = d.time_sec.toFixed(3) + 's';
       document.getElementById('info-size').textContent = `${d.width}x${d.height}`;
+      document.getElementById('info-video').textContent = sourceName(d.source);
+      document.getElementById('info-source-frame').textContent = d.source?.source_frame_idx ?? '-';
       updateBoxes();
+      updateModelBoxes();
       updateSobelInfo();
       fitAll(); drawAll();
       updateHistoryUI();
@@ -1385,6 +2307,63 @@ function loadAnnotateSecond() {
   loadAnnotateFrame(Math.round(second * meta.fps));
 }
 function stepAnnotate(delta) { loadAnnotateFrame(a.frameIdx + delta); }
+function stepAnnotateSeconds(seconds) {
+  loadAnnotateFrame(a.frameIdx + Math.round(seconds * meta.fps), {resetView: false});
+}
+
+function formatClock(totalSeconds) {
+  const safeSeconds = Math.max(0, Number(totalSeconds) || 0);
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  const seconds = Math.floor(safeSeconds % 60);
+  return [hours, minutes, seconds].map(value => String(value).padStart(2, '0')).join(':');
+}
+
+function formatFeetInches(totalInches) {
+  const value = Number(totalInches);
+  if (!Number.isFinite(value)) return '-';
+  const sign = value < 0 ? '-' : '';
+  const totalSixteenths = Math.round(Math.abs(value) * 16);
+  const feet = Math.floor(totalSixteenths / 192);
+  const remainingSixteenths = totalSixteenths - feet * 192;
+  const wholeInches = Math.floor(remainingSixteenths / 16);
+  let numerator = remainingSixteenths % 16;
+  let denominator = 16;
+  while (numerator > 0 && numerator % 2 === 0 && denominator % 2 === 0) {
+    numerator /= 2;
+    denominator /= 2;
+  }
+  const fraction = numerator ? ` ${numerator}/${denominator}` : '';
+  return `${sign}${feet}' ${wholeInches}${fraction}"`;
+}
+
+function previewAnnotateTimeline(frameValue) {
+  const frameIdx = Math.max(0, Math.min(meta.totalFrames - 1, Number(frameValue) || 0));
+  const second = frameIdx / meta.fps;
+  document.getElementById('a-second').value = second.toFixed(2);
+  document.getElementById('a-timeline-label').textContent = formatClock(second);
+}
+
+function loadAnnotateTimeline(frameValue) {
+  clearTimeout(a.timelineTimer);
+  a.timelineTimer = null;
+  return loadAnnotateFrame(Number(frameValue) || 0, {resetView: false});
+}
+
+function scrollAnnotateTimeline(event) {
+  event.preventDefault();
+  const timeline = event.currentTarget;
+  const direction = (event.deltaY || event.deltaX) > 0 ? 1 : -1;
+  const jumpSeconds = event.shiftKey ? 5 : 30;
+  const nextFrame = Math.max(
+    0,
+    Math.min(meta.totalFrames - 1, Number(timeline.value) + direction * Math.round(meta.fps * jumpSeconds))
+  );
+  timeline.value = nextFrame;
+  previewAnnotateTimeline(nextFrame);
+  clearTimeout(a.timelineTimer);
+  a.timelineTimer = setTimeout(() => loadAnnotateTimeline(nextFrame), 180);
+}
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
@@ -1401,7 +2380,7 @@ async function loadMeasureFrame(frameIdx, options = {}) {
   return await new Promise((resolve, reject) => {
     img.onload = () => {
       m.img = img; m.imgW = d.width; m.imgH = d.height;
-      m.frameIdx = d.frame_idx; m.timeSec = d.time_sec;
+      m.frameIdx = d.frame_idx; m.timeSec = d.time_sec; m.source = d.source || null;
       applyMeasureCalibration(d.calibration || {});
       if (options.resetView !== false) resetView(m);
       document.getElementById('m-second').value = d.time_sec.toFixed(2);
@@ -1440,6 +2419,7 @@ function stepMeasure(delta) {
 function applyMeasureCalibration(calibration) {
   m.segments = (calibration.segments || []).map(s => ({...s}));
   m.referenceY = calibration.reference_y ?? null;
+  m.exclusionZones = (calibration.exclusion_zones || []).map(zone => ({...zone}));
   m.inchPerPx = calibration.inch_per_px ?? computeInchPerPx();
 }
 
@@ -1453,6 +2433,8 @@ function computeInchPerPx() {
 
 function updateMeasureInfo() {
   m.inchPerPx = computeInchPerPx();
+  document.getElementById('m-info-video').textContent = sourceName(m.source);
+  document.getElementById('m-info-source-frame').textContent = m.source?.source_frame_idx ?? '-';
   document.getElementById('m-info-frame').textContent = m.img ? m.frameIdx : '-';
   document.getElementById('m-info-time').textContent = m.img ? m.timeSec.toFixed(3) + 's' : '-';
   document.getElementById('m-info-size').textContent = m.img ? `${m.imgW}x${m.imgH}` : '-';
@@ -1460,6 +2442,15 @@ function updateMeasureInfo() {
   document.getElementById('m-info-px-inch').textContent = m.inchPerPx ? (1 / m.inchPerPx).toFixed(2) : '-';
   document.getElementById('m-info-segments').textContent = m.segments.length;
   document.getElementById('m-info-ref').textContent = m.referenceY === null ? '-' : Math.round(m.referenceY) + ' px';
+  document.getElementById('m-info-zones').textContent = m.exclusionZones.length;
+  const zoneList = document.getElementById('m-zone-list');
+  zoneList.innerHTML = m.exclusionZones.length
+    ? m.exclusionZones.map((zone, index) => `<div class="box-item">
+        <span class="swatch" style="background:#ef6666"></span>
+        <span>#${index + 1} ${Math.round(zone.w)}x${Math.round(zone.h)} px</span>
+        <button class="danger" onclick="deleteMeasureExclusionZone(${index})">Borrar</button>
+      </div>`).join('')
+    : '<div class="kv"><span>Sin zonas rojas.</span></div>';
   const list = document.getElementById('m-segment-list');
   if (!m.segments.length) {
     list.innerHTML = '<div class="kv"><span>Marca un segmento y escribe sus pulgadas.</span></div>';
@@ -1479,7 +2470,13 @@ function setMeasureMode(mode) {
   m.pending = null; m.preview = null;
   document.getElementById('m-mode-segment').classList.toggle('active', mode === 'segment');
   document.getElementById('m-mode-ref').classList.toggle('active', mode === 'reference');
-  status(mode === 'segment' ? 'Modo segmento: marca 2 puntos.' : 'Modo Linea Y: click o arrastra la referencia horizontal.', 'ok');
+  document.getElementById('m-mode-exclusion').classList.toggle('active', mode === 'exclusion');
+  const message = mode === 'segment'
+    ? 'Modo segmento: marca 2 puntos.'
+    : (mode === 'reference'
+      ? 'Modo Linea Y: click o arrastra la referencia horizontal.'
+      : 'Modo Zona roja: marca dos esquinas del area sin boxes.');
+  status(message, 'ok');
   drawAll();
 }
 
@@ -1489,6 +2486,27 @@ function measureClick(point) {
     m.referenceY = point.y;
     updateMeasureInfo(); drawAll();
     status(`Linea Y en ${Math.round(point.y)} px`, 'ok');
+    return;
+  }
+  if (m.mode === 'exclusion') {
+    if (!m.pending) {
+      m.pending = point;
+      status('Primera esquina de la zona roja marcada. Marca la esquina opuesta.', 'ok');
+      drawAll();
+      return;
+    }
+    const x = Math.min(m.pending.x, point.x);
+    const y = Math.min(m.pending.y, point.y);
+    const w = Math.abs(point.x - m.pending.x);
+    const h = Math.abs(point.y - m.pending.y);
+    if (w >= 2 && h >= 2) {
+      m.exclusionZones.push({x, y, w, h});
+      status(`Zona roja guardada: ${Math.round(w)}x${Math.round(h)} px`, 'ok');
+    } else {
+      status('Zona cancelada: el area es demasiado pequena.', 'err');
+    }
+    m.pending = null; m.preview = null;
+    updateMeasureInfo(); drawAll();
     return;
   }
   if (!m.pending) {
@@ -1518,14 +2536,21 @@ function deleteMeasureSegment(i) {
   updateMeasureInfo(); drawAll();
 }
 
+function deleteMeasureExclusionZone(i) {
+  m.exclusionZones.splice(i, 1);
+  updateMeasureInfo(); drawAll();
+}
+
 function undoMeasureSegment() {
   if (m.pending) { m.pending = null; m.preview = null; }
+  else if (m.mode === 'exclusion') m.exclusionZones.pop();
   else m.segments.pop();
   updateMeasureInfo(); drawAll();
 }
 
 function clearMeasureCalibration() {
   m.segments = []; m.pending = null; m.preview = null; m.referenceY = null; m.inchPerPx = null;
+  m.exclusionZones = [];
   updateMeasureInfo(); drawAll();
 }
 
@@ -1538,6 +2563,7 @@ async function saveMeasureCalibration() {
     img_h: m.imgH,
     segments: m.segments,
     reference_y: m.referenceY,
+    exclusion_zones: m.exclusionZones,
     inch_per_px: m.inchPerPx,
   };
   const r = await fetch('/api/measure/save', {
@@ -1547,7 +2573,11 @@ async function saveMeasureCalibration() {
   });
   const d = await r.json();
   if (!r.ok) { status(d.error, 'err'); return; }
-  status(`Mediciones guardadas: ${d.path}`, 'ok');
+  p.calibration = d;
+  p.calibrationStale = true;
+  updatePlayerRulerInfo();
+  drawAll();
+  status(`Mediciones guardadas. El reproductor recalculara el frame con la nueva escala.`, 'ok');
 }
 
 async function loadPlayerFrame(frameIdx, options = {}) {
@@ -1563,13 +2593,19 @@ async function loadPlayerFrame(frameIdx, options = {}) {
   return await new Promise((resolve, reject) => {
     img.onload = () => {
       p.img = img; p.imgW = d.width; p.imgH = d.height;
-      p.frameIdx = d.frame_idx; p.timeSec = d.time_sec;
+      p.frameIdx = d.frame_idx; p.timeSec = d.time_sec; p.source = d.source || null;
       p.boxes = d.boxes || [];
+      p.pieces = d.pieces || [];
+      p.measurementSummary = d.measurement_summary || null;
       p.sobel = d.sobel || null;
       p.calibration = d.calibration || null;
       p.measurement = d.measurement || null;
+      p.boxRules = d.box_rules || null;
+      p.calibrationStale = false;
       if (options.resetView !== false) resetView(p);
       document.getElementById('p-second').value = d.time_sec.toFixed(2);
+      document.getElementById('p-timeline').value = d.frame_idx;
+      document.getElementById('p-timeline-label').textContent = formatClock(d.time_sec);
       document.getElementById('p-zoom').value = p.zoom;
       document.getElementById('p-zoom-label').textContent = p.zoom.toFixed(1) + 'x';
       updatePlayerInfo();
@@ -1577,7 +2613,8 @@ async function loadPlayerFrame(frameIdx, options = {}) {
       fitAll(); drawAll();
       if (!options.quiet) {
         const cls = p.boxes.length ? 'ok' : 'err';
-        status(`Frame ${d.frame_idx}: YOLO ${p.boxes.length} box(es), Sobel ${p.sobel && p.sobel.line ? 'con linea' : 'sin linea'}`, cls);
+        const validCount = Number(p.measurementSummary?.valid_count || 0);
+        status(`Frame ${d.frame_idx}: ${p.boxes.length} piezas, ${validCount} mediciones validas`, cls);
       }
       resolve(d);
     };
@@ -1633,6 +2670,9 @@ function updatePlayerRulerInfo() {
   document.getElementById('p-ruler-y').classList.toggle('active', p.rulerActive && p.rulerMode === 'y');
   document.getElementById('p-ruler-free').classList.toggle('active', p.rulerActive && p.rulerMode === 'free');
   document.getElementById('p-ruler-info-mode').textContent = p.rulerActive ? rulerModeLabel(p.rulerMode) : 'off';
+  const inchPerPx = p.calibration && Number(p.calibration.inch_per_px);
+  document.getElementById('p-ruler-info-scale').textContent =
+    Number.isFinite(inchPerPx) && inchPerPx > 0 ? `${inchPerPx.toFixed(6)} in/px` : '-';
   const measure = playerRulerMeasurement();
   if (!measure) {
     document.getElementById('p-ruler-info-distance').textContent = '-';
@@ -1699,6 +2739,16 @@ function playerRulerClick(point) {
 
 function updatePlayerInfo() {
   const bestConf = p.boxes.reduce((m, b) => Math.max(m, Number(b.conf || 0)), 0);
+  const validPieces = p.pieces.filter(piece => piece.valid && piece.measurement);
+  const analyzedPieces = p.pieces.filter(piece => piece.sobel && piece.sobel.has_roi);
+  const averageEdgeConf = analyzedPieces.length
+    ? analyzedPieces.reduce((sum, piece) => sum + Number(piece.sobel.edge_confidence || 0), 0) / analyzedPieces.length
+    : null;
+  const averageCrm = analyzedPieces.length
+    ? analyzedPieces.reduce((sum, piece) => sum + Number(piece.sobel.crm_px || 0), 0) / analyzedPieces.length
+    : null;
+  document.getElementById('p-info-video').textContent = sourceName(p.source);
+  document.getElementById('p-info-source-frame').textContent = p.source?.source_frame_idx ?? '-';
   document.getElementById('p-info-frame').textContent = p.img ? p.frameIdx : '-';
   document.getElementById('p-info-time').textContent = p.img ? p.timeSec.toFixed(3) + 's' : '-';
   document.getElementById('p-info-size').textContent = p.img ? `${p.imgW}x${p.imgH}` : '-';
@@ -1706,6 +2756,7 @@ function updatePlayerInfo() {
   document.getElementById('p-speed').textContent = `x${p.speed}`;
   document.getElementById('p-info-boxes').textContent = p.boxes.length;
   document.getElementById('p-info-yolo-conf').textContent = bestConf ? bestConf.toFixed(2) : '-';
+  document.getElementById('p-info-excluded').textContent = Number(p.boxRules?.removed_exclusion_count || 0);
   const yoloBadge = document.getElementById('p-yolo-badge');
   yoloBadge.textContent = p.boxes.length ? `YOLO ${p.boxes.length}` : 'YOLO 0';
   yoloBadge.className = 'pill' + (p.boxes.length ? ' ok' : '');
@@ -1715,22 +2766,41 @@ function updatePlayerInfo() {
   const crm = document.getElementById('p-info-sobel-crm');
   const measure = document.getElementById('p-info-measure');
   const sobelBadge = document.getElementById('p-sobel-badge');
-  const measureValue = playerMeasureValue(p.measurement);
-  measure.textContent = measureValue === null ? '-' : measureValue.toFixed(3) + ' in';
+  measure.textContent = `${validPieces.length} / ${p.pieces.length}`;
   updatePlayerRulerInfo();
-  if (!p.sobel || !p.sobel.has_roi) {
+  if (!p.pieces.length) {
     state.textContent = p.boxes.length ? 'sin ROI' : 'sin box YOLO';
     conf.textContent = '-';
     crm.textContent = '-';
     sobelBadge.textContent = 'Sobel -';
     sobelBadge.className = 'pill';
+    updatePlayerPieceList();
     return;
   }
-  state.textContent = p.sobel.is_valid ? 'linea valida' : 'linea debil';
-  conf.textContent = Number(p.sobel.edge_confidence || 0).toFixed(2);
-  crm.textContent = Number(p.sobel.crm_px || 0).toFixed(2) + ' px';
-  sobelBadge.textContent = p.sobel.line ? 'Sobel linea' : 'Sobel sin linea';
-  sobelBadge.className = 'pill' + (p.sobel.is_valid ? ' ok' : '');
+  state.textContent = validPieces.length === p.pieces.length ? 'todas validas' : 'revisar piezas';
+  conf.textContent = averageEdgeConf === null ? '-' : averageEdgeConf.toFixed(2);
+  crm.textContent = averageCrm === null || !Number.isFinite(averageCrm) ? '-' : averageCrm.toFixed(2) + ' px';
+  sobelBadge.textContent = `Sobel ${validPieces.length}/${p.pieces.length}`;
+  sobelBadge.className = 'pill' + (validPieces.length ? ' ok' : '');
+  updatePlayerPieceList();
+}
+
+function updatePlayerPieceList() {
+  const list = document.getElementById('p-piece-list');
+  if (!list) return;
+  if (!p.pieces.length) {
+    list.innerHTML = '<div class="kv"><span>Sin piezas detectadas.</span></div>';
+    return;
+  }
+  list.innerHTML = p.pieces.map((piece, index) => {
+    const measurement = piece.measurement;
+    const total = measurement ? formatFeetInches(measurement.measurement_in) : '-';
+    const distance = measurement ? `${Number(measurement.delta_in).toFixed(3)} in ref` : 'sin borde';
+    return `<div class="box-item">
+      <span class="swatch" style="background:${COLORS[index % COLORS.length]}"></span>
+      <span>P${Number(piece.piece_id)} | ${total}<br><small>${distance}</small></span>
+    </div>`;
+  }).join('');
 }
 
 async function refreshPlayerCaptures() {
@@ -1751,9 +2821,12 @@ function updatePlayerCapturesUI() {
   list.innerHTML = p.captures.map(item => {
     const cls = item.frame_idx === p.frameIdx ? 'history-item current' : 'history-item';
     const time = Number(item.time_sec || 0).toFixed(2);
-    const value = item.measurement_in === null || item.measurement_in === undefined
-      ? 'sin medida'
-      : Number(item.measurement_in).toFixed(3) + ' in';
+    const measurementCount = Number(item.measurement_count || 0);
+    const value = measurementCount
+      ? `${measurementCount} mediciones`
+      : (item.measurement_in === null || item.measurement_in === undefined
+        ? 'sin medida'
+        : formatFeetInches(item.measurement_in));
     return `<div class="${cls}" onclick="goToPlayerCapture(${Number(item.frame_idx)})" title="Ir a ${time}s">
       <div><strong>Frame ${Number(item.frame_idx)}</strong><span>${time}s | ${value}</span></div>
       <div class="history-actions">
@@ -1780,6 +2853,8 @@ async function savePlayerCapture() {
     img_w: p.imgW,
     img_h: p.imgH,
     boxes: p.boxes,
+    pieces: p.pieces,
+    measurement_summary: p.measurementSummary,
     sobel: p.sobel,
     measurement: p.measurement,
   };
@@ -1793,7 +2868,7 @@ async function savePlayerCapture() {
   p.captures = d.captures || [];
   updatePlayerCapturesUI();
   const value = playerMeasureValue(d.capture && d.capture.measurement);
-  status(`Captura guardada: frame ${d.capture.frame_idx}${value === null ? '' : ' | ' + value.toFixed(3) + ' in'}`, 'ok');
+  status(`Captura guardada: frame ${d.capture.frame_idx}${value === null ? '' : ' | ' + formatFeetInches(value)}`, 'ok');
 }
 
 async function deletePlayerCapture(captureId) {
@@ -1810,6 +2885,36 @@ function loadPlayerSecond() {
   stopPlayerPlayback();
   const second = parseFloat(document.getElementById('p-second').value) || 0;
   return loadPlayerFrame(Math.round(second * meta.fps));
+}
+
+function previewPlayerTimeline(frameValue) {
+  const frameIdx = Math.max(0, Math.min(meta.totalFrames - 1, Number(frameValue) || 0));
+  const second = frameIdx / meta.fps;
+  document.getElementById('p-second').value = second.toFixed(2);
+  document.getElementById('p-timeline-label').textContent = formatClock(second);
+}
+
+function loadPlayerTimeline(frameValue) {
+  stopPlayerPlayback();
+  clearTimeout(p.timelineTimer);
+  p.timelineTimer = null;
+  return loadPlayerFrame(Number(frameValue) || 0, {resetView: false});
+}
+
+function scrollPlayerTimeline(event) {
+  event.preventDefault();
+  stopPlayerPlayback();
+  const timeline = event.currentTarget;
+  const direction = (event.deltaY || event.deltaX) > 0 ? 1 : -1;
+  const jumpSeconds = event.shiftKey ? 5 : 30;
+  const nextFrame = Math.max(
+    0,
+    Math.min(meta.totalFrames - 1, Number(timeline.value) + direction * Math.round(meta.fps * jumpSeconds))
+  );
+  timeline.value = nextFrame;
+  previewPlayerTimeline(nextFrame);
+  clearTimeout(p.timelineTimer);
+  p.timelineTimer = setTimeout(() => loadPlayerTimeline(nextFrame), 180);
 }
 
 function stepPlayer(delta) {
@@ -1871,9 +2976,35 @@ function drawAnnotate() {
   const vw = a.imgW / a.zoom, vh = a.imgH / a.zoom;
   ctx.drawImage(a.img, a.panX, a.panY, vw, vh, 0, 0, cw, ch);
   drawGrid(a, 100);
+  a.modelBoxes.forEach((b, i) => {
+    const color = b.inferred ? '#d6a34b' : '#70c7c2';
+    drawBox(b, color, true, `M${i + 1}`);
+  });
   a.boxes.forEach((b, i) => drawBox(b, COLORS[i % COLORS.length], false, i + 1));
   if (a.preview) drawBox(a.preview, '#ffffff', true, '?');
   drawSobelProjection();
+}
+
+function drawExclusionZones(state, zones, showLabels = false) {
+  const ctx = state.ctx;
+  (zones || []).forEach((zone, index) => {
+    const topLeft = imageToDisplay(state, zone.x, zone.y);
+    const bottomRight = imageToDisplay(state, zone.x + zone.w, zone.y + zone.h);
+    const width = bottomRight.x - topLeft.x;
+    const height = bottomRight.y - topLeft.y;
+    ctx.save();
+    ctx.fillStyle = 'rgba(210, 48, 48, 0.18)';
+    ctx.strokeStyle = '#ef6666';
+    ctx.lineWidth = 2;
+    ctx.fillRect(topLeft.x, topLeft.y, width, height);
+    ctx.strokeRect(topLeft.x, topLeft.y, width, height);
+    if (showLabels) {
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '800 12px Arial';
+      ctx.fillText(`NO BOX ${index + 1}`, topLeft.x + 7, topLeft.y + 17);
+    }
+    ctx.restore();
+  });
 }
 
 function drawMeasure() {
@@ -1883,6 +3014,7 @@ function drawMeasure() {
   const vw = m.imgW / m.zoom, vh = m.imgH / m.zoom;
   ctx.drawImage(m.img, m.panX, m.panY, vw, vh, 0, 0, cw, ch);
   drawGrid(m, 100);
+  drawExclusionZones(m, m.exclusionZones, true);
 
   if (m.referenceY !== null) {
     const left = imageToDisplay(m, 0, m.referenceY);
@@ -1917,10 +3049,17 @@ function drawMeasure() {
     const p1 = imageToDisplay(m, m.pending.x, m.pending.y);
     const p2 = imageToDisplay(m, m.preview.x, m.preview.y);
     ctx.save();
-    ctx.strokeStyle = '#ffffff';
     ctx.setLineDash([6, 4]);
     ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+    if (m.mode === 'exclusion') {
+      ctx.strokeStyle = '#ff7a7a';
+      ctx.fillStyle = 'rgba(210, 48, 48, 0.22)';
+      ctx.fillRect(p1.x, p1.y, p2.x - p1.x, p2.y - p1.y);
+      ctx.strokeRect(p1.x, p1.y, p2.x - p1.x, p2.y - p1.y);
+    } else {
+      ctx.strokeStyle = '#ffffff';
+      ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+    }
     ctx.restore();
   }
 }
@@ -1932,22 +3071,36 @@ function drawPlayer() {
   const vw = p.imgW / p.zoom, vh = p.imgH / p.zoom;
   ctx.drawImage(p.img, p.panX, p.panY, vw, vh, 0, 0, cw, ch);
   drawGrid(p, 100);
+  drawExclusionZones(p, p.calibration?.exclusion_zones || [], false);
   drawPlayerMeasurement();
-  p.boxes.forEach((b, i) => drawBoxOnState(p, b, COLORS[i % COLORS.length], false, i + 1));
-  drawSobelOnState(p, p.sobel);
+  p.boxes.forEach((b, i) => {
+    const color = b.inferred ? '#d6a34b' : COLORS[i % COLORS.length];
+    drawBoxOnState(p, b, color, Boolean(b.inferred), i + 1);
+  });
+  if (p.pieces.length) {
+    p.pieces.forEach(piece => drawSobelOnState(p, piece.sobel));
+  } else {
+    drawSobelOnState(p, p.sobel);
+  }
   drawPlayerRuler();
 }
 
 function normBox(b) {
   if ('x' in b && 'y' in b && 'w' in b && 'h' in b) {
-    return {x: b.x, y: b.y, w: b.w, h: b.h};
+    return {...b, x: b.x, y: b.y, w: b.w, h: b.h};
   }
-  return {x: Math.min(b.x1, b.x2), y: Math.min(b.y1, b.y2), w: Math.abs(b.x2 - b.x1), h: Math.abs(b.y2 - b.y1)};
+  return {
+    ...b,
+    x: Math.min(b.x1, b.x2),
+    y: Math.min(b.y1, b.y2),
+    w: Math.abs(b.x2 - b.x1),
+    h: Math.abs(b.y2 - b.y1)
+  };
 }
 
 function boxToCorners(b) {
   if ('x1' in b && 'y1' in b && 'x2' in b && 'y2' in b) return b;
-  return {x1: b.x, y1: b.y, x2: b.x + b.w, y2: b.y + b.h};
+  return {...b, x1: b.x, y1: b.y, x2: b.x + b.w, y2: b.y + b.h};
 }
 
 function drawBox(b, color, dashed, label) {
@@ -1966,9 +3119,10 @@ function drawBoxOnState(state, b, color, dashed, label) {
   ctx.globalAlpha = dashed ? .06 : .12;
   ctx.fillStyle = color; ctx.fillRect(p1.x, p1.y, p2.x - p1.x, p2.y - p1.y);
   ctx.restore();
-  if (!dashed) {
+  if (!dashed || String(label).startsWith('M') || b.inferred) {
     ctx.fillStyle = color; ctx.font = '700 12px Arial';
-    ctx.fillText(`#${label} ${Math.round(nb.w)}x${Math.round(nb.h)}`, p1.x + 4, p1.y + 14);
+    const prefix = String(label).startsWith('M') ? '' : '#';
+    ctx.fillText(`${prefix}${label} ${Math.round(nb.w)}x${Math.round(nb.h)}`, p1.x + 4, p1.y + 14);
   }
 }
 
@@ -1985,31 +3139,27 @@ function drawPlayerMeasurement() {
   ctx.fillStyle = '#5b9bd5';
   ctx.font = '700 12px Arial';
   ctx.fillText('Y ref', 10, Math.max(16, left.y - 8));
-  if (p.measurement) {
-    const q1 = imageToDisplay(p, p.measurement.x, p.measurement.reference_y);
-    const q2 = imageToDisplay(p, p.measurement.x, p.measurement.line_y);
-    const totalIn = Number(p.measurement.measurement_in ?? p.measurement.delta_in);
-    const refDeltaIn = Number(p.measurement.delta_in);
-    const labelTotal = `Total: ${totalIn.toFixed(3)} in`;
-    const labelRef = `Ref: ${refDeltaIn >= 0 ? '+' : ''}${refDeltaIn.toFixed(3)} in`;
-    const labelX = Math.min(p.canvas.width - 220, q2.x + 14);
-    const labelY = Math.max(52, Math.min(p.canvas.height - 18, (q1.y + q2.y) / 2));
-    ctx.strokeStyle = '#ffffff';
+  const measuredPieces = p.pieces.length
+    ? p.pieces.filter(piece => piece.measurement)
+    : (p.measurement ? [{piece_id: 1, measurement: p.measurement}] : []);
+  measuredPieces.forEach((piece, index) => {
+    const measurement = piece.measurement;
+    const q1 = imageToDisplay(p, measurement.x, measurement.reference_y);
+    const q2 = imageToDisplay(p, measurement.x, measurement.line_y);
+    const color = COLORS[index % COLORS.length];
+    const label = `P${Number(piece.piece_id)} ${formatFeetInches(measurement.measurement_in)}`;
+    const labelY = Math.max(24, Math.min(p.canvas.height - 8, q2.y + 22 + (index % 2) * 20));
+    ctx.strokeStyle = color;
     ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(q1.x, q1.y); ctx.lineTo(q2.x, q2.y); ctx.stroke();
-    ctx.font = '800 24px Arial';
-    const widthTotal = ctx.measureText(labelTotal).width;
-    ctx.font = '800 18px Arial';
-    const widthRef = ctx.measureText(labelRef).width;
-    const labelWidth = Math.max(widthTotal, widthRef);
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
-    ctx.fillRect(labelX - 8, labelY - 46, labelWidth + 16, 54);
+    ctx.font = '800 13px Arial';
+    const labelWidth = ctx.measureText(label).width;
+    const labelX = Math.max(6, Math.min(p.canvas.width - labelWidth - 6, q2.x - 34));
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.62)';
+    ctx.fillRect(labelX - 4, labelY - 15, labelWidth + 8, 20);
     ctx.fillStyle = '#ffffff';
-    ctx.font = '800 24px Arial';
-    ctx.fillText(labelTotal, labelX, labelY - 20);
-    ctx.font = '800 18px Arial';
-    ctx.fillText(labelRef, labelX, labelY + 2);
-  }
+    ctx.fillText(label, labelX, labelY);
+  });
   ctx.restore();
 }
 
@@ -2082,6 +3232,10 @@ function drawSobelOnState(state, sobel) {
 }
 
 function drawSobelProjection() {
+  if (a.pieces.length) {
+    a.pieces.forEach(piece => drawSobelOnState(a, piece.sobel));
+    return;
+  }
   if (!a.sobel) return;
   const ctx = a.ctx;
   if (a.sobel.roi) {
@@ -2122,12 +3276,82 @@ function updateBoxes() {
   const list = document.getElementById('box-list');
   if (!a.boxes.length) {
     list.innerHTML = '<div class="kv"><span>Sin boxes. Se guardara como negativo.</span></div>';
+    updateModelBoxes();
     return;
   }
   list.innerHTML = a.boxes.map((b, i) => {
     const nb = normBox(b);
     return `<div class="box-item"><span class="swatch" style="background:${COLORS[i % COLORS.length]}"></span><span>#${i+1} ${Math.round(nb.w)}x${Math.round(nb.h)} @ ${Math.round(nb.x)},${Math.round(nb.y)}</span><button onclick="deleteBox(${i})">Borrar</button></div>`;
   }).join('');
+  updateModelBoxes();
+}
+
+function modelAnnotationComparison() {
+  const annotationBoxes = a.boxes.map(normBox);
+  const modelBoxes = a.modelBoxes.map(normBox);
+  const matchedAnnotations = new Set();
+  let matchedPredictions = 0;
+  modelBoxes.forEach(modelBox => {
+    let bestIndex = -1;
+    let bestOverlap = 0;
+    annotationBoxes.forEach((annotationBox, index) => {
+      const overlap = boxOverlapFraction(modelBox, annotationBox);
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        bestIndex = index;
+      }
+    });
+    if (bestIndex >= 0 && bestOverlap >= 0.35) {
+      matchedPredictions += 1;
+      matchedAnnotations.add(bestIndex);
+    }
+  });
+  return {
+    matchedPredictions,
+    missedAnnotations: Math.max(0, annotationBoxes.length - matchedAnnotations.size),
+  };
+}
+
+function updateModelBoxes() {
+  const comparison = modelAnnotationComparison();
+  const inferredCount = a.modelBoxes.filter(box => box.inferred).length;
+  document.getElementById('info-model-boxes').textContent = a.modelBoxes.length
+    ? `${a.modelBoxes.length}${inferredCount ? ` (${inferredCount} por regla)` : ''}`
+    : (a.boxRules ? '0' : '-');
+  document.getElementById('info-model-matched').textContent = a.boxRules
+    ? comparison.matchedPredictions
+    : '-';
+  document.getElementById('info-model-missed').textContent = a.boxRules
+    ? comparison.missedAnnotations
+    : '-';
+  const list = document.getElementById('model-box-list');
+  if (!a.boxRules) {
+    list.innerHTML = '';
+    return;
+  }
+  if (!a.modelBoxes.length) {
+    list.innerHTML = '<div class="kv"><span>Sin detecciones.</span></div>';
+    return;
+  }
+  list.innerHTML = a.modelBoxes.map((box, index) => {
+    const nb = normBox(box);
+    const color = box.inferred ? '#d6a34b' : '#70c7c2';
+    const source = box.inferred ? 'regla + Sobel' : `conf ${Number(box.conf || 0).toFixed(2)}`;
+    return `<div class="box-item"><span class="swatch" style="background:${color}"></span><span>M${index + 1} ${Math.round(nb.w)}x${Math.round(nb.h)} | ${source}</span><span></span></div>`;
+  }).join('');
+}
+
+function boxOverlapFraction(first, second) {
+  const left = Math.max(Number(first.x), Number(second.x));
+  const top = Math.max(Number(first.y), Number(second.y));
+  const right = Math.min(Number(first.x) + Number(first.w), Number(second.x) + Number(second.w));
+  const bottom = Math.min(Number(first.y) + Number(first.h), Number(second.y) + Number(second.h));
+  const intersection = Math.max(0, right - left) * Math.max(0, bottom - top);
+  const smallerArea = Math.min(
+    Math.max(0, Number(first.w) * Number(first.h)),
+    Math.max(0, Number(second.w) * Number(second.h))
+  );
+  return smallerArea > 0 ? intersection / smallerArea : 0;
 }
 
 function updateSobelInfo() {
@@ -2156,18 +3380,33 @@ async function predictYoloBoxes(options = {}) {
   });
   const d = await r.json();
   if (!r.ok) { status(d.error, 'err'); return; }
-  a.boxes = (d.boxes || []).map(boxToCorners);
-  a.sobel = null;
-  updateBoxes();
-  updateSobelInfo();
+  a.modelBoxes = (d.boxes || []).map(boxToCorners);
+  a.boxRules = d.box_rules || {};
+  updateModelBoxes();
   drawAll();
-  if (a.boxes.length && options.autoSobel !== false) {
-    return await runSobelProjection({quiet: options.quiet});
-  }
   if (!options.quiet) {
-    status(a.boxes.length ? `YOLO detecto ${a.boxes.length} box(es)` : 'YOLO no detecto boxes en este frame', a.boxes.length ? 'ok' : 'err');
+    const comparison = modelAnnotationComparison();
+    const inferred = Number(a.boxRules.inferred_count || 0);
+    const excluded = Number(a.boxRules.removed_exclusion_count || 0);
+    const message = a.modelBoxes.length
+      ? `Modelo: ${a.modelBoxes.length} detecciones | ${comparison.matchedPredictions} coincidencias | ${comparison.missedAnnotations} omitidas${inferred ? ` | ${inferred} inferidas por regla` : ''}${excluded ? ` | ${excluded} descartadas por zona` : ''}`
+      : `Modelo: sin detecciones | ${comparison.missedAnnotations} anotaciones omitidas${excluded ? ` | ${excluded} descartadas por zona` : ''}`;
+    status(message, a.modelBoxes.length ? 'ok' : 'err');
   }
   return d;
+}
+
+async function runModel() {
+  const button = document.getElementById('a-run-model');
+  if (!a.img || button.disabled) return;
+  button.disabled = true;
+  button.textContent = 'Running...';
+  try {
+    await predictYoloBoxes();
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Run model';
+  }
 }
 
 async function runSobelProjection(options = {}) {
@@ -2181,14 +3420,14 @@ async function runSobelProjection(options = {}) {
   const d = await r.json();
   if (!r.ok) { status(d.error, 'err'); return; }
   a.sobel = d;
+  a.pieces = d.pieces || [];
   if (!a.boxes.length && d.roi_box) a.boxes = [boxToCorners(d.roi_box)];
   updateBoxes();
   updateSobelInfo();
   drawAll();
-  const msg = d.is_valid
-    ? `Sobel projection OK | conf=${Number(d.edge_confidence).toFixed(2)} crm=${Number(d.crm_px).toFixed(2)}px`
-    : `Sobel projection debil | conf=${Number(d.edge_confidence || 0).toFixed(2)} crm=${Number(d.crm_px || 0).toFixed(2)}px`;
-  status(msg, d.is_valid ? 'ok' : 'err');
+  const validCount = Number(d.measurement_summary?.valid_count || 0);
+  const msg = `${validCount}/${a.pieces.length} piezas con medicion valida`;
+  status(msg, validCount ? 'ok' : 'err');
   return d;
 }
 
@@ -2210,24 +3449,31 @@ function updateHistoryUI() {
   }
   list.innerHTML = a.history.map(item => {
     const cls = item.frame_idx === a.frameIdx ? 'history-item current' : 'history-item';
-    const kind = item.box_count === 0 ? 'negativo' : `${item.box_count} boxes`;
+    const kind = item.candidate
+      ? 'pendiente: anotar piezas'
+      : (item.box_count === 0 ? 'negativo' : `${item.box_count} piezas`);
     const time = Number(item.time_sec || 0).toFixed(2);
+    const source = sourceName(item.source);
     return `<div class="${cls}">
-      <div><strong>Frame ${item.frame_idx}</strong><span>${time}s · ${kind}</span></div>
+      <div><strong>${source} | Frame ${item.frame_idx}</strong><span>${time}s | ${kind}</span></div>
       <button onclick="loadAnnotateFrame(${item.frame_idx})">Ir</button>
     </div>`;
   }).join('');
 }
 
-function deleteBox(i) { a.boxes.splice(i, 1); a.sobel = null; updateSobelInfo(); updateBoxes(); drawAll(); }
+function deleteBox(i) { a.boxes.splice(i, 1); a.sobel = null; a.pieces = []; updateSobelInfo(); updateBoxes(); drawAll(); }
 function undoBox() {
   if (a.cornerA) { a.cornerA = null; a.preview = null; }
   else a.boxes.pop();
   a.sobel = null;
+  a.pieces = [];
   updateSobelInfo();
   updateBoxes(); drawAll();
 }
-function clearBoxes() { a.boxes = []; a.cornerA = null; a.preview = null; a.sobel = null; updateSobelInfo(); updateBoxes(); drawAll(); }
+function clearBoxes() {
+  a.boxes = []; a.cornerA = null; a.preview = null; a.sobel = null; a.pieces = [];
+  updateSobelInfo(); updateBoxes(); drawAll();
+}
 
 async function saveFrame() {
   const payload = {
@@ -2485,9 +3731,17 @@ installPanZoom(a, document.getElementById('a-zoom'), document.getElementById('a-
     const b = {x1: a.cornerA.x, y1: a.cornerA.y, x2: p.x, y2: p.y};
     const nb = normBox(b);
     a.cornerA = null; a.preview = null;
-    if (nb.w >= 4 && nb.h >= 4) a.boxes.push(b);
+    if (nb.w >= 4 && nb.h >= 4) {
+      const conflictIndex = a.boxes.findIndex(existing => boxOverlapFraction(nb, normBox(existing)) >= 0.35);
+      if (conflictIndex >= 0) {
+        status(`El nuevo box ocupa el mismo espacio que la anotacion #${conflictIndex + 1}.`, 'err');
+      } else {
+        a.boxes.push(b);
+      }
+    }
   }
   a.sobel = null;
+  a.pieces = [];
   updateSobelInfo();
   updateBoxes(); drawAll();
 });
@@ -2516,6 +3770,7 @@ document.addEventListener('keydown', ev => {
     if (ev.key === 'z' || ev.key === 'Z') undoMeasureSegment();
     if (ev.key === 'r' || ev.key === 'R') setMeasureMode('reference');
     if (ev.key === 'm' || ev.key === 'M') setMeasureMode('segment');
+    if (ev.key === 'e' || ev.key === 'E') setMeasureMode('exclusion');
     if (ev.key === 'ArrowLeft') stepMeasure(-1);
     if (ev.key === 'ArrowRight') stepMeasure(1);
     if (ev.key === 'ArrowUp') stepMeasure(-30);
@@ -2549,9 +3804,11 @@ window.addEventListener('resize', () => { fitAll(); drawAll(); });
 
 app = Flask(__name__)
 _args: argparse.Namespace
+_video_playlist: dict | None = None
 _image: np.ndarray | None = None
 _source_label = ""
 _yolo_model = None
+_piece_box_profile_cache: dict | None = None
 
 
 @app.route("/")
@@ -2562,10 +3819,14 @@ def index():
 @app.route("/api/meta")
 def api_meta():
     try:
-        data = video_meta(_args.video)
+        if _video_playlist is None:
+            raise RuntimeError("La playlist de videos no esta inicializada")
+        data = public_playlist_meta(_video_playlist)
         data["dataset_dir"] = str(_args.dataset_dir)
+        data["video_dir"] = str(_args.video_dir) if _args.video_dir is not None else None
         data["homography_exists"] = homography_json_path().exists()
         data["measurement_exists"] = measurement_json_path().exists()
+        data["piece_box_profile"] = load_piece_box_geometry_profile()
         return jsonify(data)
     except Exception as exc:
         return jsonify(error=str(exc)), 500
@@ -2733,7 +3994,7 @@ def api_annotate_frame():
     data = request.get_json() or {}
     try:
         frame_idx = int(data.get("frame_idx", 0))
-        frame, frame_idx, time_sec = read_frame_by_index(_args.video, frame_idx)
+        frame, frame_idx, time_sec, source = read_active_frame_by_index(frame_idx)
         frame, homography = apply_saved_homography(frame)
         saved_meta = saved_frame_metadata(frame_idx)
         hgt, wid = frame.shape[:2]
@@ -2746,6 +4007,7 @@ def api_annotate_frame():
             boxes=(saved_meta or {}).get("boxes", []),
             is_saved=saved_meta is not None or (_args.dataset_dir / "images" / f"{frame_stem(frame_idx)}.jpg").exists(),
             homography_source=homography.get("source", ""),
+            source=source,
         )
     except Exception as exc:
         return jsonify(error=str(exc)), 500
@@ -2756,7 +4018,7 @@ def api_measure_frame():
     data = request.get_json() or {}
     try:
         frame_idx = int(data.get("frame_idx", 0))
-        frame, frame_idx, time_sec = read_frame_by_index(_args.video, frame_idx)
+        frame, frame_idx, time_sec, source = read_active_frame_by_index(frame_idx)
         frame, homography = apply_saved_homography(frame)
         hgt, wid = frame.shape[:2]
         return jsonify(
@@ -2767,6 +4029,7 @@ def api_measure_frame():
             time_sec=time_sec,
             calibration=load_measurement_calibration(),
             homography_source=homography.get("source", ""),
+            source=source,
         )
     except Exception as exc:
         return jsonify(error=str(exc)), 500
@@ -2785,6 +4048,14 @@ def api_measure_save():
     data = request.get_json() or {}
     try:
         segments = data.get("segments") or []
+        image_shape = (
+            max(0, int(data.get("img_h", 0))),
+            max(0, int(data.get("img_w", 0))),
+        )
+        exclusion_zones = normalize_exclusion_zones(
+            data.get("exclusion_zones") or [],
+            image_shape=image_shape if all(image_shape) else None,
+        )
         valid = [
             seg
             for seg in segments
@@ -2804,6 +4075,8 @@ def api_measure_save():
             "segments": segments,
             "reference_y": data.get("reference_y"),
             "reference_offset_in": MEASUREMENT_REFERENCE_OFFSET_IN,
+            "exclusion_zones": exclusion_zones,
+            "exclusion_max_box_overlap": EXCLUSION_ZONE_MAX_BOX_OVERLAP,
             "inch_per_px": inch_per_px,
             "px_per_in": (1.0 / float(inch_per_px)) if inch_per_px else None,
             "homography_path": str(homography_json_path()),
@@ -2823,15 +4096,22 @@ def api_annotate_predict():
     try:
         frame_idx = int(data.get("frame_idx", 0))
         conf = float(data.get("conf", 0.10))
-        frame, frame_idx, time_sec = read_frame_by_index(_args.video, frame_idx)
+        frame, frame_idx, time_sec, source = read_active_frame_by_index(frame_idx)
         frame, _homography = apply_saved_homography(frame)
-        boxes = predict_yolo_boxes(frame, conf=conf)
+        calibration = load_measurement_calibration()
+        boxes, box_rules = predict_yolo_boxes_with_rules(
+            frame,
+            conf=conf,
+            exclusion_zones=calibration.get("exclusion_zones"),
+        )
         return jsonify(
             frame_idx=frame_idx,
             time_sec=time_sec,
             boxes=boxes,
             count=len(boxes),
+            box_rules=box_rules,
             model=str(_args.model),
+            source=source,
         )
     except Exception as exc:
         return jsonify(error=str(exc)), 500
@@ -2844,24 +4124,34 @@ def api_annotate_sobel_projection():
         frame_idx = int(data.get("frame_idx", 0))
         conf = float(data.get("conf", 0.10))
         boxes = data.get("boxes") or []
-        frame, frame_idx, time_sec = read_frame_by_index(_args.video, frame_idx)
+        frame, frame_idx, time_sec, source = read_active_frame_by_index(frame_idx)
         frame, _homography = apply_saved_homography(frame)
-        box = best_box_for_projection(frame, boxes, conf=conf)
-        if box is None:
-            return jsonify(
-                frame_idx=frame_idx,
-                time_sec=time_sec,
-                has_roi=False,
-                is_valid=False,
-                roi=None,
-                roi_box=None,
-                line=None,
-                points=[],
-                edge_confidence=0.0,
-                crm_px=0.0,
+        calibration = load_measurement_calibration()
+        if boxes:
+            candidates = boxes
+            box_rules = None
+        else:
+            candidates, box_rules = predict_yolo_boxes_with_rules(
+                frame,
+                conf=conf,
+                exclusion_zones=calibration.get("exclusion_zones"),
             )
-        result = sobel_projection_for_box(frame, box)
-        result.update(frame_idx=frame_idx, time_sec=time_sec)
+        pieces, measurement_summary = analyze_piece_boxes(
+            frame,
+            candidates,
+            calibration,
+            frame_idx=frame_idx,
+            time_sec=time_sec,
+        )
+        primary = primary_piece_analysis(pieces)
+        result = dict(primary["sobel"]) if primary else empty_sobel_result(frame_idx, time_sec)
+        result.update(
+            pieces=pieces,
+            measurement_summary=measurement_summary,
+            measurements=[piece["measurement"] for piece in pieces],
+            box_rules=box_rules,
+            source=source,
+        )
         return jsonify(result)
     except Exception as exc:
         return jsonify(error=str(exc)), 500
@@ -2873,33 +4163,25 @@ def api_player_frame():
     try:
         frame_idx = int(data.get("frame_idx", 0))
         conf = float(data.get("conf", 0.10))
-        frame, frame_idx, time_sec = read_frame_by_index(_args.video, frame_idx)
+        frame, frame_idx, time_sec, source = read_active_frame_by_index(frame_idx)
         frame, _homography = apply_saved_homography(frame)
-        boxes = predict_yolo_boxes(frame, conf=conf)
-        box = max(
-            boxes,
-            key=lambda item: float(item["w"]) * float(item["h"]) * float(item.get("conf", 1.0)),
-            default=None,
-        )
-        if box is None:
-            sobel = {
-                "frame_idx": frame_idx,
-                "time_sec": time_sec,
-                "has_roi": False,
-                "is_valid": False,
-                "roi": None,
-                "roi_box": None,
-                "line": None,
-                "points": [],
-                "edge_confidence": 0.0,
-                "crm_px": 0.0,
-            }
-        else:
-            sobel = sobel_projection_for_box(frame, box)
-            sobel.update(frame_idx=frame_idx, time_sec=time_sec)
-        hgt, wid = frame.shape[:2]
         calibration = load_measurement_calibration()
-        measurement = measurement_from_sobel(sobel, calibration, wid)
+        boxes, box_rules = predict_yolo_boxes_with_rules(
+            frame,
+            conf=conf,
+            exclusion_zones=calibration.get("exclusion_zones"),
+        )
+        hgt, wid = frame.shape[:2]
+        pieces, measurement_summary = analyze_piece_boxes(
+            frame,
+            boxes,
+            calibration,
+            frame_idx=frame_idx,
+            time_sec=time_sec,
+        )
+        primary = primary_piece_analysis(pieces)
+        sobel = primary["sobel"] if primary else empty_sobel_result(frame_idx, time_sec)
+        measurement = primary["measurement"] if primary else None
         return jsonify(
             image=img_to_b64(frame, quality=88),
             width=wid,
@@ -2908,10 +4190,14 @@ def api_player_frame():
             time_sec=time_sec,
             boxes=boxes,
             count=len(boxes),
+            box_rules=box_rules,
+            pieces=pieces,
+            measurement_summary=measurement_summary,
             sobel=sobel,
             calibration=calibration,
             measurement=measurement,
             model=str(_args.model),
+            source=source,
         )
     except Exception as exc:
         return jsonify(error=str(exc)), 500
@@ -2923,37 +4209,29 @@ def api_mvp_frame():
     try:
         frame_idx = int(data.get("frame_idx", 0))
         conf = float(data.get("conf", 0.10))
-        original, frame_idx, time_sec = read_frame_by_index(_args.video, frame_idx)
+        original, frame_idx, time_sec, source = read_active_frame_by_index(frame_idx)
         matrix, out_size, _homography = load_homography()
         rectified = cv2.warpPerspective(original, matrix, out_size)
-        boxes = predict_yolo_boxes(rectified, conf=conf)
-        box = max(
-            boxes,
-            key=lambda item: float(item["w"]) * float(item["h"]) * float(item.get("conf", 1.0)),
-            default=None,
+        calibration = load_measurement_calibration()
+        boxes, box_rules = predict_yolo_boxes_with_rules(
+            rectified,
+            conf=conf,
+            exclusion_zones=calibration.get("exclusion_zones"),
         )
-        if box is None:
-            sobel = {
-                "frame_idx": frame_idx,
-                "time_sec": time_sec,
-                "has_roi": False,
-                "is_valid": False,
-                "roi": None,
-                "roi_box": None,
-                "line": None,
-                "points": [],
-                "edge_confidence": 0.0,
-                "crm_px": 0.0,
-            }
-        else:
-            sobel = sobel_projection_for_box(rectified, box)
-            sobel.update(frame_idx=frame_idx, time_sec=time_sec)
 
         src_h, src_w = original.shape[:2]
         rect_h, rect_w = rectified.shape[:2]
-        calibration = load_measurement_calibration()
-        measurement = measurement_from_sobel(sobel, calibration, rect_w)
-        original_overlay = mvp_original_overlay(sobel, calibration, matrix, rect_w)
+        pieces, measurement_summary = analyze_piece_boxes(
+            rectified,
+            boxes,
+            calibration,
+            frame_idx=frame_idx,
+            time_sec=time_sec,
+        )
+        primary = primary_piece_analysis(pieces)
+        sobel = primary["sobel"] if primary else empty_sobel_result(frame_idx, time_sec)
+        measurement = primary["measurement"] if primary else None
+        original_overlay = mvp_original_overlay_for_pieces(pieces, calibration, matrix, rect_w)
         return jsonify(
             original_image=img_to_b64(original, quality=82),
             rectified_image=img_to_b64(rectified, quality=82),
@@ -2963,15 +4241,19 @@ def api_mvp_frame():
             rectified_height=rect_h,
             frame_idx=frame_idx,
             time_sec=time_sec,
-            fps=video_meta(_args.video)["fps"],
-            total_frames=video_meta(_args.video)["total_frames"],
+            fps=float(_video_playlist["fps"]),
+            total_frames=int(_video_playlist["total_frames"]),
             boxes=boxes,
             count=len(boxes),
+            box_rules=box_rules,
+            pieces=pieces,
+            measurement_summary=measurement_summary,
             sobel=sobel,
             calibration=calibration,
             measurement=measurement,
             original_overlay=original_overlay,
             front_y_ratio=(float(sobel["line"]["y"]) / float(rect_h)) if sobel.get("line") else None,
+            source=source,
         )
     except Exception as exc:
         return jsonify(error=str(exc)), 500
@@ -2991,7 +4273,7 @@ def api_player_capture_save():
     data = request.get_json() or {}
     try:
         frame_idx = int(data["frame_idx"])
-        frame, frame_idx, time_sec = read_frame_by_index(_args.video, frame_idx)
+        frame, frame_idx, time_sec, source = read_active_frame_by_index(frame_idx)
         frame, _homography = apply_saved_homography(frame)
         hgt, wid = frame.shape[:2]
 
@@ -3010,6 +4292,12 @@ def api_player_capture_save():
 
         sobel = data.get("sobel") if isinstance(data.get("sobel"), dict) else None
         boxes = data.get("boxes") if isinstance(data.get("boxes"), list) else []
+        pieces = data.get("pieces") if isinstance(data.get("pieces"), list) else []
+        measurement_summary = (
+            data.get("measurement_summary")
+            if isinstance(data.get("measurement_summary"), dict)
+            else summarize_piece_measurements(pieces)
+        )
         capture = {
             "id": capture_id,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -3022,7 +4310,11 @@ def api_player_capture_save():
             "sobel_valid": bool(sobel.get("is_valid")) if sobel else False,
             "sobel": sobel,
             "boxes_count": len(boxes),
+            "pieces": pieces,
+            "measurement_summary": measurement_summary,
+            "measurement_count": int(measurement_summary.get("valid_count", 0)),
             "image": str(image_path),
+            "source": source,
         }
 
         captures = [item for item in load_player_captures() if item.get("id") != capture_id]
@@ -3054,13 +4346,18 @@ def api_player_capture_delete(capture_id: str):
 def api_annotate_history():
     try:
         items = dataset_history()
-        return jsonify(items=items, count=len(items))
+        return jsonify(
+            items=items,
+            count=saved_piece_annotation_count(items),
+            candidate_count=sum(1 for item in items if item.get("candidate")),
+        )
     except Exception as exc:
         return jsonify(error=str(exc)), 500
 
 
 @app.route("/api/annotate/save", methods=["POST"])
 def api_annotate_save():
+    global _piece_box_profile_cache
     data = request.get_json() or {}
     try:
         frame_idx = int(data["frame_idx"])
@@ -3069,7 +4366,7 @@ def api_annotate_save():
         img_h = int(data["img_h"])
         boxes = data["boxes"]
 
-        frame, _frame_idx, _time_sec = read_frame_by_index(_args.video, frame_idx)
+        frame, _frame_idx, _time_sec, source = read_active_frame_by_index(frame_idx)
         frame, _homography = apply_saved_homography(frame)
 
         images_dir = _args.dataset_dir / "images"
@@ -3105,15 +4402,17 @@ def api_annotate_save():
                     "img_h": img_h,
                     "boxes": boxes,
                     "class_id": 0,
-                    "class_name": "tubo",
+                    "class_name": "piece",
+                    "source": source,
                 },
                 indent=2,
             ),
             encoding="utf-8",
         )
+        _piece_box_profile_cache = None
         history = dataset_history()
         return jsonify(
-            saved_count=len(history),
+            saved_count=saved_piece_annotation_count(history),
             history=history,
             image=str(image_path),
             label=str(label_path),
@@ -3124,8 +4423,10 @@ def api_annotate_save():
 
 
 def main() -> None:
-    global _args, _image, _source_label
+    global _args, _video_playlist, _image, _source_label
     _args = parse_args()
+    _video_playlist = build_video_playlist(discover_video_paths(_args))
+    _args.video = Path(_video_playlist["segments"][0]["path"])
     _args.output_dir.mkdir(parents=True, exist_ok=True)
     _args.dataset_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -3133,7 +4434,11 @@ def main() -> None:
     except Exception as exc:
         print(f"Advertencia al precargar frame: {exc}")
         _image = None
-        _source_label = str(_args.video)
+        _source_label = str(_args.video_dir or _args.video)
+    print(
+        f"  Playlist: {len(_video_playlist['segments'])} videos, "
+        f"{_video_playlist['duration_sec'] / 60.0:.1f} min"
+    )
     print(f"\n  TX2 Vision Tool en http://localhost:{_args.port}\n")
     app.run(host="0.0.0.0", port=_args.port, debug=False)
 

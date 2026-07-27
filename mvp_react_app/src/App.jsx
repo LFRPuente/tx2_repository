@@ -15,26 +15,32 @@ function imageSrc(base64) {
   return base64 ? `data:image/jpeg;base64,${base64}` : '';
 }
 
+function sourceLabel(source) {
+  return String(source?.video_name || '')
+    .replace(/^\d{8}_/, '')
+    .replace(/\.mkv$/i, '');
+}
+
 function validLine(line) {
   return line && ['x1', 'y1', 'x2', 'y2'].every((key) => Number.isFinite(Number(line[key])));
 }
 
 function PieceDiagram({ frame }) {
-  const ratio = frame?.front_y_ratio;
-  const hasLine = Number.isFinite(Number(ratio));
-  const frontY = hasLine ? clamp(Number(ratio) * 300 + 55, 150, 345) : 230;
-  const pieceCols = Array.from({ length: 12 }, (_, index) => index);
-  const referenceY = 213;
-  const packTop = 86;
-  const packBottom = Math.max(packTop + 24, frontY - 8);
-  const pieceHeight = Math.max(18, packBottom - packTop);
+  const pieces = Array.isArray(frame?.pieces) ? frame.pieces : [];
+  const rectWidth = Math.max(1, Number(frame?.rectified_width || 1));
+  const rectHeight = Math.max(1, Number(frame?.rectified_height || 1));
+  const mapY = (value) => clamp(76 + (Number(value) / rectHeight) * 260, 82, 344);
+  const referenceY = Number.isFinite(Number(frame?.calibration?.reference_y))
+    ? mapY(frame.calibration.reference_y)
+    : 220;
+  const summary = frame?.measurement_summary || {};
 
   return (
     <section className="panel diagram-panel">
       <div className="panel-heading">
         <div>
           <p className="eyebrow">Diagram</p>
-          <h2>Piece bundle</h2>
+          <h2>Individual pieces</h2>
         </div>
       </div>
 
@@ -54,16 +60,12 @@ function PieceDiagram({ frame }) {
             <stop offset="76%" stopColor="#929fa4" />
             <stop offset="100%" stopColor="#667278" />
           </linearGradient>
-          <linearGradient id="steelPackShade" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stopColor="#e6ebea" stopOpacity=".62" />
-            <stop offset="100%" stopColor="#c9d1cf" stopOpacity=".26" />
-          </linearGradient>
           <filter id="pieceShadow" x="-25%" y="-10%" width="150%" height="125%">
             <feDropShadow dx="0" dy="3" stdDeviation="2.2" floodColor="#253238" floodOpacity=".18" />
           </filter>
         </defs>
         <rect x="44" y="44" width="672" height="342" rx="8" fill="#f7faf8" stroke="#cbd6cf" strokeWidth="2" />
-        <rect x="72" y="82" width="616" height="262" rx="6" fill="#f9fbfa" stroke="#d9e0dc" />
+        <rect x="72" y="64" width="616" height="300" rx="6" fill="#f9fbfa" stroke="#d9e0dc" />
         <path d="M380 372 V96" stroke="#aeb8b2" strokeWidth="3" strokeDasharray="10 9" />
         <path d="M380 96 l-10 18 h20 z" fill="#aeb8b2" />
 
@@ -81,67 +83,39 @@ function PieceDiagram({ frame }) {
           Reference
         </text>
 
-        <rect
-          x="112"
-          y={packTop}
-          width="524"
-          height={Math.max(16, packBottom - packTop)}
-          rx="7"
-          fill="url(#steelPackShade)"
-        />
-
-        {pieceCols.map((col) => {
-          const x = 132 + col * 40;
-          const gradient = col % 2 ? 'url(#steelPieceB)' : 'url(#steelPieceA)';
-          const capStroke = col % 2 ? '#eef2f2' : '#d7dddf';
+        {pieces.map((piece, index) => {
+          const box = piece.box || {};
+          const centerRatio = (Number(box.x || 0) + Number(box.w || 0) / 2) / rectWidth;
+          const x = 92 + clamp(centerRatio, 0, 1) * 576;
+          const width = clamp((Number(box.w || 0) / rectWidth) * 576, 14, 38);
+          const lineY = piece?.sobel?.line?.y;
+          const frontY = Number.isFinite(Number(lineY)) ? mapY(lineY) : 260;
+          const gradient = index % 2 ? 'url(#steelPieceB)' : 'url(#steelPieceA)';
+          const capStroke = index % 2 ? '#eef2f2' : '#d7dddf';
+          const color = piece.valid ? '#15845c' : '#b8792f';
+          const value = piece.measurement?.measurement_in;
           return (
-            <g key={col} filter="url(#pieceShadow)">
-              <rect x={x} y={packTop} width="25" height={pieceHeight} rx="5" fill={gradient} stroke="#566268" strokeWidth="1.1" />
-              <rect x={x + 2.5} y={packTop + 3} width="20" height={Math.max(8, pieceHeight - 6)} rx="4" fill="none" stroke={capStroke} strokeWidth="1" opacity=".42" />
-              <line x1={x + 7} y1={packTop + 7} x2={x + 7} y2={packTop + pieceHeight - 8} stroke="#ffffff" strokeWidth="1.4" opacity=".48" />
-              <line x1={x + 18} y1={packTop + 7} x2={x + 18} y2={packTop + pieceHeight - 8} stroke="#3f4a50" strokeWidth="1.1" opacity=".24" />
+            <g key={piece.piece_id ?? index} filter="url(#pieceShadow)">
+              <rect x={x - width / 2} y="78" width={width} height={Math.max(12, frontY - 78)} rx="4" fill={gradient} stroke="#566268" strokeWidth="1.1" />
+              <rect x={x - width / 2 + 2} y="81" width={Math.max(8, width - 4)} height={Math.max(8, frontY - 84)} rx="3" fill="none" stroke={capStroke} strokeWidth="1" opacity=".42" />
+              <line x1={x - width / 2 - 3} x2={x + width / 2 + 3} y1={frontY} y2={frontY} stroke={color} strokeWidth="6" strokeLinecap="round" />
+              <text x={x} y={Math.min(372, frontY + 18 + (index % 2) * 15)} textAnchor="middle" fill={color} fontSize="11" fontWeight="900">
+                P{piece.piece_id} {Number.isFinite(Number(value)) ? fmt(value, 2) : '-'}
+              </text>
             </g>
           );
         })}
-
-        <line
-          x1="86"
-          x2="674"
-          y1={frontY}
-          y2={frontY}
-          stroke={hasLine ? '#15845c' : '#b78c38'}
-          strokeWidth="7"
-          strokeLinecap="round"
-          strokeDasharray={hasLine ? '0' : '12 10'}
-        />
-        <text x="96" y={frontY - 14} fill={hasLine ? '#116b4b' : '#8a6627'} fontSize="20" fontWeight="800">
-          Piece front
+        <text x="380" y="408" textAnchor="middle" fill="#1e2f3a" fontSize="17" fontWeight="800">
+          {pieces.length
+            ? `${Number(summary.valid_count || 0)} of ${pieces.length} valid measurements`
+            : 'No pieces detected'}
         </text>
-
-        {frame?.measurement && (
-          <g>
-            <line
-              x1="690"
-              x2="690"
-              y1={frontY}
-              y2={referenceY}
-              stroke="#2f5f9d"
-              strokeWidth="3"
-              strokeDasharray="7 6"
-            />
-            <circle cx="690" cy={frontY} r="6" fill="#15845c" />
-            <circle cx="690" cy={referenceY} r="6" fill="#2f5f9d" />
-            <text x="340" y="405" fill="#1e2f3a" fontSize="18" fontWeight="800">
-              Total {fmt(frame.measurement.measurement_in)} in | Distance {fmt(frame.measurement.delta_in)} in
-            </text>
-          </g>
-        )}
       </svg>
     </section>
   );
 }
 
-function ImageLine({ line, color, label, dashed = false, width, height, labelOffset = -14 }) {
+function ImageLine({ line, color, label, dashed = false, width, height, labelOffset = -14, compact = false }) {
   if (!validLine(line)) return null;
   const x1 = Number(line.x1);
   const y1 = Number(line.y1);
@@ -176,7 +150,7 @@ function ImageLine({ line, color, label, dashed = false, width, height, labelOff
         x={labelX}
         y={labelY}
         fill={color}
-        fontSize={Math.max(20, width / 70)}
+        fontSize={compact ? Math.max(13, width / 120) : Math.max(20, width / 70)}
         fontWeight="900"
         paintOrder="stroke"
         stroke="rgba(255,255,255,.92)"
@@ -194,7 +168,8 @@ function OriginalOverlay({ frame }) {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
 
   const overlay = frame?.original_overlay || {};
-  if (!validLine(overlay.reference_line) && !validLine(overlay.front_line)) return null;
+  const pieceFronts = Array.isArray(overlay.piece_fronts) ? overlay.piece_fronts : [];
+  if (!validLine(overlay.reference_line) && !pieceFronts.length && !validLine(overlay.front_line)) return null;
 
   return (
     <svg
@@ -204,7 +179,20 @@ function OriginalOverlay({ frame }) {
       aria-hidden="true"
     >
       <ImageLine line={overlay.reference_line} color="#2f5f9d" label="Reference" dashed width={width} height={height} labelOffset={34} />
-      <ImageLine line={overlay.front_line} color="#15845c" label="Piece front" width={width} height={height} labelOffset={-18} />
+      {pieceFronts.length ? pieceFronts.map((piece, index) => (
+        <ImageLine
+          key={piece.piece_id ?? index}
+          line={piece.line}
+          color={piece.valid ? '#15845c' : '#b8792f'}
+          label={`P${piece.piece_id}`}
+          width={width}
+          height={height}
+          labelOffset={index % 2 ? 24 : -12}
+          compact
+        />
+      )) : (
+        <ImageLine line={overlay.front_line} color="#15845c" label="Piece front" width={width} height={height} labelOffset={-18} />
+      )}
     </svg>
   );
 }
@@ -217,7 +205,9 @@ function OriginalImage({ frame }) {
           <p className="eyebrow">Live video</p>
           <h2>Original image</h2>
         </div>
-        <span className="state-pill neutral">Frame {frame?.frame_idx ?? '-'}</span>
+        <span className="state-pill neutral">
+          {sourceLabel(frame?.source) || 'Video'} | Frame {frame?.source?.source_frame_idx ?? frame?.frame_idx ?? '-'}
+        </span>
       </div>
       <div className="image-stage">
         {frame?.original_image ? (
@@ -239,6 +229,46 @@ function Metric({ label, value, tone = '' }) {
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
+  );
+}
+
+function PieceMeasurements({ pieces }) {
+  if (!pieces.length) return null;
+  return (
+    <section className="panel piece-results">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">Measurements</p>
+          <h2>Individual piece results</h2>
+        </div>
+      </div>
+      <div className="piece-table-wrap">
+        <table className="piece-table">
+          <thead>
+            <tr>
+              <th>Piece</th>
+              <th>Total</th>
+              <th>Distance to reference</th>
+              <th>YOLO confidence</th>
+              <th>Sobel confidence</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pieces.map((piece) => (
+              <tr key={piece.piece_id}>
+                <td>P{piece.piece_id}</td>
+                <td>{piece.measurement ? `${fmt(piece.measurement.measurement_in)} in` : '-'}</td>
+                <td>{piece.measurement ? `${fmt(piece.measurement.delta_in)} in` : '-'}</td>
+                <td>{fmt(piece.confidence, 2)}</td>
+                <td>{fmt(piece.sobel?.edge_confidence, 2)}</td>
+                <td><span className={`result-state ${piece.valid ? 'valid' : 'review'}`}>{piece.valid ? 'Valid' : 'Review'}</span></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 
@@ -302,7 +332,8 @@ export default function App() {
   const maxFrame = Math.max(0, Number(meta?.total_frames || frame?.total_frames || 1) - 1);
   const fps = Number(meta?.fps || frame?.fps || 30);
   const timeSec = frame ? frame.time_sec : frameIdx / fps;
-  const measured = frame?.measurement;
+  const pieces = Array.isArray(frame?.pieces) ? frame.pieces : [];
+  const summary = frame?.measurement_summary || {};
 
   useEffect(() => {
     if (!playing || loading || !meta) return undefined;
@@ -391,14 +422,17 @@ export default function App() {
         <section className="metrics">
           <Metric label="Time" value={`${fmt(timeSec, 2)} s`} />
           <Metric label="Frame" value={frame?.frame_idx ?? frameIdx} />
-          <Metric label="Total measurement" value={measured ? `${fmt(measured.measurement_in)} in` : '-'} tone="total" />
-          <Metric label="Distance to ref" value={measured ? `${fmt(measured.delta_in)} in` : '-'} tone="reference" />
+          <Metric label="Detected pieces" value={pieces.length} />
+          <Metric label="Valid measurements" value={`${Number(summary.valid_count || 0)} / ${pieces.length}`} tone="total" />
+          <Metric label="Minimum" value={summary.minimum_in == null ? '-' : `${fmt(summary.minimum_in)} in`} />
+          <Metric label="Maximum" value={summary.maximum_in == null ? '-' : `${fmt(summary.maximum_in)} in`} tone="reference" />
         </section>
 
         <section className="main-grid">
           <PieceDiagram frame={frame} />
           <OriginalImage frame={frame} />
         </section>
+        <PieceMeasurements pieces={pieces} />
       </main>
     </div>
   );

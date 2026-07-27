@@ -33,10 +33,12 @@ if str(ROOT) not in sys.path:
 
 import homography_web_app as vision
 
-DEFAULT_VIDEO = Path(r"C:\Users\luis_\Downloads\20260508_000307_7F66.mkv")
+DEFAULT_VIDEO = Path(r"C:\Users\luis_\Downloads\20260724_10\20260724_100105_6439.mkv")
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
-DEFAULT_DATASET_DIR = ROOT / "dataset"
-DEFAULT_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_tubos_v1" / "weights" / "best.pt"
+DEFAULT_DATASET_DIR = ROOT / "dataset_pieces"
+DEFAULT_PIECE_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v1" / "weights" / "best.pt"
+DEFAULT_LEGACY_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_tubos_v1" / "weights" / "best.pt"
+DEFAULT_MODEL = DEFAULT_PIECE_MODEL if DEFAULT_PIECE_MODEL.exists() else DEFAULT_LEGACY_MODEL
 DEFAULT_ENDPOINT = "opc.tcp://10.14.6.48:49320"
 DEFAULT_WATCHDOG_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.VisionWD"
 DEFAULT_EVENT_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.MeasureLength"
@@ -182,35 +184,75 @@ def draw_line(img: np.ndarray, line: dict | None, color: tuple[int, int, int], l
     cv2.putText(img, label, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
 
-def draw_rectified_overlay(rectified: np.ndarray, boxes: list[dict], sobel: dict, calibration: dict) -> np.ndarray:
+def draw_rectified_overlay(
+    rectified: np.ndarray,
+    pieces: list[dict],
+    calibration: dict,
+) -> np.ndarray:
     out = rectified.copy()
-    for box in boxes:
+    for index, piece in enumerate(pieces):
+        box = piece["box"]
+        piece_id = int(piece["piece_id"])
+        color = (62, 214, 166) if piece.get("valid") else (48, 156, 220)
         x0 = int(float(box["x"]))
         y0 = int(float(box["y"]))
         x1 = int(float(box["x"]) + float(box["w"]))
         y1 = int(float(box["y"]) + float(box["h"]))
-        cv2.rectangle(out, (x0, y0), (x1, y1), (62, 214, 166), 2, cv2.LINE_AA)
+        cv2.rectangle(out, (x0, y0), (x1, y1), color, 2, cv2.LINE_AA)
         cv2.putText(
             out,
-            f"{float(box.get('conf', 0.0)):.2f}",
+            f"P{piece_id} {float(box.get('conf', 0.0)):.2f}",
             (x0 + 3, max(18, y0 - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            (62, 214, 166),
+            color,
             2,
             cv2.LINE_AA,
         )
+        draw_line(out, (piece.get("sobel") or {}).get("line"), color, f"P{piece_id}")
+        measurement = piece.get("measurement")
+        if isinstance(measurement, dict):
+            label = f"{float(measurement['measurement_in']):.3f} in"
+            label_y = min(
+                out.shape[0] - 8,
+                max(24, int(float(measurement["line_y"])) + 24 + (index % 2) * 18),
+            )
+            cv2.putText(
+                out,
+                label,
+                (x0 + 2, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                out,
+                label,
+                (x0 + 2, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
     if calibration.get("reference_y") is not None:
         y = float(calibration["reference_y"])
         draw_line(out, {"x1": 0, "y1": y, "x2": out.shape[1] - 1, "y2": y}, (210, 130, 48), "REF")
-    draw_line(out, (sobel or {}).get("line"), (40, 210, 128), "front")
     return out
 
 
 def draw_original_overlay(original: np.ndarray, overlay: dict) -> np.ndarray:
     out = original.copy()
     draw_line(out, overlay.get("reference_line"), (210, 130, 48), "REF")
-    draw_line(out, overlay.get("front_line"), (40, 210, 128), "front")
+    piece_fronts = overlay.get("piece_fronts") or []
+    if piece_fronts:
+        for item in piece_fronts:
+            color = (40, 210, 128) if item.get("valid") else (48, 156, 220)
+            draw_line(out, item.get("line"), color, f"P{int(item['piece_id'])}")
+    else:
+        draw_line(out, overlay.get("front_line"), (40, 210, 128), "front")
     return out
 
 
@@ -448,36 +490,23 @@ class LiveProcessor:
         matrix, out_size, _homography = vision.load_homography()
         rectified = cv2.warpPerspective(original, matrix, out_size)
         boxes = vision.predict_yolo_boxes(rectified, conf=float(self.args.conf), imgsz=int(self.args.imgsz))
-        box = max(
-            boxes,
-            key=lambda candidate: float(candidate["w"]) * float(candidate["h"]) * float(candidate.get("conf", 1.0)),
-            default=None,
-        )
-
-        if box is None:
-            sobel = {
-                "frame_idx": int(item["index"]),
-                "time_sec": None,
-                "has_roi": False,
-                "is_valid": False,
-                "roi": None,
-                "roi_box": None,
-                "line": None,
-                "points": [],
-                "edge_confidence": 0.0,
-                "crm_px": 0.0,
-            }
-        else:
-            sobel = vision.sobel_projection_for_box(rectified, box)
-            sobel.update(frame_idx=int(item["index"]), time_sec=None)
 
         rect_h, rect_w = rectified.shape[:2]
         src_h, src_w = original.shape[:2]
         calibration = vision.load_measurement_calibration()
-        measurement = vision.measurement_from_sobel(sobel, calibration, rect_w)
-        original_overlay = vision.mvp_original_overlay(sobel, calibration, matrix, rect_w)
+        pieces, measurement_summary = vision.analyze_piece_boxes(
+            rectified,
+            boxes,
+            calibration,
+            frame_idx=int(item["index"]),
+            time_sec=None,
+        )
+        primary = vision.primary_piece_analysis(pieces)
+        sobel = primary["sobel"] if primary else vision.empty_sobel_result(int(item["index"]), None)
+        measurement = primary["measurement"] if primary else None
+        original_overlay = vision.mvp_original_overlay_for_pieces(pieces, calibration, matrix, rect_w)
         original_viz = draw_original_overlay(original, original_overlay)
-        rectified_viz = draw_rectified_overlay(rectified, boxes, sobel, calibration)
+        rectified_viz = draw_rectified_overlay(rectified, pieces, calibration)
 
         return {
             "frame_index": int(item["index"]),
@@ -492,10 +521,17 @@ class LiveProcessor:
             "rectified_image": img_to_b64(rectified_viz, quality=82),
             "boxes": boxes,
             "count": len(boxes),
+            "pieces": pieces,
+            "measurement_summary": measurement_summary,
             "sobel": sobel,
             "calibration": calibration,
             "measurement": measurement,
             "front_y_ratio": (float(sobel["line"]["y"]) / float(rect_h)) if sobel.get("line") else None,
+            "piece_front_y_ratios": [
+                float(piece["sobel"]["line"]["y"]) / float(rect_h)
+                for piece in pieces
+                if (piece.get("sobel") or {}).get("line")
+            ],
             "model": str(self.args.model),
             "conf": float(self.args.conf),
             "_recording_frame": {
@@ -920,13 +956,20 @@ h2 { font-size: 16px; }
 
     <section class="panel">
       <svg class="diagram" viewBox="0 0 760 310" role="img" aria-label="Measurement diagram">
+        <defs>
+          <linearGradient id="live-steel" x1="0" x2="1">
+            <stop offset="0%" stop-color="#69777c" />
+            <stop offset="42%" stop-color="#d6dcde" />
+            <stop offset="72%" stop-color="#929da1" />
+            <stop offset="100%" stop-color="#5a666b" />
+          </linearGradient>
+        </defs>
         <rect x="38" y="34" width="684" height="232" rx="8" fill="#f7faf8" stroke="#cbd6cf" stroke-width="2" />
-        <rect x="86" y="82" width="588" height="132" rx="6" fill="#e5ece8" stroke="#c0cbc6" />
-        <line x1="92" x2="668" y1="156" y2="156" stroke="#d28230" stroke-width="5" stroke-linecap="round" stroke-dasharray="12 9" />
-        <text x="104" y="184" fill="#a66324" font-size="20" font-weight="900">REF</text>
-        <line id="diagram-front" x1="92" x2="668" y1="205" y2="205" stroke="#28a96e" stroke-width="7" stroke-linecap="round" />
-        <text id="diagram-label" x="104" y="235" fill="#14784f" font-size="20" font-weight="900">front</text>
-        <line id="diagram-measure" x1="700" x2="700" y1="156" y2="205" stroke="#243c48" stroke-width="3" stroke-dasharray="8 7" />
+        <rect x="86" y="58" width="588" height="182" rx="6" fill="#edf2ef" stroke="#c0cbc6" />
+        <line id="diagram-reference" x1="92" x2="668" y1="156" y2="156" stroke="#d28230" stroke-width="4" stroke-linecap="round" stroke-dasharray="10 8" />
+        <text id="diagram-reference-label" x="100" y="180" fill="#a66324" font-size="16" font-weight="900">REFERENCE</text>
+        <g id="diagram-pieces"></g>
+        <text id="diagram-summary" x="380" y="286" text-anchor="middle" fill="#243c48" font-size="17" font-weight="900">Waiting for pieces</text>
       </svg>
     </section>
   </main>
@@ -957,13 +1000,44 @@ function pill(el, text, tone) {
   el.className = `pill ${tone || ''}`.trim();
 }
 
-function updateDiagram(ratio) {
-  const has = Number.isFinite(Number(ratio));
-  const y = has ? Math.max(112, Math.min(238, 92 + Number(ratio) * 160)) : 205;
-  $('diagram-front').setAttribute('y1', y);
-  $('diagram-front').setAttribute('y2', y);
-  $('diagram-label').setAttribute('y', Math.max(118, Math.min(252, y + 30)));
-  $('diagram-measure').setAttribute('y2', y);
+function updateDiagram(result) {
+  const pieces = Array.isArray(result?.pieces) ? result.pieces : [];
+  const rectWidth = Math.max(1, Number(result?.rectified_width || 1));
+  const rectHeight = Math.max(1, Number(result?.rectified_height || 1));
+  const mapY = (value) => Math.max(66, Math.min(232, 58 + (Number(value) / rectHeight) * 182));
+  const referenceValue = result?.calibration?.reference_y;
+  const referenceY = Number.isFinite(Number(referenceValue)) ? mapY(referenceValue) : 156;
+  $('diagram-reference').setAttribute('y1', referenceY);
+  $('diagram-reference').setAttribute('y2', referenceY);
+  $('diagram-reference-label').setAttribute('y', Math.min(252, referenceY + 22));
+
+  $('diagram-pieces').innerHTML = pieces.map((piece, index) => {
+    const box = piece.box || {};
+    const lineY = piece?.sobel?.line?.y;
+    if (!Number.isFinite(Number(lineY))) return '';
+    const centerRatio = (Number(box.x || 0) + Number(box.w || 0) / 2) / rectWidth;
+    const x = 92 + Math.max(0, Math.min(1, centerRatio)) * 576;
+    const width = Math.max(12, Math.min(34, (Number(box.w || 0) / rectWidth) * 576));
+    const frontY = mapY(lineY);
+    const valid = Boolean(piece.valid);
+    const color = valid ? '#16845a' : '#c5782d';
+    const measurement = piece.measurement?.measurement_in;
+    const label = Number.isFinite(Number(measurement)) ? Number(measurement).toFixed(2) : '-';
+    return `
+      <g>
+        <rect x="${x - width / 2}" y="68" width="${width}" height="${Math.max(8, frontY - 68)}" rx="3"
+          fill="url(#live-steel)" stroke="#536066" stroke-width="1" />
+        <line x1="${x - width / 2 - 2}" x2="${x + width / 2 + 2}" y1="${frontY}" y2="${frontY}"
+          stroke="${color}" stroke-width="5" stroke-linecap="round" />
+        <text x="${x}" y="${Math.min(254, frontY + 17 + (index % 2) * 14)}" text-anchor="middle"
+          fill="${color}" font-size="11" font-weight="900">P${Number(piece.piece_id)} ${label}</text>
+      </g>`;
+  }).join('');
+
+  const summary = result?.measurement_summary || {};
+  $('diagram-summary').textContent = pieces.length
+    ? `${Number(summary.valid_count || 0)} / ${pieces.length} valid piece measurements`
+    : 'No pieces detected';
 }
 
 function signalTime(trigger) {
@@ -1009,7 +1083,7 @@ async function refreshFrame() {
     const result = data.result;
     if (!result) return;
     setImage($('original-stage'), result.original_image, 'Live camera');
-    updateDiagram(result.front_y_ratio);
+    updateDiagram(result);
   } catch (err) {
     pill($('top-state'), 'frame error', 'err');
   }
@@ -1130,13 +1204,13 @@ function metric(label, value) {
 function renderSnapshots(snapshots) {
   if (!snapshots || !snapshots.length) return '<div class="empty">No processing snapshots saved for this clip.</div>';
   return `<div class="snapshots">${snapshots.map((snap) => {
-    const measurement = snap.measurement || {};
-    const total = measurement.measurement_in != null ? `${fmt(measurement.measurement_in)} in` : '-';
-    const delta = measurement.delta_in != null ? `${fmt(measurement.delta_in)} in` : '-';
+    const summary = snap.measurement_summary || {};
+    const minimum = summary.minimum_in != null ? `${fmt(summary.minimum_in)} in` : '-';
+    const maximum = summary.maximum_in != null ? `${fmt(summary.maximum_in)} in` : '-';
     return `<article class="snapshot">
       <div class="snapshot-head">
         <span>${snap.processed_utc || snap.frame_utc || '-'}</span>
-        <span>YOLO ${snap.count ?? 0} | Total ${total} | REF ${delta}</span>
+        <span>Pieces ${snap.count ?? 0} | Valid ${summary.valid_count ?? 0} | ${minimum} to ${maximum}</span>
       </div>
       <div class="snapshot-grid">
         ${snap.original_overlay_url ? `<img src="${snap.original_overlay_url}" alt="Original overlay">` : '<div class="empty">No original overlay</div>'}

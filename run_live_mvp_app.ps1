@@ -3,9 +3,15 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $scriptPath = Join-Path $root "live_mvp_app.py"
 $outputDir = Join-Path $root "outputs"
-$datasetDir = Join-Path $root "dataset"
-$modelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_tubos_v1\weights\best.pt"
+$datasetDir = Join-Path $root "dataset_pieces"
+$pieceModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt"
+$legacyModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_tubos_v1\weights\best.pt"
+$modelPath = if (Test-Path -LiteralPath $pieceModelPath) { $pieceModelPath } else { $legacyModelPath }
 $cameraIp = "10.14.115.241"
+
+if ($modelPath -eq $legacyModelPath) {
+    Write-Warning "Individual-piece model not found. Live inference is using the legacy package model."
+}
 
 $candidates = @(
     (Get-Command python -ErrorAction SilentlyContinue).Source

@@ -2,10 +2,16 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $scriptPath = Join-Path $root "homography_web_app.py"
-$videoPath = "C:\Users\luis_\Downloads\20260508_000307_7F66.mkv"
+$videoDir = "C:\Users\luis_\Downloads\20260724_10"
 $outputDir = Join-Path $root "outputs"
-$datasetDir = Join-Path $root "dataset"
-$modelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_tubos_v1\weights\best.pt"
+$datasetDir = Join-Path $root "dataset_pieces"
+$pieceModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt"
+$legacyModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_tubos_v1\weights\best.pt"
+$modelPath = if (Test-Path -LiteralPath $pieceModelPath) { $pieceModelPath } else { $legacyModelPath }
+
+if ($modelPath -eq $legacyModelPath) {
+    Write-Warning "Individual-piece model not found. Annotation uses dataset_pieces; prediction still uses the legacy package model."
+}
 
 $candidates = @(
     (Get-Command python -ErrorAction SilentlyContinue).Source
@@ -32,8 +38,8 @@ if (-not $pythonExe) {
 }
 
 & $pythonExe $scriptPath `
-  --video $videoPath `
-  --second 155.0 `
+  --video-dir $videoDir `
+  --second 30.0 `
   --output-dir $outputDir `
   --dataset-dir $datasetDir `
   --model $modelPath `
