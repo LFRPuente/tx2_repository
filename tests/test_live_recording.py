@@ -36,6 +36,17 @@ class FakeOverlayProcessor:
         return {"result": None}
 
 
+class FakeSnapshotProcessor:
+    def __init__(self) -> None:
+        self.result: dict | None = None
+
+    def recording_frame(self) -> dict | None:
+        return None
+
+    def snapshot(self, include_images: bool = False) -> dict:
+        return {"result": self.result}
+
+
 class FrameBufferTests(unittest.TestCase):
     def test_capacity_is_bounded(self) -> None:
         buffer = FrameBuffer(maxlen=8)
@@ -105,6 +116,28 @@ class HistoryTests(unittest.TestCase):
 
 
 class ClipRecorderTests(unittest.TestCase):
+    def test_processing_snapshots_are_strictly_inside_the_plc_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            processor = FakeSnapshotProcessor()
+            recorder = ClipRecorder(
+                SimpleNamespace(record_seconds=8.0),
+                FrameBuffer(maxlen=8),
+                processor,
+            )
+            snapshots: list[dict] = []
+            seen: set[int] = set()
+            analysis_dir = Path(temp_dir)
+
+            for frame_index, frame_monotonic in ((1, 9.9), (2, 10.0), (3, 17.9), (4, 18.0)):
+                processor.result = {
+                    "frame_index": frame_index,
+                    "frame_utc": f"frame-{frame_index}",
+                    "frame_monotonic": frame_monotonic,
+                }
+                recorder._capture_processing_snapshot(analysis_dir, snapshots, seen, 10.0, 18.0)
+
+            self.assertEqual([item["frame_index"] for item in snapshots], [2, 3])
+
     def test_overlapping_events_keep_separate_fixed_duration_clips(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             args = SimpleNamespace(

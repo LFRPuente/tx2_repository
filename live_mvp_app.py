@@ -482,6 +482,7 @@ class LiveProcessor:
         return {
             "frame_index": int(item["index"]),
             "frame_utc": item["utc"],
+            "frame_monotonic": float(item["monotonic"]),
             "processed_utc": utc_now(),
             "original_width": src_w,
             "original_height": src_h,
@@ -549,6 +550,8 @@ class ClipRecorder:
         analysis_dir: Path,
         snapshots: list[dict[str, Any]],
         seen_frame_indices: set[int],
+        start_monotonic: float,
+        end_monotonic: float,
     ) -> None:
         if self.processor is None:
             return
@@ -558,6 +561,9 @@ class ClipRecorder:
             return
         frame_index = result.get("frame_index")
         if frame_index is None:
+            return
+        frame_monotonic = float(result.get("frame_monotonic", 0.0))
+        if frame_monotonic < start_monotonic or frame_monotonic >= end_monotonic:
             return
         frame_index = int(frame_index)
         if frame_index in seen_frame_indices:
@@ -648,9 +654,21 @@ class ClipRecorder:
                             last_written_source = last_source
                             frames_written += 1
                         last_source = item
-                self._capture_processing_snapshot(analysis_dir, processing_snapshots, seen_processing_frames)
+                self._capture_processing_snapshot(
+                    analysis_dir,
+                    processing_snapshots,
+                    seen_processing_frames,
+                    event_mono,
+                    deadline,
+                )
                 time.sleep(0.025)
-            self._capture_processing_snapshot(analysis_dir, processing_snapshots, seen_processing_frames)
+            self._capture_processing_snapshot(
+                analysis_dir,
+                processing_snapshots,
+                seen_processing_frames,
+                event_mono,
+                deadline,
+            )
 
             if writer is None or last_source is None:
                 raise RuntimeError("No frames were available to record the clip.")
