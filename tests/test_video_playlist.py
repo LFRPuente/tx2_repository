@@ -85,6 +85,22 @@ class VideoPlaylistTests(unittest.TestCase):
 
         self.assertEqual(matching, paths[1:])
 
+    def test_latest_format_filter_groups_small_fps_variations(self) -> None:
+        paths = [
+            Path("live_0001_raw.mp4"),
+            Path("live_0002_raw.mp4"),
+            Path("live_0003_raw.mp4"),
+        ]
+        metas = {
+            paths[0]: {"width": 2880, "height": 2160, "fps": 25.07},
+            paths[1]: {"width": 2880, "height": 2160, "fps": 24.96},
+            paths[2]: {"width": 2880, "height": 2160, "fps": 25.01},
+        }
+        with patch.object(vision, "video_meta", side_effect=lambda path: metas[path]):
+            matching = vision.latest_video_format_paths(paths)
+
+        self.assertEqual(matching, paths)
+
     def test_frame_read_retains_source_video_traceability(self) -> None:
         playlist = {
             "fps": 30.0,

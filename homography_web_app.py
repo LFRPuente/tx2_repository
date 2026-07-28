@@ -98,6 +98,14 @@ def video_meta(video_path: Path) -> dict:
     }
 
 
+def video_format_signature(meta: dict) -> tuple[int, int, int]:
+    return (
+        int(meta["width"]),
+        int(meta["height"]),
+        int(round(float(meta["fps"]))),
+    )
+
+
 def discover_video_paths(args: argparse.Namespace) -> list[Path]:
     video_dir = getattr(args, "video_dir", None)
     video = getattr(args, "video", None)
@@ -121,19 +129,12 @@ def latest_video_format_paths(video_paths: list[Path]) -> list[Path]:
     if not video_paths:
         return []
     latest_meta = video_meta(video_paths[-1])
-    latest_signature = (
-        int(latest_meta["width"]),
-        int(latest_meta["height"]),
-        float(latest_meta["fps"]),
-    )
+    latest_signature = video_format_signature(latest_meta)
     matching = []
     for path in video_paths:
         meta = video_meta(path)
-        signature = (int(meta["width"]), int(meta["height"]), float(meta["fps"]))
-        if (
-            signature[:2] == latest_signature[:2]
-            and abs(signature[2] - latest_signature[2]) <= 1e-3
-        ):
+        signature = video_format_signature(meta)
+        if signature == latest_signature:
             matching.append(path)
     return matching
 
@@ -147,13 +148,13 @@ def build_video_playlist(video_paths: list[Path]) -> dict:
     expected = None
     for path in video_paths:
         meta = video_meta(path)
-        signature = (int(meta["width"]), int(meta["height"]), float(meta["fps"]))
+        signature = video_format_signature(meta)
         if expected is None:
             expected = signature
-        elif signature[:2] != expected[:2] or abs(signature[2] - expected[2]) > 1e-3:
+        elif signature != expected:
             raise RuntimeError(
                 f"El video {path.name} no coincide con la playlist "
-                f"({signature[0]}x{signature[1]} @ {signature[2]:.3f} FPS)"
+                f"({signature[0]}x{signature[1]} @ {signature[2]} FPS nominales)"
             )
         total_frames = int(meta["total_frames"])
         segments.append(
