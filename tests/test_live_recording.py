@@ -8,6 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -20,6 +21,7 @@ from live_mvp_app import (
     HTML,
     HISTORY_HTML,
     ClipRecorder,
+    DatabaseReconciler,
     FrameBuffer,
     LiveProcessor,
     build_raw_rtsp_url,
@@ -103,6 +105,66 @@ class FakeDatabase:
 
     def delete_measurement_event(self, event_id: str) -> None:
         self.deleted_event_ids.append(event_id)
+
+
+class DatabaseReconcilerTests(unittest.TestCase):
+    def test_synced_sidecar_missing_from_database_is_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            clip_dir = output_dir / "live_plc_clips" / "2026-07-28"
+            clip_dir.mkdir(parents=True)
+            sidecar_path = clip_dir / "live_0001_raw.json"
+            sidecar_path.write_text(
+                json.dumps(
+                    {
+                        "event_id": "retained-event",
+                        "event_key": "retained-key",
+                        "event": {},
+                        "db_sync_status": "synced",
+                        "db_sync_backend": "sqlite",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class ReconcileDatabase:
+                backend_name = "sqlite"
+
+                def __init__(self) -> None:
+                    self.event_ids: set[str] = set()
+                    self.synced_paths: list[Path] = []
+
+                def all_measurement_event_ids(self) -> set[str]:
+                    return self.event_ids.copy()
+
+                def sync_sidecar(self, path: Path, _output_dir: Path) -> str:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    event_id = str(data["event_id"])
+                    self.event_ids.add(event_id)
+                    self.synced_paths.append(path)
+                    return event_id
+
+                def delete_measurement_event(self, event_id: str) -> None:
+                    self.event_ids.discard(event_id)
+
+            args = SimpleNamespace(
+                output_dir=output_dir,
+                plc_endpoint="opc.tcp://test",
+                event_node="ns=2;s=MeasureLength",
+                watchdog_node="ns=2;s=VisionWD",
+            )
+            database = ReconcileDatabase()
+            with patch(
+                "live_mvp_app.build_vision_configuration",
+                return_value={"configuration_hash": "test"},
+            ):
+                reconciler = DatabaseReconciler(args, database)
+
+            reconciler.sync_once()
+
+            self.assertEqual(database.synced_paths, [sidecar_path])
+            self.assertEqual(database.event_ids, {"retained-event"})
+            self.assertEqual(reconciler.snapshot()["synced"], 1)
 
 
 class FrameBufferTests(unittest.TestCase):

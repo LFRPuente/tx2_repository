@@ -1541,6 +1541,12 @@ class DatabaseReconciler:
     def sync_once(self) -> None:
         pending_paths = []
         backend = self.database.backend_name
+        all_event_ids = getattr(
+            self.database,
+            "all_measurement_event_ids",
+            None,
+        )
+        existing_event_ids = all_event_ids() if callable(all_event_ids) else None
         for path in clip_sidecars(self.args.output_dir):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
@@ -1549,6 +1555,11 @@ class DatabaseReconciler:
             if data and (
                 data.get("db_sync_status") == "pending"
                 or data.get("db_sync_backend") != backend
+                or (
+                    existing_event_ids is not None
+                    and data.get("event_id")
+                    and str(data["event_id"]) not in existing_event_ids
+                )
             ):
                 pending_paths.append(path)
         self._set_state(running=True, pending=len(pending_paths), last_run_utc=utc_now())
@@ -1588,11 +1599,6 @@ class DatabaseReconciler:
                 failed += 1
                 write_json_atomic(path, data)
         pruned = 0
-        all_event_ids = getattr(
-            self.database,
-            "all_measurement_event_ids",
-            None,
-        )
         if callable(all_event_ids):
             retained_event_ids: set[str] = set()
             can_prune = True
