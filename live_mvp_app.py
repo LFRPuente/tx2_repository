@@ -901,6 +901,7 @@ class ClipRecorder:
         self.lock = threading.Lock()
         self.configuration_lock = threading.Lock()
         self.vision_configuration: dict[str, Any] | None = None
+        self.configuration_fingerprint: tuple[tuple[str, int | None, int | None], ...] | None = None
         self.active_recordings: dict[int, float] = {}
         self.clip_index = 0
         self.last_clip: dict[str, Any] | None = None
@@ -974,12 +975,37 @@ class ClipRecorder:
             return self.processor.recording_frame()
         return self.buffer.latest()
 
+    def _configuration_files_fingerprint(
+        self,
+    ) -> tuple[tuple[str, int | None, int | None], ...]:
+        output_dir = Path(self.args.output_dir).resolve()
+        paths = (
+            output_dir / "homography_selection.json",
+            output_dir / "table_measurement_calibration.json",
+            Path(self.args.model).resolve(),
+        )
+        fingerprint = []
+        for path in paths:
+            try:
+                stat = path.stat()
+                fingerprint.append((str(path), stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                fingerprint.append((str(path), None, None))
+        return tuple(fingerprint)
+
     def _configuration_snapshot(self) -> dict[str, Any] | None:
         with self.configuration_lock:
             if self.vision_configuration is not None:
-                return self.vision_configuration
+                if self.configuration_fingerprint is None:
+                    return self.vision_configuration
+                fingerprint = self._configuration_files_fingerprint()
+                if fingerprint == self.configuration_fingerprint:
+                    return self.vision_configuration
+            else:
+                fingerprint = self._configuration_files_fingerprint()
             try:
                 self.vision_configuration = build_vision_configuration(self.args, ROOT)
+                self.configuration_fingerprint = fingerprint
             except (AttributeError, FileNotFoundError, ValueError):
                 if self.database is not None:
                     raise
