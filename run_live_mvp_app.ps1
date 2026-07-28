@@ -55,7 +55,15 @@ if (-not $pythonExe) {
 }
 
 if (-not $env:AXIS_USER) {
+    $env:AXIS_USER = [Environment]::GetEnvironmentVariable("AXIS_USER", "User")
+}
+
+if (-not $env:AXIS_USER) {
     $env:AXIS_USER = Read-Host "AXIS username"
+}
+
+if (-not $env:AXIS_PASSWORD) {
+    $env:AXIS_PASSWORD = [Environment]::GetEnvironmentVariable("AXIS_PASSWORD", "User")
 }
 
 if (-not $env:AXIS_PASSWORD) {
