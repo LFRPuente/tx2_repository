@@ -36,6 +36,9 @@ mvp_react_app/dist/
 *.jpg
 *.jpeg
 
+# Curated raw training clips are versioned through Git LFS.
+!training_videos/**/*.mp4
+
 # Keep curated YOLO datasets in Git.
 !dataset/images/**/*.jpg
 !dataset_yolo11/images/**/*.jpg
