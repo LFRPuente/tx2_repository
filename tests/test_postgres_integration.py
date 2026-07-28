@@ -71,9 +71,11 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
             analysis_dir = clip_dir / "clip_analysis"
             analysis_dir.mkdir(parents=True)
             video_path = clip_dir / "clip.mp4"
+            raw_video_path = clip_dir / "clip_raw.mp4"
             original_path = analysis_dir / "original.jpg"
             rectified_path = analysis_dir / "rectified.jpg"
             video_path.write_bytes(b"test-video")
+            raw_video_path.write_bytes(b"test-raw-video")
             original_path.write_bytes(b"test-original")
             rectified_path.write_bytes(b"test-rectified")
             sidecar_path = clip_dir / "clip.json"
@@ -112,6 +114,7 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
                 "first_frame_utc": "2026-07-27T12:00:00+00:00",
                 "last_frame_utc": "2026-07-27T12:00:08+00:00",
                 "video_path": str(video_path),
+                "raw_video_path": str(raw_video_path),
                 "processing_snapshots": [
                     {
                         "frame_index": 1,
@@ -159,6 +162,12 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
             self.assertEqual(len(matching), 1)
             detail = self.repository.get_measurement_event(event_id)
             self.assertEqual(len(detail["pieces"]), 1)
+            self.assertTrue(
+                any(
+                    asset["asset_type"] == "raw_video"
+                    for asset in detail["assets"]
+                )
+            )
             piece = detail["pieces"][0]
             self.repository.set_operator_measurement(
                 event_id=event_id,

@@ -66,10 +66,12 @@ Cuando esta integracion termine, un ciclo de produccion debe verse asi:
 13. Una nueva señal crea otra ventana fija de 8 segundos. Si ambas ventanas
     coinciden en el tiempo, se conservan como clips separados sin truncarlas.
 14. La ventana solo se conserva si YOLO detecta al menos una pieza. Si no
-    detecta ninguna, se eliminan el MP4, los snapshots temporales y el evento.
+    detecta ninguna, se eliminan ambos MP4, los snapshots temporales y el evento.
 15. El evento, sus piezas, snapshots y rutas de assets se guardan en PostgreSQL.
 16. En `History`, el operador puede capturar una medida real para cada pieza.
-17. La medida automatica nunca se sobrescribe. Cada cambio del operador queda
+17. Temporalmente, cada evento valido tambien copia el H.264 crudo desde un
+    stream AXIS separado a `2880x2160`, 60 FPS y sin overlays.
+18. La medida automatica nunca se sobrescribe. Cada cambio del operador queda
     auditado con usuario, hora, valor anterior, valor nuevo y motivo.
 
 ## 3. Aplicaciones del repositorio y responsabilidad de cada una
@@ -135,7 +137,7 @@ Responsabilidades actuales:
 - leer `VisionWD` y `MeasureLength` por OPC UA;
 - iniciar clips fijos de 8 segundos con señales rising del PLC;
 - conservar ventanas cercanas como clips independientes, incluso si se solapan;
-- guardar MP4, JSON y snapshots JPEG;
+- guardar MP4 procesado, MP4 raw temporal, JSON y snapshots JPEG;
 - servir una interfaz ligera en ingles;
 - mostrar historia de clips guardados.
 
@@ -186,6 +188,7 @@ implementado como backend temporal y migrable para no detener el Live MVP.
 | Formato `40' 9 1/16"` | Si | Si | Validacion visual |
 | PLC/OPC UA | Pruebas | Si | Endurecer reconexion y metricas |
 | Clips fijos de 8 s | No aplica | Si, ventanas independientes | Validacion de duracion/retencion |
+| RAW temporal 2880x2160/60 | No aplica | Implementado por copia H.264 | Retirar despues de recalibrar y entrenar |
 | SQLite temporal | No | Implementado | Migrar y retirar despues de validar PostgreSQL |
 | PostgreSQL | No | Implementado | Instalar/configurar servicio y ejecutar migraciones |
 | Edicion en History | No | Implementada | Validacion operativa y permisos |
@@ -199,13 +202,18 @@ desplegarse juntos:
 ```text
 outputs/homography_selection.json
 outputs/table_measurement_calibration.json
+runs/detect/runs_tx2/yolo11n_pieces_v2/weights/best.pt
 runs/detect/runs_tx2/yolo11n_pieces_v1/weights/best.pt
 ```
 
-No se debe copiar solo el modelo ni solo la homografia. Las coordenadas de boxes,
+El checkpoint v2 es opcional hasta completar el nuevo entrenamiento; los
+launchers usan v1 mientras no exista. No se debe copiar solo el modelo ni solo
+la homografia. Las coordenadas de boxes,
 zonas, referencia y Sobel viven en la imagen rectificada; por eso dependen de la
 misma matriz y del mismo `output_size`.
 
+La homografia desplegada fue seleccionada sobre una fuente `1920x1080` y debe
+recrearse con un RAW `2880x2160` antes de aceptar medidas del stream nativo.
 La calibracion desplegada preservada en esta rama no contiene actualmente
 `exclusion_zones`. El pipeline Live ya aplica y dibuja las zonas que reciba,
 pero no se deben recuperar coordenadas de una calibracion anterior. Las zonas
@@ -343,6 +351,12 @@ pequeno y no contiene negativos. Antes de confiar en la tasa de falsos positivos
 se deben guardar y entrenar frames sin piezas medibles. Las zonas rojas ayudan,
 pero no sustituyen ejemplos negativos.
 
+El siguiente entrenamiento se guarda como `yolo11n_pieces_v2`, parte del
+checkpoint v1 y usa `imgsz=1280`. Debe ejecutarse unicamente despues de revisar
+anotaciones representativas extraidas de los nuevos RAW `2880x2160`. La maquina
+actual tiene PyTorch sin CUDA; por ello el entrenamiento util queda pendiente de
+un host con GPU y del nuevo conjunto revisado.
+
 ### 5.5 Confianza alineada para validacion
 
 El tool y el launcher Live usan inicialmente:
@@ -360,10 +374,11 @@ no una aprobacion final de produccion.
 
 ```mermaid
 flowchart LR
-    Camera["AXIS camera<br/>RTSP 1920x1080"] --> Reader["CameraReader"]
+    Camera["AXIS camera<br/>RTSP 2880x2160 @ 10 FPS"] --> Reader["CameraReader"]
+    Camera --> RawCopy["Temporary H.264 copy<br/>2880x2160 @ 60 FPS"]
     Reader --> Buffer["Bounded FrameBuffer"]
     Buffer --> Processor["LiveProcessor"]
-    Processor --> Warp["Homography<br/>1191x404"]
+    Processor --> Warp["Homography<br/>recalibrated for native input"]
     Warp --> Yolo["YOLO11 individual pieces"]
     Config["Configuration files<br/>homography + calibration + red zones"] --> Warp
     Config --> Rules["Box rules + red-zone filter"]
@@ -378,7 +393,8 @@ flowchart LR
     Event --> Recorder["ClipRecorder"]
     Buffer --> Recorder
     Processor --> Recorder
-    Recorder --> Assets["MP4 + JPEG assets"]
+    RawCopy --> Recorder
+    Recorder --> Assets["Processed MP4 + raw MP4 + JPEG assets"]
     Recorder --> DB["PostgreSQL"]
     Measure --> DB
     Assets --> DB
@@ -906,6 +922,7 @@ CREATE TABLE event_asset (
     asset_type text NOT NULL
         CHECK (asset_type IN (
             'video',
+            'raw_video',
             'sidecar',
             'original_overlay',
             'rectified_overlay'
@@ -977,18 +994,20 @@ nueva fila por cada reconexion.
 ### 13.3 Al cerrar el clip
 
 1. Cerrar correctamente `VideoWriter`.
-2. Verificar si YOLO detecto al menos una pieza en cualquier snapshot de los
+2. Finalizar la copia H.264 raw temporal y verificar resolucion, FPS y duracion
+   desde el contenedor MP4.
+3. Verificar si YOLO detecto al menos una pieza en cualquier snapshot de los
    8 segundos.
-3. Si no hubo piezas, eliminar MP4, snapshots temporales y evento pendiente;
+4. Si no hubo piezas, eliminar ambos MP4, snapshots temporales y evento pendiente;
    no mostrar esa ventana en `History`.
-4. Elegir como snapshot canonico el primer frame procesado a partir de
+5. Elegir como snapshot canonico el primer frame procesado a partir de
    `señal PLC + 2.0 segundos`.
-5. Insertar sus piezas en `piece_measurement`.
-6. Insertar rutas en `event_asset`.
-7. Actualizar conteos y timestamps del evento.
-8. Marcar `complete` si todas las piezas son validas.
-9. Marcar `needs_review` si hay piezas invalidas o no hay snapshot confiable.
-10. Hacer commit de la transaccion.
+6. Insertar sus piezas en `piece_measurement`.
+7. Insertar rutas en `event_asset`.
+8. Actualizar conteos y timestamps del evento.
+9. Marcar `complete` si todas las piezas son validas.
+10. Marcar `needs_review` si hay piezas invalidas o no hay snapshot confiable.
+11. Hacer commit de la transaccion.
 
 Si falla el procesamiento, guardar el evento como `failed` y conservar
 `error_text` y los assets recuperables.
@@ -1114,6 +1133,7 @@ Debe devolver:
 - metadata de camara;
 - configuracion utilizada;
 - video y snapshot canonico de `PLC + 2.0 s`;
+- enlace al video raw temporal, cuando exista;
 - piezas ordenadas;
 - medida automatica;
 - medida de operador;
@@ -1296,7 +1316,12 @@ PostgreSQL debe guardar rutas relativas, por ejemplo:
 
 ```text
 live_plc_clips/2026-07-27/live_0001_..._rising.mp4
+live_plc_clips/2026-07-27/live_0001_..._rising_raw.mp4
 ```
+
+El primer archivo es el video procesado; el segundo es el stream crudo temporal.
+La retencion cuenta eventos y elimina ambos videos junto con el sidecar y la
+evidencia al superar 100 eventos.
 
 El backend resuelve la ruta contra `output_dir` y verifica que permanezca dentro
 de ese root antes de servirla. Se debe conservar la validacion equivalente a
@@ -1391,6 +1416,8 @@ temporal explicito, no una cola activada por errores de PostgreSQL.
 - [x] Hacer configurable `conf`.
 - [x] Hacer visible/configurable la IP de camara.
 - [x] Conservar credenciales AXIS fuera del repo.
+- [x] Pedir `2880x2160` para Live y para el RAW temporal.
+- [x] Mantener YOLO a 10 FPS y copiar H.264 raw a 60 FPS sin decodificar.
 
 ### `requirements.txt`
 
@@ -1514,8 +1541,8 @@ continua pendiente.
 
 ### 23.2 Integracion live
 
-- frame original conserva 1920x1080;
-- rectificado conserva 1191x404 con configuracion actual;
+- frame original conserva 2880x2160;
+- homografia y rectificado se recalibran con un RAW de esa resolucion;
 - modelo usado es el individual;
 - `box_rules` llega a `/api/live/frame`;
 - zonas se ven y filtran;
@@ -1529,7 +1556,9 @@ continua pendiente.
 - rising edge crea un evento;
 - un segundo rising edge crea otra ventana sin cerrar la anterior;
 - cada ventana contiene solo frames desde su señal hasta su limite de 8 segundos;
-- cada MP4 reporta 80 frames a 10 FPS y 8 segundos;
+- el MP4 procesado reporta 80 frames a 10 FPS y 8 segundos;
+- el MP4 raw reporta aproximadamente 480 frames a 60 FPS y 8 segundos;
+- el raw no contiene overlays ni perimetro verde;
 - la medicion canonica usa el primer frame procesado a partir de `PLC + 2.0 s`;
 - el perimetro verde marca ese instante en Live y en el MP4 procesado;
 - una ventana sin ninguna pieza detectada se descarta y no aparece en History;
@@ -1695,6 +1724,7 @@ Validar archivos:
 ```powershell
 Test-Path outputs\homography_selection.json
 Test-Path outputs\table_measurement_calibration.json
+Test-Path runs\detect\runs_tx2\yolo11n_pieces_v2\weights\best.pt
 Test-Path runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt
 ```
 
@@ -1731,6 +1761,11 @@ Ejecutar live:
 Antes de produccion confirmar la IP real de camara. El codigo/launcher actual
 usa `10.14.115.241`, mientras documentacion previa tambien menciona
 `10.14.115.74` y `10.14.115.75`. No se debe adivinar el endpoint final.
+
+La captura raw se habilita temporalmente con `--save-raw-clips`. Para retirarla,
+se elimina esa bandera y los argumentos `--raw-camera-resolution` y
+`--raw-record-fps` del launcher; los clips historicos permanecen hasta que la
+retencion normal elimine su evento.
 
 ## 28. Rollback
 

@@ -1189,6 +1189,11 @@ def _sidecar_assets(
         path = Path(str(video_path))
         if path.is_file():
             yield _asset_metadata(event_id, "video", path, output_dir, "video/mp4")
+    raw_video_path = sidecar.get("raw_video_path")
+    if raw_video_path:
+        path = Path(str(raw_video_path))
+        if path.is_file():
+            yield _asset_metadata(event_id, "raw_video", path, output_dir, "video/mp4")
     for snapshot in snapshots:
         for key, asset_type in (
             ("original_overlay_path", "original_overlay"),

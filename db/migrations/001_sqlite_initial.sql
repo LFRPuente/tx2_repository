@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS event_asset (
     event_id TEXT NOT NULL REFERENCES measurement_event(id) ON DELETE CASCADE,
     asset_type TEXT NOT NULL CHECK (asset_type IN (
         'video',
+        'raw_video',
         'sidecar',
         'original_overlay',
         'rectified_overlay'

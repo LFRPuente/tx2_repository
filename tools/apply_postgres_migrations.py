@@ -39,7 +39,11 @@ def main() -> int:
         print("ERROR: PostgreSQL support is not installed. Install requirements.txt.", file=sys.stderr)
         return 2
 
-    migrations = sorted(args.migrations_dir.glob("*.sql"))
+    migrations = sorted(
+        path
+        for path in args.migrations_dir.glob("*.sql")
+        if "_sqlite_" not in path.name
+    )
     if not migrations:
         print(f"ERROR: No migrations found in {args.migrations_dir}", file=sys.stderr)
         return 2
