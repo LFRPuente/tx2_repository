@@ -228,6 +228,10 @@ Live camera perimeter turns green and the same green perimeter is embedded in
 the processed MP4 for 0.8 seconds. The sidecar records the configured delay,
 the actual selected-frame offset, and the marked video frame range.
 
+The database reconciler also verifies retained sidecar event IDs against the
+active database. A sidecar marked as synced is imported again if its database
+row is missing, keeping History aligned with the 100 retained clips.
+
 The deployed `outputs/table_measurement_calibration.json` currently contains no
 `exclusion_zones`. The filtering and overlay support are active in code, but
 remain inert until zones are saved from the calibration tool. Do not restore
