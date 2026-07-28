@@ -127,22 +127,23 @@ class FrameBufferTests(unittest.TestCase):
 
 
 class RawCaptureTests(unittest.TestCase):
-    def test_raw_rtsp_requests_camera_native_resolution_and_sixty_fps(self) -> None:
+    def test_raw_rtsp_requests_camera_native_resolution_and_thirty_fps(self) -> None:
         args = SimpleNamespace(
             camera_user="axis user",
             camera_password="p@ss word",
             camera_ip="10.14.115.241",
             codec="h264",
             raw_camera_resolution="2880x2160",
-            raw_record_fps=60.0,
+            raw_record_fps=30.0,
             raw_rtsp_url="",
         )
 
         url = build_raw_rtsp_url(args)
 
         self.assertIn("resolution=2880x2160", url)
-        self.assertIn("fps=60", url)
-        self.assertIn("dynamicfps=0", url)
+        self.assertIn("fps=30", url)
+        self.assertIn("videozfpsmode=fixed", url)
+        self.assertIn("videokeyframeinterval=30", url)
         self.assertIn("axis%20user:p%40ss%20word@", url)
 
     def test_direct_raw_copy_is_only_used_for_camera_sources(self) -> None:

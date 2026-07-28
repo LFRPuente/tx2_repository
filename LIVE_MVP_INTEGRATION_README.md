@@ -70,7 +70,7 @@ Cuando esta integracion termine, un ciclo de produccion debe verse asi:
 15. El evento, sus piezas, snapshots y rutas de assets se guardan en PostgreSQL.
 16. En `History`, el operador puede capturar una medida real para cada pieza.
 17. Temporalmente, cada evento valido tambien copia el H.264 crudo desde un
-    stream AXIS separado a `2880x2160`, 60 FPS y sin overlays.
+    stream AXIS separado a `2880x2160`, 30 FPS y sin overlays.
 18. La medida automatica nunca se sobrescribe. Cada cambio del operador queda
     auditado con usuario, hora, valor anterior, valor nuevo y motivo.
 
@@ -188,7 +188,7 @@ implementado como backend temporal y migrable para no detener el Live MVP.
 | Formato `40' 9 1/16"` | Si | Si | Validacion visual |
 | PLC/OPC UA | Pruebas | Si | Endurecer reconexion y metricas |
 | Clips fijos de 8 s | No aplica | Si, ventanas independientes | Validacion de duracion/retencion |
-| RAW temporal 2880x2160/60 | No aplica | Implementado por copia H.264 | Retirar despues de recalibrar y entrenar |
+| RAW temporal 2880x2160/30 | No aplica | Implementado por copia H.264 | Retirar despues de recalibrar y entrenar |
 | SQLite temporal | No | Implementado | Migrar y retirar despues de validar PostgreSQL |
 | PostgreSQL | No | Implementado | Instalar/configurar servicio y ejecutar migraciones |
 | Edicion en History | No | Implementada | Validacion operativa y permisos |
@@ -375,7 +375,7 @@ no una aprobacion final de produccion.
 ```mermaid
 flowchart LR
     Camera["AXIS camera<br/>RTSP 2880x2160 @ 10 FPS"] --> Reader["CameraReader"]
-    Camera --> RawCopy["Temporary H.264 copy<br/>2880x2160 @ 60 FPS"]
+    Camera --> RawCopy["Temporary H.264 copy<br/>2880x2160 @ 30 FPS"]
     Reader --> Buffer["Bounded FrameBuffer"]
     Buffer --> Processor["LiveProcessor"]
     Processor --> Warp["Homography<br/>recalibrated for native input"]
@@ -1417,7 +1417,7 @@ temporal explicito, no una cola activada por errores de PostgreSQL.
 - [x] Hacer visible/configurable la IP de camara.
 - [x] Conservar credenciales AXIS fuera del repo.
 - [x] Pedir `2880x2160` para Live y para el RAW temporal.
-- [x] Mantener YOLO a 10 FPS y copiar H.264 raw a 60 FPS sin decodificar.
+- [x] Mantener YOLO a 10 FPS y copiar H.264 raw a 30 FPS sin decodificar.
 
 ### `requirements.txt`
 
@@ -1557,7 +1557,7 @@ continua pendiente.
 - un segundo rising edge crea otra ventana sin cerrar la anterior;
 - cada ventana contiene solo frames desde su señal hasta su limite de 8 segundos;
 - el MP4 procesado reporta 80 frames a 10 FPS y 8 segundos;
-- el MP4 raw reporta aproximadamente 480 frames a 60 FPS y 8 segundos;
+- el MP4 raw reporta aproximadamente 240 frames a 30 FPS y 8 segundos;
 - el raw no contiene overlays ni perimetro verde;
 - la medicion canonica usa el primer frame procesado a partir de `PLC + 2.0 s`;
 - el perimetro verde marca ese instante en Live y en el MP4 procesado;
