@@ -124,11 +124,12 @@ outputs/live_plc_clips/<YYYY-MM-DD>/*_raw.mp4
 ```
 
 It searches recursively, ignores processed MP4s when raw clips exist, and
-loads only raw clips that match the resolution and FPS of the newest recording.
-This prevents older Full HD material from being mixed with the new
-`2880x2160` source. The backend exposes the selected files as one continuous
-timeline while retaining the source video name, source frame index, and source
-timestamp in each annotation.
+loads only raw clips that match the resolution and nominal rounded FPS of the
+newest recording. Small container-reported FPS variations are grouped together
+without mixing older Full HD material with the new `2880x2160` source. The
+backend exposes the selected files as one continuous timeline while retaining
+the source video name, source frame index, and source timestamp in each
+annotation.
 
 The current homography was selected from a `1920x1080` source. Recreate and
 validate these files from a new `2880x2160` raw clip before accepting
