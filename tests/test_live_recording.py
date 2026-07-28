@@ -292,6 +292,43 @@ class HistoryTests(unittest.TestCase):
 
 
 class ClipRecorderTests(unittest.TestCase):
+    def test_configuration_snapshot_refreshes_after_calibration_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            homography_path = output_dir / "homography_selection.json"
+            calibration_path = output_dir / "table_measurement_calibration.json"
+            model_path = output_dir / "best.pt"
+            homography_path.write_text("{}", encoding="utf-8")
+            calibration_path.write_text('{"version": 1}', encoding="utf-8")
+            model_path.write_bytes(b"model")
+            recorder = ClipRecorder(
+                SimpleNamespace(
+                    output_dir=output_dir,
+                    model=model_path,
+                    conf=0.1,
+                    imgsz=960,
+                ),
+                FrameBuffer(maxlen=8),
+            )
+            configurations = [
+                {"calibration_sha256": "first"},
+                {"calibration_sha256": "second"},
+            ]
+
+            with patch(
+                "live_mvp_app.build_vision_configuration",
+                side_effect=configurations,
+            ) as build:
+                first = recorder._configuration_snapshot()
+                cached = recorder._configuration_snapshot()
+                calibration_path.write_text('{"version": 22}', encoding="utf-8")
+                refreshed = recorder._configuration_snapshot()
+
+            self.assertIs(first, cached)
+            self.assertEqual(first["calibration_sha256"], "first")
+            self.assertEqual(refreshed["calibration_sha256"], "second")
+            self.assertEqual(build.call_count, 2)
+
     def test_measurement_evidence_image_gets_a_green_perimeter(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             image_path = Path(temp_dir) / "evidence.jpg"
