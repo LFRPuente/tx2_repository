@@ -22,11 +22,13 @@ corrections into the real-time MVP is:
 - `tools/plc_triggered_video_recorder.py`: records AXIS RTSP clips when the PLC cut/measure tag changes.
 - `dataset/` and `dataset_yolo11/`: legacy package-front YOLO datasets.
 - `dataset_pieces/`: source annotations with one box per measurable piece.
+- `training_videos/`: curated native-resolution AXIS clips stored with Git LFS.
 - `prepare_yolo_dataset.py`: creates the piece train/validation split.
 - `train_yolo11_pieces.py`: trains the individual-piece YOLO11 detector.
 - `runs/detect/runs_tx2/yolo11n_tubos_v1/weights/best.pt`: legacy fallback model.
 
 Generated videos, local caches, `node_modules`, previews, and redundant checkpoints are intentionally ignored.
+Only reviewed raw clips under `training_videos/` are versioned.
 
 ## Individual Piece Detection
 
@@ -73,6 +75,16 @@ After annotating a representative set of frames:
 python prepare_yolo_dataset.py
 python train_yolo11_pieces.py
 ```
+
+Curated RAW clips can be downloaded on a training computer with:
+
+```powershell
+git lfs install
+git lfs pull --include="training_videos/**"
+```
+
+See [`training_videos/README.md`](training_videos/README.md) for clip hashes,
+capture metadata, and commands for opening a clip in the annotation tool.
 
 The v2 training command starts from the deployed individual-piece checkpoint
 when available, uses `imgsz=1280`, and never overwrites v1. Only reviewed
@@ -123,17 +135,17 @@ the Live MVP:
 outputs/live_plc_clips/<YYYY-MM-DD>/*_raw.mp4
 ```
 
-It searches recursively, ignores processed MP4s when raw clips exist, and
-loads only raw clips that match the resolution and nominal rounded FPS of the
-newest recording. Small container-reported FPS variations are grouped together
-without mixing older Full HD material with the new `2880x2160` source. The
-backend exposes the selected files as one continuous timeline while retaining
-the source video name, source frame index, and source timestamp in each
-annotation.
+It searches recursively, ignores processed MP4s when raw clips exist, skips a
+new RAW clip while its MP4 container is still being finalized, and loads only
+complete clips matching the resolution and nominal rounded FPS of the newest
+complete recording. Small container-reported FPS variations are grouped
+together without mixing older Full HD material with the new `2880x2160`
+source. The backend exposes the selected files as one continuous timeline
+while retaining the source video name, source frame index, and source
+timestamp in each annotation.
 
-The current homography was selected from a `1920x1080` source. Recreate and
-validate these files from a new `2880x2160` raw clip before accepting
-measurements from the native-resolution Live stream:
+When the camera resolution, zoom, or position changes, recreate and validate
+these files from a native `2880x2160` raw clip before accepting measurements:
 
 ```text
 outputs/homography_selection.json
