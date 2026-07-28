@@ -164,9 +164,31 @@ def select_canonical_snapshot(
     snapshots: list[dict[str, Any]],
     event_monotonic: float | None = None,
     window_seconds: float = CANONICAL_WINDOW_SECONDS,
+    target_offset_seconds: float | None = None,
 ) -> dict[str, Any] | None:
     if not snapshots:
         return None
+
+    if event_monotonic is not None and target_offset_seconds is not None:
+        timed_snapshots = [
+            (float(snapshot["frame_monotonic"]), snapshot)
+            for snapshot in snapshots
+            if snapshot.get("frame_monotonic") is not None
+        ]
+        if timed_snapshots:
+            target_monotonic = float(event_monotonic) + max(0.0, float(target_offset_seconds))
+            snapshots_at_or_after_target = [
+                item for item in timed_snapshots if item[0] >= target_monotonic
+            ]
+            if snapshots_at_or_after_target:
+                return min(
+                    snapshots_at_or_after_target,
+                    key=lambda item: (item[0], int(item[1].get("snapshot_index") or 0)),
+                )[1]
+            return max(
+                timed_snapshots,
+                key=lambda item: (item[0], -int(item[1].get("snapshot_index") or 0)),
+            )[1]
 
     candidates = []
     if event_monotonic is not None:
@@ -550,6 +572,7 @@ class DatabaseRepository:
         canonical = select_canonical_snapshot(
             snapshots,
             event_monotonic=event.get("event_read_monotonic"),
+            target_offset_seconds=data.get("measurement_delay_seconds"),
         )
         canonical_frame_index = int(canonical["frame_index"]) if canonical else None
         canonical_summary = snapshot_summary(canonical) if canonical else {

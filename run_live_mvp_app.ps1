@@ -111,6 +111,7 @@ else {
   --buffer-max-frames 60 `
   --record-seconds 8 `
   --record-fps 10 `
+  --measurement-delay-seconds 2 `
   --max-clips 100 `
   --plc-enabled `
   --plc-edge rising `

@@ -203,6 +203,12 @@ until the window closes: if YOLO did not detect any piece during those 8
 seconds, the MP4, processing captures, sidecar, and pending database event are
 discarded.
 
+The automatic per-piece measurements for a retained event come from the first
+processed frame at or after `PLC signal + 2.0 seconds`. At that instant, the
+Live camera perimeter turns green and the same green perimeter is embedded in
+the processed MP4 for 0.8 seconds. The sidecar records the configured delay,
+the actual selected-frame offset, and the marked video frame range.
+
 The deployed `outputs/table_measurement_calibration.json` currently contains no
 `exclusion_zones`. The filtering and overlay support are active in code, but
 remain inert until zones are saved from the calibration tool. Do not restore
@@ -227,7 +233,8 @@ automatically.
 The selected database is the History system of record. Each PLC signal creates an
 idempotent event, snapshots the active model/homography/calibration hashes,
 stores all processing snapshots, selects one canonical snapshot, and persists
-its per-piece automatic measurements. Operator corrections preserve the
+the per-piece automatic measurements from the `PLC + 2.0 seconds` snapshot.
+Operator corrections preserve the
 automatic value and create immutable audit revisions with optimistic
 concurrency checks. SQLite mirrors the PostgreSQL entities so it can be migrated
 later without changing the Live or History API.

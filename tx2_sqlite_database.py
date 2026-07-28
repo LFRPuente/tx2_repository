@@ -433,6 +433,7 @@ class SQLiteDatabaseRepository:
         canonical = select_canonical_snapshot(
             snapshots,
             event_monotonic=event.get("event_read_monotonic"),
+            target_offset_seconds=data.get("measurement_delay_seconds"),
         )
         canonical_frame_index = int(canonical["frame_index"]) if canonical else None
         canonical_summary = (

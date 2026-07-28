@@ -16,7 +16,14 @@ if str(REPO_ROOT) not in sys.path:
 import cv2
 import numpy as np
 
-from live_mvp_app import HTML, ClipRecorder, FrameBuffer, LiveProcessor, representative_snapshots
+from live_mvp_app import (
+    HTML,
+    ClipRecorder,
+    FrameBuffer,
+    LiveProcessor,
+    measurement_marker_active,
+    representative_snapshots,
+)
 from tools.plc_triggered_video_recorder import edge_matches
 
 
@@ -144,6 +151,8 @@ class PlcEdgeTests(unittest.TestCase):
         self.assertIn('id="plc-signal"', HTML)
         self.assertIn("plc.last_trigger", HTML)
         self.assertIn("PLC signal received", HTML)
+        self.assertIn("measurement-taken", HTML)
+        self.assertIn("data.recorder?.measurement_marker_active", HTML)
         self.assertNotIn("TX2 Vision", HTML)
         self.assertNotIn("<h1>Live MVP</h1>", HTML)
 
@@ -161,6 +170,12 @@ class HistoryTests(unittest.TestCase):
 
 
 class ClipRecorderTests(unittest.TestCase):
+    def test_measurement_marker_starts_two_seconds_after_the_plc_event(self) -> None:
+        self.assertFalse(measurement_marker_active(11.999, 10.0))
+        self.assertTrue(measurement_marker_active(12.0, 10.0))
+        self.assertTrue(measurement_marker_active(12.799, 10.0))
+        self.assertFalse(measurement_marker_active(12.8, 10.0))
+
     def test_processing_snapshots_are_strictly_inside_the_plc_window(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             processor = FakeSnapshotProcessor()
@@ -190,6 +205,7 @@ class ClipRecorderTests(unittest.TestCase):
                 record_seconds=0.4,
                 record_fps=10.0,
                 capture_fps=30.0,
+                measurement_delay_seconds=0.2,
                 max_clips=10,
             )
             buffer = FrameBuffer(maxlen=20)
@@ -252,6 +268,9 @@ class ClipRecorderTests(unittest.TestCase):
                 self.assertEqual(data["frames_written"], 4)
                 self.assertAlmostEqual(data["video_duration_seconds"], 0.4, places=3)
                 self.assertEqual(data["video_content"], "yolo_processed_overlay")
+                self.assertEqual(data["measurement_delay_seconds"], 0.2)
+                self.assertEqual(data["measurement_marker_first_video_frame_index"], 2)
+                self.assertEqual(data["measurement_marker_frames_written"], 2)
 
                 video = cv2.VideoCapture(data["video_path"])
                 try:
@@ -267,6 +286,26 @@ class ClipRecorderTests(unittest.TestCase):
                     blue, green, red = encoded_frame.mean(axis=(0, 1))
                     self.assertGreater(red, blue + 100)
                     self.assertGreater(red, green + 100)
+                    green_perimeter_found = False
+                    while True:
+                        ok, encoded_frame = video.read()
+                        if not ok:
+                            break
+                        perimeter = np.concatenate(
+                            (
+                                encoded_frame[:8].reshape(-1, 3),
+                                encoded_frame[-8:].reshape(-1, 3),
+                                encoded_frame[:, :8].reshape(-1, 3),
+                                encoded_frame[:, -8:].reshape(-1, 3),
+                            )
+                        )
+                        green_pixels = (
+                            (perimeter[:, 1] > perimeter[:, 0] + 30)
+                            & (perimeter[:, 1] > perimeter[:, 2] + 30)
+                        )
+                        if float(green_pixels.mean()) > 0.10:
+                            green_perimeter_found = True
+                    self.assertTrue(green_perimeter_found)
                 finally:
                     video.release()
 

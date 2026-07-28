@@ -60,13 +60,16 @@ Cuando esta integracion termine, un ciclo de produccion debe verse asi:
 10. El frontend muestra la imagen original, el esquema y la tabla de piezas.
 11. Una señal rising del PLC crea un evento de medicion y comienza una
     grabacion independiente de 8 segundos.
-12. Una nueva señal crea otra ventana fija de 8 segundos. Si ambas ventanas
+12. La medida automatica se toma en el primer frame procesado a partir de
+    `señal PLC + 2.0 segundos`; el perimetro se muestra verde en Live y queda
+    grabado en verde durante 0.8 segundos dentro del MP4 procesado.
+13. Una nueva señal crea otra ventana fija de 8 segundos. Si ambas ventanas
     coinciden en el tiempo, se conservan como clips separados sin truncarlas.
-13. La ventana solo se conserva si YOLO detecta al menos una pieza. Si no
+14. La ventana solo se conserva si YOLO detecta al menos una pieza. Si no
     detecta ninguna, se eliminan el MP4, los snapshots temporales y el evento.
-14. El evento, sus piezas, snapshots y rutas de assets se guardan en PostgreSQL.
-15. En `History`, el operador puede capturar una medida real para cada pieza.
-16. La medida automatica nunca se sobrescribe. Cada cambio del operador queda
+15. El evento, sus piezas, snapshots y rutas de assets se guardan en PostgreSQL.
+16. En `History`, el operador puede capturar una medida real para cada pieza.
+17. La medida automatica nunca se sobrescribe. Cada cambio del operador queda
     auditado con usuario, hora, valor anterior, valor nuevo y motivo.
 
 ## 3. Aplicaciones del repositorio y responsabilidad de cada una
@@ -978,7 +981,8 @@ nueva fila por cada reconexion.
    8 segundos.
 3. Si no hubo piezas, eliminar MP4, snapshots temporales y evento pendiente;
    no mostrar esa ventana en `History`.
-4. Elegir un snapshot canonico.
+4. Elegir como snapshot canonico el primer frame procesado a partir de
+   `señal PLC + 2.0 segundos`.
 5. Insertar sus piezas en `piece_measurement`.
 6. Insertar rutas en `event_asset`.
 7. Actualizar conteos y timestamps del evento.
@@ -995,24 +999,22 @@ El `piece_id` actual se asigna de izquierda a derecha en cada frame. No es un
 tracking persistente entre frames. Por eso no se deben insertar todas las
 apariciones de `P1` durante 8 segundos como si fueran la misma pieza fisica.
 
-Para el primer MVP se recomienda:
+La regla aplicada en el Live MVP es:
 
-1. agregar `frame_monotonic` al resultado de `LiveProcessor`;
-2. considerar snapshots desde la señal hasta 1.5 segundos despues;
-3. descartar snapshots sin mediciones validas;
-4. elegir por este orden:
-   - mayor `valid_count`;
-   - menor `invalid_count`;
-   - mayor promedio de `edge_confidence`;
-   - menor distancia temporal a la señal PLC;
-5. si no existe candidato en 1.5 segundos, buscar en todo el clip;
-6. guardar todos los snapshots como evidencia;
-7. crear `piece_measurement` solamente desde el snapshot canonico.
+1. conservar `frame_monotonic` en cada resultado de `LiveProcessor`;
+2. calcular el objetivo como `event_read_monotonic + 2.0 segundos`;
+3. elegir el primer snapshot procesado cuyo tiempo sea igual o posterior al
+   objetivo;
+4. usar el ultimo snapshot anterior solo como fallback si el clip termina sin
+   un frame posterior al objetivo;
+5. guardar todos los snapshots como evidencia;
+6. crear `piece_measurement` solamente desde ese snapshot canonico;
+7. guardar en el sidecar el retraso configurado y el offset real del frame
+   seleccionado.
 
-Esta ventana debe confirmarse en la linea real. Si una señal corresponde a un
-flujo de varias piezas distintas durante todo el clip, sera necesario tracking
-temporal y el esquema debera usar una identidad de pieza fisica, no solo orden
-horizontal.
+La seleccion es temporal y deliberadamente no cambia a otro frame por tener
+mayor confianza o mas piezas. Asi, la medida corresponde al instante definido
+por el proceso de planta.
 
 ## 15. Acceso a PostgreSQL desde Flask
 
@@ -1524,6 +1526,8 @@ continua pendiente.
 - un segundo rising edge crea otra ventana sin cerrar la anterior;
 - cada ventana contiene solo frames desde su señal hasta su limite de 8 segundos;
 - cada MP4 reporta 80 frames a 10 FPS y 8 segundos;
+- la medicion canonica usa el primer frame procesado a partir de `PLC + 2.0 s`;
+- el perimetro verde marca ese instante en Live y en el MP4 procesado;
 - una ventana sin ninguna pieza detectada se descarta y no aparece en History;
 - dos ventanas cercanas se conservan como clips independientes;
 - sidecar conserva source/server/app timestamps.
@@ -1780,6 +1784,8 @@ La integracion esta terminada cuando:
 - [ ] La señal PLC crea exactamente un evento en la base seleccionada.
 - [x] Dos señales cercanas conservan dos clips independientes de 8 segundos.
 - [x] El evento tiene un snapshot canonico explicable.
+- [x] La medicion canonica se toma a `PLC + 2.0 s`.
+- [x] El perimetro verde queda visible en Live y grabado en el MP4.
 - [x] History lista eventos desde la base seleccionada.
 - [x] El operador puede corregir una pieza.
 - [x] La medida automatica sigue intacta.

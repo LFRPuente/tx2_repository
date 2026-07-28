@@ -87,6 +87,35 @@ class CanonicalSnapshotTests(unittest.TestCase):
 
         self.assertEqual(selected["frame_index"], 2)
 
+    def test_measurement_target_uses_first_snapshot_at_or_after_two_seconds(self) -> None:
+        snapshots = [
+            snapshot(1, 101.9, 4, 0, 0.99),
+            snapshot(2, 102.0, 1, 1, 0.40),
+            snapshot(3, 102.1, 3, 0, 0.95),
+        ]
+
+        selected = select_canonical_snapshot(
+            snapshots,
+            event_monotonic=100.0,
+            target_offset_seconds=2.0,
+        )
+
+        self.assertEqual(selected["frame_index"], 2)
+
+    def test_measurement_target_falls_back_to_latest_available_snapshot(self) -> None:
+        snapshots = [
+            snapshot(1, 201.7, 1, 0, 0.80),
+            snapshot(2, 201.9, 1, 0, 0.70),
+        ]
+
+        selected = select_canonical_snapshot(
+            snapshots,
+            event_monotonic=200.0,
+            target_offset_seconds=2.0,
+        )
+
+        self.assertEqual(selected["frame_index"], 2)
+
     def test_legacy_single_measurement_becomes_one_piece(self) -> None:
         pieces = snapshot_pieces(
             {

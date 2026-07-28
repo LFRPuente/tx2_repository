@@ -59,6 +59,8 @@ DEFAULT_ENDPOINT = "opc.tcp://10.14.6.48:49320"
 DEFAULT_WATCHDOG_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.VisionWD"
 DEFAULT_EVENT_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.MeasureLength"
 HISTORY_SNAPSHOT_LIMIT = 6
+DEFAULT_MEASUREMENT_DELAY_SECONDS = 2.0
+MEASUREMENT_MARKER_DURATION_SECONDS = 0.8
 
 
 def utc_now() -> str:
@@ -117,6 +119,33 @@ def snapshots_contain_piece(snapshots: list[dict[str, Any]]) -> bool:
     return False
 
 
+def measurement_marker_active(
+    sample_monotonic: float,
+    event_monotonic: float,
+    delay_seconds: float = DEFAULT_MEASUREMENT_DELAY_SECONDS,
+    duration_seconds: float = MEASUREMENT_MARKER_DURATION_SECONDS,
+) -> bool:
+    marker_start = float(event_monotonic) + max(0.0, float(delay_seconds))
+    marker_end = marker_start + max(0.0, float(duration_seconds))
+    return marker_start <= float(sample_monotonic) < marker_end
+
+
+def draw_measurement_perimeter(frame: np.ndarray) -> np.ndarray:
+    marked = frame.copy()
+    height, width = marked.shape[:2]
+    thickness = max(4, int(round(min(height, width) * 0.012)))
+    inset = max(1, thickness // 2)
+    cv2.rectangle(
+        marked,
+        (inset, inset),
+        (max(inset, width - inset - 1), max(inset, height - inset - 1)),
+        (46, 204, 113),
+        thickness,
+        cv2.LINE_AA,
+    )
+    return marked
+
+
 def img_to_b64(img: np.ndarray, quality: int = 82) -> str:
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
     if not ok:
@@ -146,6 +175,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--buffer-max-frames", type=int, default=60)
     parser.add_argument("--record-seconds", type=float, default=8.0)
     parser.add_argument("--record-fps", type=float, default=10.0)
+    parser.add_argument(
+        "--measurement-delay-seconds",
+        type=float,
+        default=DEFAULT_MEASUREMENT_DELAY_SECONDS,
+    )
     parser.add_argument("--max-clips", type=int, default=100)
     parser.add_argument("--plc-enabled", action="store_true")
     parser.add_argument("--plc-endpoint", default=DEFAULT_ENDPOINT)
@@ -167,7 +201,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--db-disabled", action="store_true")
     parser.add_argument("--db-retry-seconds", type=float, default=15.0)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.measurement_delay_seconds < 0:
+        parser.error("--measurement-delay-seconds must be zero or greater")
+    if args.measurement_delay_seconds >= args.record_seconds:
+        parser.error(
+            "--measurement-delay-seconds must be shorter than --record-seconds"
+        )
+    return args
 
 
 def build_rtsp_url(args: argparse.Namespace) -> str:
@@ -656,7 +697,7 @@ class ClipRecorder:
         self.lock = threading.Lock()
         self.configuration_lock = threading.Lock()
         self.vision_configuration: dict[str, Any] | None = None
-        self.active_recordings: set[int] = set()
+        self.active_recordings: dict[int, float] = {}
         self.clip_index = 0
         self.last_clip: dict[str, Any] | None = None
         self.discarded_clip_count = 0
@@ -666,6 +707,16 @@ class ClipRecorder:
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
+            now = time.perf_counter()
+            measurement_delay_seconds = self._measurement_delay_seconds()
+            measurement_marker_active_now = any(
+                measurement_marker_active(
+                    now,
+                    event_monotonic,
+                    measurement_delay_seconds,
+                )
+                for event_monotonic in self.active_recordings.values()
+            )
             return {
                 "recording": bool(self.active_recordings),
                 "active_recordings": len(self.active_recordings),
@@ -677,16 +728,33 @@ class ClipRecorder:
                 "failed_recordings": [failure.copy() for failure in self.failed_recordings],
                 "error": self.error,
                 "record_seconds": self.args.record_seconds,
+                "measurement_delay_seconds": measurement_delay_seconds,
+                "measurement_marker_active": measurement_marker_active_now,
                 "database_enabled": self.database is not None,
             }
 
     def start_event_clip(self, event: dict[str, Any]) -> None:
+        event = dict(event)
+        event_monotonic = float(event.get("event_read_monotonic") or time.perf_counter())
+        event["event_read_monotonic"] = event_monotonic
         with self.lock:
             self.clip_index += 1
             clip_index = self.clip_index
-            self.active_recordings.add(clip_index)
+            self.active_recordings[clip_index] = event_monotonic
         thread = threading.Thread(target=self._record_clip, args=(clip_index, event), daemon=True)
         thread.start()
+
+    def _measurement_delay_seconds(self) -> float:
+        return max(
+            0.0,
+            float(
+                getattr(
+                    self.args,
+                    "measurement_delay_seconds",
+                    DEFAULT_MEASUREMENT_DELAY_SECONDS,
+                )
+            ),
+        )
 
     def _latest_recording_frame(self) -> dict[str, Any] | None:
         if self.processor is not None:
@@ -797,6 +865,8 @@ class ClipRecorder:
             db_sync_error = str(exc)
         record_seconds = max(0.1, float(self.args.record_seconds))
         deadline = event_mono + record_seconds
+        measurement_delay_seconds = self._measurement_delay_seconds()
+        measurement_target_mono = event_mono + measurement_delay_seconds
         fps = max(1.0, min(float(self.args.record_fps or self.args.capture_fps or 10.0), 60.0))
         target_frame_count = max(1, int(round(record_seconds * fps)))
         frames_written = 0
@@ -809,6 +879,31 @@ class ClipRecorder:
         video_path: Path | None = None
         analysis_dir: Path | None = None
         json_path: Path | None = None
+        measurement_marker_frames_written = 0
+        measurement_marker_first_video_frame_index: int | None = None
+
+        def write_sample(source: dict[str, Any], sample_monotonic: float) -> None:
+            nonlocal frames_written
+            nonlocal first_written_source
+            nonlocal last_written_source
+            nonlocal measurement_marker_frames_written
+            nonlocal measurement_marker_first_video_frame_index
+            if writer is None:
+                raise RuntimeError("VideoWriter is not available")
+            frame = source["frame"]
+            if measurement_marker_active(
+                sample_monotonic,
+                event_mono,
+                measurement_delay_seconds,
+            ):
+                if measurement_marker_first_video_frame_index is None:
+                    measurement_marker_first_video_frame_index = frames_written
+                measurement_marker_frames_written += 1
+                frame = draw_measurement_perimeter(frame)
+            writer.write(frame)
+            first_written_source = first_written_source or source
+            last_written_source = source
+            frames_written += 1
 
         try:
             day_dir = self.args.output_dir / "live_plc_clips" / datetime.now().strftime("%Y-%m-%d")
@@ -852,10 +947,7 @@ class ClipRecorder:
                             sample_mono = event_mono + (frames_written / fps)
                             if sample_mono > item_mono:
                                 break
-                            writer.write(last_source["frame"])
-                            first_written_source = first_written_source or last_source
-                            last_written_source = last_source
-                            frames_written += 1
+                            write_sample(last_source, sample_mono)
                         last_source = item
                 self._capture_processing_snapshot(
                     analysis_dir,
@@ -877,10 +969,8 @@ class ClipRecorder:
                 raise RuntimeError("No frames were available to record the clip.")
 
             while frames_written < target_frame_count:
-                writer.write(last_source["frame"])
-                first_written_source = first_written_source or last_source
-                last_written_source = last_source
-                frames_written += 1
+                sample_mono = event_mono + (frames_written / fps)
+                write_sample(last_source, sample_mono)
             writer.release()
             writer = None
 
@@ -926,6 +1016,13 @@ class ClipRecorder:
             canonical_snapshot = select_canonical_snapshot(
                 processing_snapshots,
                 event_monotonic=event_mono,
+                target_offset_seconds=measurement_delay_seconds,
+            )
+            measurement_actual_offset_seconds = (
+                float(canonical_snapshot["frame_monotonic"]) - event_mono
+                if canonical_snapshot is not None
+                and canonical_snapshot.get("frame_monotonic") is not None
+                else None
             )
             sidecar = {
                 "clip_index": clip_index,
@@ -942,6 +1039,24 @@ class ClipRecorder:
                 "video_fps": fps,
                 "video_codec": "h264",
                 "video_content": "yolo_processed_overlay" if self.processor is not None else "raw_fallback",
+                "measurement_delay_seconds": measurement_delay_seconds,
+                "measurement_target_monotonic": measurement_target_mono,
+                "measurement_actual_offset_seconds": measurement_actual_offset_seconds,
+                "measurement_snapshot_utc": (
+                    canonical_snapshot.get("frame_utc")
+                    if canonical_snapshot is not None
+                    else None
+                ),
+                "measurement_snapshot_frame_index": (
+                    int(canonical_snapshot["frame_index"])
+                    if canonical_snapshot is not None
+                    else None
+                ),
+                "measurement_marker_duration_seconds": MEASUREMENT_MARKER_DURATION_SECONDS,
+                "measurement_marker_frames_written": measurement_marker_frames_written,
+                "measurement_marker_first_video_frame_index": (
+                    measurement_marker_first_video_frame_index
+                ),
                 "video_duration_seconds": frames_written / fps,
                 "frames_captured": source_frames_seen,
                 "frames_written": frames_written,
@@ -1021,7 +1136,7 @@ class ClipRecorder:
             if writer is not None:
                 writer.release()
             with self.lock:
-                self.active_recordings.discard(clip_index)
+                self.active_recordings.pop(clip_index, None)
 
     def _enforce_retention(self) -> None:
         max_clips = max(1, int(self.args.max_clips or 100))
@@ -1332,7 +1447,9 @@ h2 { font-size: 16px; }
 .grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(360px, .75fr); gap: 12px; align-items: start; }
 .panel { border: 1px solid #d8e0e4; border-radius: 8px; background: #ffffff; overflow: hidden; box-shadow: 0 14px 28px rgba(23,32,37,.08); }
 .panel-head { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #d8e0e4; }
-.stage { display: grid; place-items: center; min-height: 300px; background: #eef2f4; }
+.stage { position: relative; display: grid; place-items: center; min-height: 300px; background: #eef2f4; }
+.stage::after { content: ""; position: absolute; inset: 0; border: 0 solid #2ecc71; pointer-events: none; }
+.stage.measurement-taken::after { border-width: 8px; box-shadow: inset 0 0 0 2px rgba(255,255,255,.85); }
 .stage img { display: block; width: 100%; height: auto; max-height: calc(100vh - 260px); object-fit: contain; }
 .side { display: grid; gap: 12px; }
 .diagram { width: 100%; height: auto; display: block; background: #f7faf8; }
@@ -1514,6 +1631,10 @@ async function refreshFrame() {
     const result = data.result;
     if (!result) return;
     setImage($('original-stage'), result.original_image, 'Live camera');
+    $('original-stage').classList.toggle(
+      'measurement-taken',
+      Boolean(data.recorder?.measurement_marker_active),
+    );
     updateDiagram(result);
   } catch (err) {
     pill($('top-state'), 'frame error', 'err');
@@ -1970,6 +2091,7 @@ def legacy_history_event(json_path: Path, *, detail: bool) -> dict[str, Any] | N
     canonical = select_canonical_snapshot(
         all_snapshots,
         event_monotonic=(data.get("event") or {}).get("event_read_monotonic"),
+        target_offset_seconds=data.get("measurement_delay_seconds"),
     )
     summary = snapshot_summary(canonical) if canonical else {}
     event_id = str(data.get("event_id") or data["clip_id"])
@@ -2107,6 +2229,7 @@ def api_live_frame():
     data = _processor.snapshot(include_images=True)
     if data.get("result") is None:
         return jsonify(error=data.get("error") or "No processed frame is available yet", processor=data), 503
+    data["recorder"] = _recorder.snapshot()
     return jsonify(data)
 
 
