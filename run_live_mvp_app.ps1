@@ -122,7 +122,7 @@ else {
   --record-fps 10 `
   --save-raw-clips `
   --raw-camera-resolution 2880x2160 `
-  --raw-record-fps 60 `
+  --raw-record-fps 30 `
   --measurement-delay-seconds 2 `
   --max-clips 100 `
   --plc-enabled `

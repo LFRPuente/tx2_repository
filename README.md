@@ -215,12 +215,11 @@ seconds, the processed MP4, temporary raw MP4, processing captures, sidecar,
 and pending database event are discarded.
 
 Temporary raw capture is enabled by `--save-raw-clips`. For a camera source,
-the app opens a separate `2880x2160`, 60 FPS RTSP stream and copies its H.264
+the app opens a separate `2880x2160`, 30 FPS RTSP stream and copies its H.264
 packets directly to `<clip>_raw.mp4` without decoding or overlays. YOLO remains
-at 10 FPS. The AXIS P1388-LE must be in its `4K @ 50/60 fps (no WDR)` capture
-mode; otherwise the camera limits the requested raw stream to 30 FPS. Remove
-the flag and the three `--raw-*` launcher arguments when this temporary data
-collection is complete.
+at 10 FPS. The camera currently uses its 4K capture mode and the raw URL forces
+a fixed frame cadence. Remove the flag and the three `--raw-*` launcher
+arguments when this temporary data collection is complete.
 
 The automatic per-piece measurements for a retained event come from the first
 processed frame at or after `PLC signal + 2.0 seconds`. At that instant, the

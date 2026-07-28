@@ -237,7 +237,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional RTSP URL used only for temporary raw recordings.",
     )
     parser.add_argument("--raw-camera-resolution", default="2880x2160")
-    parser.add_argument("--raw-record-fps", type=float, default=60.0)
+    parser.add_argument("--raw-record-fps", type=float, default=30.0)
     parser.add_argument(
         "--measurement-delay-seconds",
         type=float,
@@ -309,11 +309,14 @@ def build_raw_rtsp_url(args: argparse.Namespace) -> str:
     url = _axis_rtsp_url(
         args,
         str(getattr(args, "raw_camera_resolution", "2880x2160")),
-        float(getattr(args, "raw_record_fps", 60.0)),
+        float(getattr(args, "raw_record_fps", 30.0)),
         str(getattr(args, "raw_rtsp_url", "")),
     )
     separator = "&" if "?" in url else "?"
-    return f"{url}{separator}dynamicfps=0"
+    return (
+        f"{url}{separator}videozfpsmode=fixed"
+        "&videokeyframeinterval=30"
+    )
 
 
 def direct_raw_capture_enabled(args: argparse.Namespace) -> bool:
@@ -936,7 +939,7 @@ class ClipRecorder:
                     getattr(self.args, "raw_camera_resolution", "2880x2160")
                 ),
                 "raw_record_fps": float(
-                    getattr(self.args, "raw_record_fps", 60.0)
+                    getattr(self.args, "raw_record_fps", 30.0)
                 ),
                 "measurement_delay_seconds": measurement_delay_seconds,
                 "measurement_marker_active": measurement_marker_active_now,
