@@ -10,6 +10,7 @@ import argparse
 import base64
 import json
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -82,6 +83,7 @@ def open_video(video_path: Path) -> cv2.VideoCapture:
     return cap
 
 
+@lru_cache(maxsize=512)
 def video_meta(video_path: Path) -> dict:
     cap = open_video(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
