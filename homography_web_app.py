@@ -1962,7 +1962,8 @@ const m = {
   img: null, imgW: 0, imgH: 0, zoom: 1, panX: 0, panY: 0,
   frameIdx: 0, timeSec: 0, source: null, segments: [], pending: null, preview: null,
   referenceY: null, inchPerPx: null, exclusionZones: [], mode: 'segment', draggingReference: false,
-  panning: false, panAnchor: null, panStart: null
+  selectedSegment: null, draggingSegment: null,
+  panning: false, panAnchor: null, panStart: null, didDrag: false
 };
 m.ctx = m.canvas.getContext('2d');
 
@@ -2462,6 +2463,8 @@ function applyMeasureCalibration(calibration) {
   m.referenceY = calibration.reference_y ?? null;
   m.exclusionZones = (calibration.exclusion_zones || []).map(zone => ({...zone}));
   m.inchPerPx = calibration.inch_per_px ?? computeInchPerPx();
+  m.selectedSegment = null;
+  m.draggingSegment = null;
 }
 
 function computeInchPerPx() {
@@ -2509,6 +2512,8 @@ function updateMeasureInfo() {
 function setMeasureMode(mode) {
   m.mode = mode;
   m.pending = null; m.preview = null;
+  m.draggingSegment = null;
+  if (mode !== 'segment') m.selectedSegment = null;
   document.getElementById('m-mode-segment').classList.toggle('active', mode === 'segment');
   document.getElementById('m-mode-ref').classList.toggle('active', mode === 'reference');
   document.getElementById('m-mode-exclusion').classList.toggle('active', mode === 'exclusion');
@@ -2574,6 +2579,8 @@ function measureClick(point) {
 
 function deleteMeasureSegment(i) {
   m.segments.splice(i, 1);
+  if (m.selectedSegment === i) m.selectedSegment = null;
+  else if (m.selectedSegment > i) m.selectedSegment -= 1;
   updateMeasureInfo(); drawAll();
 }
 
@@ -2592,6 +2599,7 @@ function undoMeasureSegment() {
 function clearMeasureCalibration() {
   m.segments = []; m.pending = null; m.preview = null; m.referenceY = null; m.inchPerPx = null;
   m.exclusionZones = [];
+  m.selectedSegment = null; m.draggingSegment = null;
   updateMeasureInfo(); drawAll();
 }
 
@@ -3075,12 +3083,18 @@ function drawMeasure() {
     const a2 = imageToDisplay(m, s.x2, s.y2);
     const color = COLORS[i % COLORS.length];
     ctx.save();
+    if (m.selectedSegment === i) {
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 7;
+      ctx.beginPath(); ctx.moveTo(a1.x, a1.y); ctx.lineTo(a2.x, a2.y); ctx.stroke();
+    }
     ctx.strokeStyle = color;
     ctx.lineWidth = 3;
     ctx.beginPath(); ctx.moveTo(a1.x, a1.y); ctx.lineTo(a2.x, a2.y); ctx.stroke();
     ctx.fillStyle = color;
-    ctx.beginPath(); ctx.arc(a1.x, a1.y, 5, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.arc(a2.x, a2.y, 5, 0, Math.PI * 2); ctx.fill();
+    const handleRadius = m.selectedSegment === i ? 7 : 5;
+    ctx.beginPath(); ctx.arc(a1.x, a1.y, handleRadius, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(a2.x, a2.y, handleRadius, 0, Math.PI * 2); ctx.fill();
     ctx.font = '700 12px Arial';
     ctx.fillText(`${Number(s.inches).toFixed(2)} in`, (a1.x + a2.x) / 2 + 8, (a1.y + a2.y) / 2 - 8);
     ctx.restore();
@@ -3557,6 +3571,74 @@ function distToSegment(px, py, a, b) {
   return Math.hypot(px - x, py - y);
 }
 
+function nearestMeasureSegmentPart(cx, cy) {
+  if (m.mode !== 'segment' || m.pending) return null;
+  const candidates = m.segments.map((segment, index) => ({
+    index,
+    start: imageToDisplay(m, segment.x1, segment.y1),
+    end: imageToDisplay(m, segment.x2, segment.y2),
+  })).reverse();
+  for (const candidate of candidates) {
+    if (Math.hypot(cx - candidate.start.x, cy - candidate.start.y) <= 14) {
+      return {index: candidate.index, part: 'start'};
+    }
+    if (Math.hypot(cx - candidate.end.x, cy - candidate.end.y) <= 14) {
+      return {index: candidate.index, part: 'end'};
+    }
+  }
+  for (const candidate of candidates) {
+    if (distToSegment(cx, cy, candidate.start, candidate.end) <= 10) {
+      return {index: candidate.index, part: 'line'};
+    }
+  }
+  return null;
+}
+
+function beginMeasureSegmentDrag(hit, imagePoint) {
+  const segment = m.segments[hit.index];
+  if (!segment) return false;
+  m.selectedSegment = hit.index;
+  m.draggingSegment = {
+    index: hit.index,
+    part: hit.part,
+    anchor: {...imagePoint},
+    original: {
+      x1: Number(segment.x1), y1: Number(segment.y1),
+      x2: Number(segment.x2), y2: Number(segment.y2),
+    },
+  };
+  return true;
+}
+
+function updateMeasureSegmentDrag(imagePoint) {
+  const drag = m.draggingSegment;
+  if (!drag) return;
+  const segment = m.segments[drag.index];
+  if (!segment) {
+    m.draggingSegment = null;
+    return;
+  }
+  const x = Math.max(0, Math.min(m.imgW - 1, imagePoint.x));
+  const y = Math.max(0, Math.min(m.imgH - 1, imagePoint.y));
+  if (drag.part === 'start') {
+    segment.x1 = x; segment.y1 = y;
+  } else if (drag.part === 'end') {
+    segment.x2 = x; segment.y2 = y;
+  } else {
+    const original = drag.original;
+    const minDx = -Math.min(original.x1, original.x2);
+    const maxDx = (m.imgW - 1) - Math.max(original.x1, original.x2);
+    const minDy = -Math.min(original.y1, original.y2);
+    const maxDy = (m.imgH - 1) - Math.max(original.y1, original.y2);
+    const dx = Math.max(minDx, Math.min(maxDx, imagePoint.x - drag.anchor.x));
+    const dy = Math.max(minDy, Math.min(maxDy, imagePoint.y - drag.anchor.y));
+    segment.x1 = original.x1 + dx; segment.y1 = original.y1 + dy;
+    segment.x2 = original.x2 + dx; segment.y2 = original.y2 + dy;
+  }
+  segment.px = Math.hypot(segment.x2 - segment.x1, segment.y2 - segment.y1);
+  segment.inch_per_px = segment.px > 0 ? Number(segment.inches) / segment.px : null;
+}
+
 function nearestWorkRoiSide(cx, cy) {
   if (h.expandedPoints.length !== 4) return null;
   const pts = h.expandedPoints.map(p => imageToDisplay(h, p.x, p.y));
@@ -3647,6 +3729,22 @@ function installPanZoom(state, zoomInput, zoomLabel, hud, onClick) {
         return;
       }
     }
+    if (state === m && ev.button === 0 && m.mode === 'segment' && !m.pending) {
+      const rect = state.canvas.getBoundingClientRect();
+      const cx = ev.clientX - rect.left;
+      const cy = ev.clientY - rect.top;
+      const hit = nearestMeasureSegmentPart(cx, cy);
+      if (hit) {
+        ev.preventDefault();
+        const imagePoint = displayToImage(m, cx, cy);
+        if (beginMeasureSegmentDrag(hit, imagePoint)) {
+          state.didDrag = false;
+          state.wrap.style.cursor = 'grabbing';
+          drawAll();
+          return;
+        }
+      }
+    }
     if (state === m && ev.button === 0 && m.mode === 'reference' && m.referenceY !== null) {
       const rect = state.canvas.getBoundingClientRect();
       const cy = ev.clientY - rect.top;
@@ -3677,6 +3775,17 @@ function installPanZoom(state, zoomInput, zoomLabel, hud, onClick) {
       setTimeout(() => { state.didDrag = false; }, 0);
       return;
     }
+    if (state === m && m.draggingSegment) {
+      const index = m.draggingSegment.index;
+      m.draggingSegment = null;
+      state.didDrag = true;
+      state.wrap.style.cursor = 'crosshair';
+      updateMeasureInfo();
+      const segment = m.segments[index];
+      status(`Medicion #${index + 1} actualizada: ${Number(segment?.px || 0).toFixed(1)} px.`, 'ok');
+      setTimeout(() => { state.didDrag = false; }, 0);
+      return;
+    }
     if (state === m && m.draggingReference) {
       m.draggingReference = false;
       state.didDrag = true;
@@ -3704,12 +3813,18 @@ function installPanZoom(state, zoomInput, zoomLabel, hud, onClick) {
       return;
     }
     if (state === m) {
-      if (m.draggingReference) {
+      if (m.draggingSegment) {
+        updateMeasureSegmentDrag(imgPoint);
+        state.didDrag = true;
+        updateMeasureInfo();
+      } else if (m.draggingReference) {
         m.referenceY = imgPoint.y;
         state.didDrag = true;
         updateMeasureInfo();
       } else if (m.pending) {
         m.preview = imgPoint;
+      } else if (m.mode === 'segment' && !state.panning) {
+        state.wrap.style.cursor = nearestMeasureSegmentPart(cx, cy) ? 'grab' : 'crosshair';
       }
     }
     if (state === p && p.rulerActive && p.rulerStart && !p.rulerEnd && !state.panning) {
