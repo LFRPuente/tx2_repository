@@ -96,7 +96,7 @@ class HistoryApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(payload["database_mode"], "sqlite")
-        self.assertIn("migrated", payload["warning"])
+        self.assertNotIn("warning", payload)
 
     def test_operator_measurement_converts_units_and_records_identity(self) -> None:
         response = self.client.patch(

@@ -58,7 +58,6 @@ DEFAULT_MODEL = DEFAULT_PIECE_MODEL if DEFAULT_PIECE_MODEL.exists() else DEFAULT
 DEFAULT_ENDPOINT = "opc.tcp://10.14.6.48:49320"
 DEFAULT_WATCHDOG_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.VisionWD"
 DEFAULT_EVENT_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.MeasureLength"
-HISTORY_SNAPSHOT_LIMIT = 6
 DEFAULT_MEASUREMENT_DELAY_SECONDS = 2.0
 MEASUREMENT_MARKER_DURATION_SECONDS = 0.8
 
@@ -107,6 +106,32 @@ def representative_snapshots(snapshots: list[dict[str, Any]], limit: int) -> lis
     return [snapshots[index] for index in indices]
 
 
+def measurement_evidence_snapshots(
+    snapshots: list[dict[str, Any]],
+    *,
+    event_monotonic: float | None = None,
+    measurement_delay_seconds: float | None = None,
+) -> list[dict[str, Any]]:
+    if not snapshots:
+        return []
+    canonical = next(
+        (
+            snapshot
+            for snapshot in snapshots
+            if snapshot.get("is_canonical") is True
+            or snapshot.get("is_canonical") == 1
+        ),
+        None,
+    )
+    if canonical is None:
+        canonical = select_canonical_snapshot(
+            snapshots,
+            event_monotonic=event_monotonic,
+            target_offset_seconds=measurement_delay_seconds,
+        )
+    return [canonical] if canonical is not None else []
+
+
 def snapshots_contain_piece(snapshots: list[dict[str, Any]]) -> bool:
     for snapshot in snapshots:
         if snapshot_pieces(snapshot):
@@ -144,6 +169,22 @@ def draw_measurement_perimeter(frame: np.ndarray) -> np.ndarray:
         cv2.LINE_AA,
     )
     return marked
+
+
+def mark_measurement_evidence_snapshot(snapshot: dict[str, Any] | None) -> bool:
+    if snapshot is None:
+        return False
+    value = snapshot.get("original_overlay_path")
+    if not value:
+        return False
+    image_path = Path(str(value))
+    image = cv2.imread(str(image_path))
+    if image is None:
+        return False
+    if not cv2.imwrite(str(image_path), draw_measurement_perimeter(image)):
+        raise RuntimeError(f"Could not mark measurement evidence: {image_path}")
+    snapshot["measurement_evidence"] = True
+    return True
 
 
 def img_to_b64(img: np.ndarray, quality: int = 82) -> str:
@@ -1018,6 +1059,9 @@ class ClipRecorder:
                 event_monotonic=event_mono,
                 target_offset_seconds=measurement_delay_seconds,
             )
+            measurement_evidence_marked = mark_measurement_evidence_snapshot(
+                canonical_snapshot
+            )
             measurement_actual_offset_seconds = (
                 float(canonical_snapshot["frame_monotonic"]) - event_mono
                 if canonical_snapshot is not None
@@ -1052,6 +1096,7 @@ class ClipRecorder:
                     if canonical_snapshot is not None
                     else None
                 ),
+                "measurement_evidence_marked": measurement_evidence_marked,
                 "measurement_marker_duration_seconds": MEASUREMENT_MARKER_DURATION_SECONDS,
                 "measurement_marker_frames_written": measurement_marker_frames_written,
                 "measurement_marker_first_video_frame_index": (
@@ -1617,7 +1662,7 @@ function updatePlcSignal(plc) {
     const highlighting = Date.now() < plcSignalHighlightUntil;
     const time = signalTime(trigger);
     signal.className = `plc-signal ${highlighting ? 'received' : 'seen'}`;
-    text.textContent = `${highlighting ? 'PLC signal received' : 'Last PLC signal'}${time ? ` | ${time}` : ''}`;
+    text.textContent = `${highlighting ? 'PLC signal received' : 'Last PLC Cut Signal'}${time ? ` | ${time}` : ''}`;
     signal.title = trigger.event_source_timestamp || trigger.read_utc || '';
   }
   lastPlcEventCount = count;
@@ -1688,7 +1733,6 @@ h2 { font-size: 16px; }
 .nav a, .btn { border: 1px solid #cbd5da; border-radius: 8px; padding: 9px 12px; color: #172025; background: #fff; text-decoration: none; font-weight: 800; cursor: pointer; }
 .btn.primary { border-color: #247654; background: #247654; color: #fff; }
 .btn.danger { border-color: #c77a7a; color: #9d2d2d; }
-.mode { display: none; margin-bottom: 12px; border: 1px solid #d7a34d; border-radius: 8px; padding: 10px 12px; color: #7f550e; background: #fff8e8; font-weight: 750; overflow-wrap: anywhere; }
 .grid { display: grid; grid-template-columns: 360px minmax(0, 1fr); gap: 12px; align-items: start; }
 .panel { min-width: 0; border: 1px solid #d8e0e4; border-radius: 8px; background: #fff; overflow: hidden; box-shadow: 0 10px 24px rgba(23,32,37,.07); }
 .panel-head { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #d8e0e4; }
@@ -1720,7 +1764,8 @@ video, img { display: block; width: 100%; border-radius: 6px; background: #eef2f
 .snapshots { display: grid; gap: 10px; }
 .snapshot { border: 1px solid #d8e0e4; border-radius: 8px; overflow: hidden; background: #fff; }
 .snapshot-head { display: flex; justify-content: space-between; gap: 10px; padding: 9px 10px; border-bottom: 1px solid #e2e8eb; color: #3c4d54; font-size: 12px; font-weight: 800; }
-.snapshot-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 8px; }
+.snapshot-grid { padding: 8px; }
+.measurement-evidence { border: 8px solid #2ecc71; border-radius: 6px; }
 .empty { color: #68787f; font-weight: 750; padding: 44px 12px; text-align: center; }
 dialog { width: min(520px, calc(100vw - 24px)); border: 1px solid #cbd5da; border-radius: 8px; padding: 0; box-shadow: 0 24px 60px rgba(23,32,37,.22); }
 dialog::backdrop { background: rgba(23,32,37,.35); }
@@ -1731,7 +1776,7 @@ label { display: grid; gap: 5px; color: #4d5e65; font-size: 12px; font-weight: 8
 input, textarea { width: 100%; border: 1px solid #bac7cc; border-radius: 6px; padding: 9px; color: #172025; background: #fff; }
 textarea { min-height: 78px; resize: vertical; }
 @media (max-width: 1050px) { .grid { grid-template-columns: 1fr; } .list { max-height: 340px; } }
-@media (max-width: 760px) { .meta { grid-template-columns: repeat(2, 1fr); } .metric:nth-child(2) { border-right: 0; } .pieces { display: block; overflow-x: auto; } .snapshot-grid { grid-template-columns: 1fr; } }
+@media (max-width: 760px) { .meta { grid-template-columns: repeat(2, 1fr); } .metric:nth-child(2) { border-right: 0; } .pieces { display: block; overflow-x: auto; } }
 @media (max-width: 520px) { .topbar h1 { font-size: 21px; } .meta { grid-template-columns: 1fr; } .metric { border-right: 0; border-bottom: 1px solid #d8e0e4; } .metric:last-child { border-bottom: 0; } .revision { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -1741,7 +1786,6 @@ textarea { min-height: 78px; resize: vertical; }
     <h1>Measurement history</h1>
     <nav class="nav"><a href="/">Live</a></nav>
   </header>
-  <div id="mode" class="mode"></div>
   <main class="grid">
     <section class="panel">
       <div class="panel-head">
@@ -1854,8 +1898,7 @@ function renderSnapshots(snapshots) {
         <span>${esc(summary.valid_count ?? snapshot.valid_piece_count ?? 0)} valid of ${esc(summary.detected_count ?? snapshot.detected_piece_count ?? 0)}</span>
       </div>
       <div class="snapshot-grid">
-        ${snapshot.original_overlay_url ? `<img src="${esc(snapshot.original_overlay_url)}" alt="Processed camera view">` : '<div class="empty">No camera evidence</div>'}
-        ${snapshot.rectified_overlay_url ? `<img src="${esc(snapshot.rectified_overlay_url)}" alt="Processed diagram view">` : '<div class="empty">No diagram evidence</div>'}
+        ${snapshot.original_overlay_url ? `<img class="measurement-evidence" src="${esc(snapshot.original_overlay_url)}" alt="Measurement evidence">` : '<div class="empty">No camera evidence</div>'}
       </div>
     </article>`;
   }).join('')}</div>`;
@@ -1880,7 +1923,7 @@ async function loadEvent(eventId) {
     </div>
     <div class="section-head"><h3>Piece measurements</h3><span class="muted">Canonical processed frame</span></div>
     ${renderPieces(data.pieces, data.database_mode)}
-    <div class="section-head"><h3>Processing evidence</h3><span class="muted">Up to 6 representative captures</span></div>
+    <div class="section-head"><h3>Processing evidence</h3><span class="muted">PLC + 2 s measurement frame</span></div>
     ${renderSnapshots(data.snapshots)}
   `;
   document.querySelectorAll('.edit-piece').forEach((button) => button.addEventListener('click', () => openCorrection(button.dataset.pieceId)));
@@ -1891,10 +1934,6 @@ async function loadHistory() {
   const response = await fetch('/api/history/events?limit=100');
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || 'Could not load history');
-  if (data.database_mode !== 'postgresql') {
-    $('mode').style.display = 'block';
-    $('mode').textContent = data.warning || 'The database is disabled.';
-  }
   $('event-count').textContent = `${data.count} saved events`;
   if (!data.events.length) {
     $('event-list').innerHTML = '<div class="empty">No PLC events have been saved.</div>';
@@ -2046,14 +2085,26 @@ def delete_clip_paths(output_dir: Path, candidates: list[Path | None]) -> list[s
     return errors
 
 
-def read_clip_sidecar(json_path: Path, snapshot_limit: int | None = None) -> dict[str, Any] | None:
+def read_clip_sidecar(
+    json_path: Path,
+    snapshot_limit: int | None = None,
+    *,
+    measurement_evidence_only: bool = False,
+) -> dict[str, Any] | None:
     try:
         data = json.loads(json_path.read_text(encoding="utf-8"))
     except Exception:
         return None
     snapshots = data.get("processing_snapshots", []) or []
     data["processing_snapshot_count"] = int(data.get("processing_snapshot_count", len(snapshots)))
-    if snapshot_limit is not None:
+    if measurement_evidence_only:
+        snapshots = measurement_evidence_snapshots(
+            snapshots,
+            event_monotonic=(data.get("event") or {}).get("event_read_monotonic"),
+            measurement_delay_seconds=data.get("measurement_delay_seconds"),
+        )
+        data["processing_snapshots"] = snapshots
+    elif snapshot_limit is not None:
         snapshots = representative_snapshots(snapshots, snapshot_limit)
         data["processing_snapshots"] = snapshots
     data["processing_snapshots_shown"] = len(snapshots)
@@ -2079,20 +2130,13 @@ def find_clip_json(clip_id: str) -> Path | None:
 def legacy_history_event(json_path: Path, *, detail: bool) -> dict[str, Any] | None:
     data = read_clip_sidecar(
         json_path,
-        snapshot_limit=HISTORY_SNAPSHOT_LIMIT if detail else 0,
+        snapshot_limit=None if detail else 0,
+        measurement_evidence_only=detail,
     )
     if data is None:
         return None
-    try:
-        raw = json.loads(json_path.read_text(encoding="utf-8"))
-        all_snapshots = raw.get("processing_snapshots", [])
-    except Exception:
-        all_snapshots = data.get("processing_snapshots", [])
-    canonical = select_canonical_snapshot(
-        all_snapshots,
-        event_monotonic=(data.get("event") or {}).get("event_read_monotonic"),
-        target_offset_seconds=data.get("measurement_delay_seconds"),
-    )
+    evidence_snapshots = data.get("processing_snapshots", [])
+    canonical = evidence_snapshots[0] if evidence_snapshots else None
     summary = snapshot_summary(canonical) if canonical else {}
     event_id = str(data.get("event_id") or data["clip_id"])
     result: dict[str, Any] = {
@@ -2157,7 +2201,7 @@ def database_event_detail(event_id: str) -> dict[str, Any] | None:
         return None
     assets = [clean_value(asset) for asset in event.get("assets", [])]
     asset_by_path = {asset["relative_path"]: asset for asset in assets}
-    snapshots = representative_snapshots(event.get("snapshots", []), HISTORY_SNAPSHOT_LIMIT)
+    snapshots = measurement_evidence_snapshots(event.get("snapshots", []))
     for snapshot in snapshots:
         for path_key, url_key in (
             ("original_overlay_path", "original_overlay_url"),
@@ -2264,17 +2308,10 @@ def api_history_events():
         event["id"] = str(event["id"])
         event["detail_url"] = f"/history/{event['id']}"
         event["video_url"] = f"/api/history/events/{event['id']}/video"
-    warning = (
-        "SQLite temporal is active. History and corrections will be migrated "
-        "to PostgreSQL when the server is available."
-        if mode == "sqlite"
-        else ""
-    )
     return jsonify(
         events=clean_value(events),
         count=len(events),
         database_mode=mode,
-        warning=warning,
     )
 
 
@@ -2424,7 +2461,7 @@ def api_live_clip(clip_id: str):
     json_path = find_clip_json(clip_id)
     if json_path is None:
         return jsonify(error="Clip not found"), 404
-    data = read_clip_sidecar(json_path, snapshot_limit=HISTORY_SNAPSHOT_LIMIT)
+    data = read_clip_sidecar(json_path, measurement_evidence_only=True)
     if data is None:
         return jsonify(error="Clip metadata could not be read"), 500
     return jsonify(data)

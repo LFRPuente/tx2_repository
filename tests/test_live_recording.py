@@ -18,9 +18,12 @@ import numpy as np
 
 from live_mvp_app import (
     HTML,
+    HISTORY_HTML,
     ClipRecorder,
     FrameBuffer,
     LiveProcessor,
+    mark_measurement_evidence_snapshot,
+    measurement_evidence_snapshots,
     measurement_marker_active,
     representative_snapshots,
 )
@@ -151,6 +154,8 @@ class PlcEdgeTests(unittest.TestCase):
         self.assertIn('id="plc-signal"', HTML)
         self.assertIn("plc.last_trigger", HTML)
         self.assertIn("PLC signal received", HTML)
+        self.assertIn("Last PLC Cut Signal", HTML)
+        self.assertNotIn("Last PLC signal", HTML)
         self.assertIn("measurement-taken", HTML)
         self.assertIn("data.recorder?.measurement_marker_active", HTML)
         self.assertNotIn("TX2 Vision", HTML)
@@ -158,6 +163,24 @@ class PlcEdgeTests(unittest.TestCase):
 
 
 class HistoryTests(unittest.TestCase):
+    def test_history_only_renders_the_green_measurement_evidence(self) -> None:
+        self.assertIn("PLC + 2 s measurement frame", HISTORY_HTML)
+        self.assertIn('class="measurement-evidence"', HISTORY_HTML)
+        self.assertNotIn("Up to 6 representative captures", HISTORY_HTML)
+        self.assertNotIn("No diagram evidence", HISTORY_HTML)
+        self.assertNotIn("SQLite temporal is active", HISTORY_HTML)
+
+    def test_measurement_evidence_uses_only_the_canonical_snapshot(self) -> None:
+        snapshots = [
+            {"frame_index": 1, "frame_monotonic": 10.1, "is_canonical": 0},
+            {"frame_index": 2, "frame_monotonic": 12.0, "is_canonical": 1},
+            {"frame_index": 3, "frame_monotonic": 12.1, "is_canonical": 0},
+        ]
+
+        selected = measurement_evidence_snapshots(snapshots)
+
+        self.assertEqual([item["frame_index"] for item in selected], [2])
+
     def test_representative_snapshots_include_the_full_clip_range(self) -> None:
         snapshots = [{"index": index} for index in range(64)]
 
@@ -170,6 +193,34 @@ class HistoryTests(unittest.TestCase):
 
 
 class ClipRecorderTests(unittest.TestCase):
+    def test_measurement_evidence_image_gets_a_green_perimeter(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "evidence.jpg"
+            cv2.imwrite(
+                str(image_path),
+                np.full((80, 120, 3), (0, 0, 240), dtype=np.uint8),
+            )
+            snapshot = {"original_overlay_path": str(image_path)}
+
+            marked = mark_measurement_evidence_snapshot(snapshot)
+            image = cv2.imread(str(image_path))
+            perimeter = np.concatenate(
+                (
+                    image[:8].reshape(-1, 3),
+                    image[-8:].reshape(-1, 3),
+                    image[:, :8].reshape(-1, 3),
+                    image[:, -8:].reshape(-1, 3),
+                )
+            )
+            green_pixels = (
+                (perimeter[:, 1] > perimeter[:, 0] + 30)
+                & (perimeter[:, 1] > perimeter[:, 2] + 30)
+            )
+
+            self.assertTrue(marked)
+            self.assertTrue(snapshot["measurement_evidence"])
+            self.assertGreater(float(green_pixels.mean()), 0.10)
+
     def test_measurement_marker_starts_two_seconds_after_the_plc_event(self) -> None:
         self.assertFalse(measurement_marker_active(11.999, 10.0))
         self.assertTrue(measurement_marker_active(12.0, 10.0))

@@ -1113,7 +1113,7 @@ Debe devolver:
 - metadata PLC;
 - metadata de camara;
 - configuracion utilizada;
-- video y snapshots;
+- video y snapshot canonico de `PLC + 2.0 s`;
 - piezas ordenadas;
 - medida automatica;
 - medida de operador;
@@ -1121,6 +1121,10 @@ Debe devolver:
 - revision actual;
 - historial de cambios;
 - diagnosticos YOLO/Sobel.
+
+La UI muestra una sola imagen en `Processing evidence`: el overlay original
+del snapshot canonico con perimetro verde. Los demas snapshots permanecen
+persistidos para auditoria, pero no se renderizan como galeria.
 
 ### 16.3 Edicion de medida por pieza
 

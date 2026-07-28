@@ -225,10 +225,11 @@ Each history entry contains a browser-compatible H.264 MP4, PLC event metadata,
 processing snapshots, and the overlays produced while the clip was recorded.
 The MP4 itself contains the processed live camera view with the YOLO-derived
 reference and front overlays; it is not the raw camera feed.
-The history shows up to six representative processing captures per clip while
-the full processing data remains in its sidecar JSON. The app retains the 100
-most recent clips and removes older clip artifacts and their database events
-automatically.
+The Processing evidence section shows only the canonical `PLC + 2.0 seconds`
+camera frame with a green perimeter. All processing snapshots remain available
+in the sidecar JSON and selected database for audit, but are not rendered as a
+gallery. The app retains the 100 most recent clips and removes older clip
+artifacts and their database events automatically.
 
 The selected database is the History system of record. Each PLC signal creates an
 idempotent event, snapshots the active model/homography/calibration hashes,
