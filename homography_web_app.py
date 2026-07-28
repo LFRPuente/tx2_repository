@@ -106,6 +106,18 @@ def video_format_signature(meta: dict) -> tuple[int, int, int]:
     )
 
 
+def complete_video_meta(video_path: Path) -> dict:
+    meta = video_meta(video_path)
+    if (
+        int(meta["total_frames"]) <= 0
+        or int(meta["width"]) <= 0
+        or int(meta["height"]) <= 0
+        or float(meta["fps"]) <= 0
+    ):
+        raise RuntimeError(f"El video todavia no esta completo: {video_path}")
+    return meta
+
+
 def discover_video_paths(args: argparse.Namespace) -> list[Path]:
     video_dir = getattr(args, "video_dir", None)
     video = getattr(args, "video", None)
@@ -128,15 +140,21 @@ def discover_video_paths(args: argparse.Namespace) -> list[Path]:
 def latest_video_format_paths(video_paths: list[Path]) -> list[Path]:
     if not video_paths:
         return []
-    latest_meta = video_meta(video_paths[-1])
-    latest_signature = video_format_signature(latest_meta)
-    matching = []
+    readable = []
     for path in video_paths:
-        meta = video_meta(path)
-        signature = video_format_signature(meta)
-        if signature == latest_signature:
-            matching.append(path)
-    return matching
+        try:
+            readable.append((path, complete_video_meta(path)))
+        except RuntimeError as exc:
+            print(f"Advertencia: se omite video incompleto o ilegible: {exc}")
+    if not readable:
+        raise RuntimeError("No hay videos completos disponibles para la herramienta")
+    latest_meta = readable[-1][1]
+    latest_signature = video_format_signature(latest_meta)
+    return [
+        path
+        for path, meta in readable
+        if video_format_signature(meta) == latest_signature
+    ]
 
 
 def build_video_playlist(video_paths: list[Path]) -> dict:
@@ -147,7 +165,11 @@ def build_video_playlist(video_paths: list[Path]) -> dict:
     start_frame = 0
     expected = None
     for path in video_paths:
-        meta = video_meta(path)
+        try:
+            meta = complete_video_meta(path)
+        except RuntimeError as exc:
+            print(f"Advertencia: se omite video incompleto o ilegible: {exc}")
+            continue
         signature = video_format_signature(meta)
         if expected is None:
             expected = signature
@@ -170,7 +192,8 @@ def build_video_playlist(video_paths: list[Path]) -> dict:
         )
         start_frame += total_frames
 
-    assert expected is not None
+    if expected is None:
+        raise RuntimeError("La playlist no contiene videos completos")
     fps = expected[2]
     return {
         "segments": segments,

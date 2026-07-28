@@ -76,9 +76,18 @@ class VideoPlaylistTests(unittest.TestCase):
             Path("live_0003_raw.mp4"),
         ]
         metas = {
-            paths[0]: {"width": 1920, "height": 1080, "fps": 10.0},
-            paths[1]: {"width": 2560, "height": 1440, "fps": 10.0},
-            paths[2]: {"width": 2560, "height": 1440, "fps": 10.0},
+            paths[0]: {
+                "width": 1920, "height": 1080, "fps": 10.0,
+                "total_frames": 80, "duration_sec": 8.0,
+            },
+            paths[1]: {
+                "width": 2560, "height": 1440, "fps": 10.0,
+                "total_frames": 80, "duration_sec": 8.0,
+            },
+            paths[2]: {
+                "width": 2560, "height": 1440, "fps": 10.0,
+                "total_frames": 80, "duration_sec": 8.0,
+            },
         }
         with patch.object(vision, "video_meta", side_effect=lambda path: metas[path]):
             matching = vision.latest_video_format_paths(paths)
@@ -92,14 +101,75 @@ class VideoPlaylistTests(unittest.TestCase):
             Path("live_0003_raw.mp4"),
         ]
         metas = {
-            paths[0]: {"width": 2880, "height": 2160, "fps": 25.07},
-            paths[1]: {"width": 2880, "height": 2160, "fps": 24.96},
-            paths[2]: {"width": 2880, "height": 2160, "fps": 25.01},
+            paths[0]: {
+                "width": 2880, "height": 2160, "fps": 25.07,
+                "total_frames": 200, "duration_sec": 8.0,
+            },
+            paths[1]: {
+                "width": 2880, "height": 2160, "fps": 24.96,
+                "total_frames": 200, "duration_sec": 8.0,
+            },
+            paths[2]: {
+                "width": 2880, "height": 2160, "fps": 25.01,
+                "total_frames": 200, "duration_sec": 8.0,
+            },
         }
         with patch.object(vision, "video_meta", side_effect=lambda path: metas[path]):
             matching = vision.latest_video_format_paths(paths)
 
         self.assertEqual(matching, paths)
+
+    def test_latest_format_filter_skips_an_in_progress_newest_clip(self) -> None:
+        complete = Path("live_0001_raw.mp4")
+        in_progress = Path("live_0002_raw.mp4")
+        meta = {
+            "width": 2880,
+            "height": 2160,
+            "fps": 29.0,
+            "total_frames": 232,
+            "duration_sec": 8.0,
+        }
+
+        def read_meta(path: Path) -> dict:
+            if path == in_progress:
+                raise RuntimeError("moov atom not found")
+            return meta
+
+        with patch.object(vision, "video_meta", side_effect=read_meta):
+            matching = vision.latest_video_format_paths([complete, in_progress])
+
+        self.assertEqual(matching, [complete])
+
+    def test_playlist_skips_a_clip_that_becomes_unreadable(self) -> None:
+        complete = Path("live_0001_raw.mp4")
+        unavailable = Path("live_0002_raw.mp4")
+        meta = {
+            "width": 2880,
+            "height": 2160,
+            "fps": 29.0,
+            "total_frames": 232,
+            "duration_sec": 8.0,
+        }
+
+        def read_meta(path: Path) -> dict:
+            if path == unavailable:
+                raise RuntimeError("retention race")
+            return meta
+
+        with patch.object(vision, "video_meta", side_effect=read_meta):
+            playlist = vision.build_video_playlist([complete, unavailable])
+
+        self.assertEqual([segment["path"] for segment in playlist["segments"]], [complete])
+        self.assertEqual(playlist["total_frames"], 232)
+
+    def test_latest_format_filter_rejects_a_folder_without_complete_clips(self) -> None:
+        with patch.object(
+            vision,
+            "video_meta",
+            side_effect=RuntimeError("moov atom not found"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "No hay videos completos"):
+                vision.latest_video_format_paths([Path("live_0001_raw.mp4")])
 
     def test_frame_read_retains_source_video_traceability(self) -> None:
         playlist = {
