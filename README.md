@@ -74,16 +74,22 @@ python prepare_yolo_dataset.py
 python train_yolo11_pieces.py
 ```
 
+The v2 training command starts from the deployed individual-piece checkpoint
+when available, uses `imgsz=1280`, and never overwrites v1. Only reviewed
+annotations are included. Collect and review representative `2880x2160` frames
+before training; this workstation currently has CPU-only PyTorch, so a useful
+training run should be executed on a CUDA host.
+
 The trained weights are written to:
 
 ```text
-runs/detect/runs_tx2/yolo11n_pieces_v1/weights/best.pt
+runs/detect/runs_tx2/yolo11n_pieces_v2/weights/best.pt
 ```
 
-Both MVP launchers select that model automatically when it exists. The
-individual checkpoint is present in the current repository. A launcher only
-falls back to the legacy package model, with an explicit warning, if that file
-is missing.
+Both MVP launchers prefer that model automatically when it exists, then fall
+back to the deployed `yolo11n_pieces_v1` checkpoint. They use the legacy
+package model, with an explicit warning, only if neither individual-piece
+checkpoint exists.
 
 Vision API responses now include:
 
@@ -110,29 +116,33 @@ py -m pip install -r requirements.txt
 .\run_homography_web_app.ps1
 ```
 
-The current offline source is the extracted July 24 recording playlist:
+The calibration and annotation launcher reads temporary raw clips produced by
+the Live MVP:
 
 ```text
-C:\Users\luis_\Downloads\20260724_10\
+outputs/live_plc_clips/<YYYY-MM-DD>/*_raw.mp4
 ```
 
-The folder contains 12 consecutive `1920x1080`, 30 FPS MKV files. The backend
-exposes them as one continuous timeline while retaining the source video name,
-source frame index, and source timestamp in each annotation. Because all 12
-recordings share the calibrated camera view, they reuse:
+It searches recursively, ignores processed MP4s when raw clips exist, and
+loads only raw clips that match the resolution and FPS of the newest recording.
+This prevents older Full HD material from being mixed with the new
+`2880x2160` source. The backend exposes the selected files as one continuous
+timeline while retaining the source video name, source frame index, and source
+timestamp in each annotation.
+
+The current homography was selected from a `1920x1080` source. Recreate and
+validate these files from a new `2880x2160` raw clip before accepting
+measurements from the native-resolution Live stream:
 
 ```text
 outputs/homography_selection.json
 outputs/table_measurement_calibration.json
 ```
 
-The raw recordings are extracted from
-`C:\Users\luis_\Downloads\20260724_10.zip` and remain outside Git.
-
-The annotation history initially shows 12 evenly spaced pending candidates per
-video, for 144 candidates across the playlist. A candidate is excluded from the
-training dataset until it is reviewed and saved. Save frames without boxes as
-negative examples; draw one tight box per visible piece on positive frames.
+The annotation history creates evenly spaced pending candidates for each
+selected raw clip. A candidate is excluded from the training dataset until it
+is reviewed and saved. Save frames without boxes as negative examples; draw
+one tight box per visible piece on positive frames.
 
 Then open:
 
@@ -190,8 +200,9 @@ http://127.0.0.1:8767
 ```
 
 The Live MVP provides a light interface with the live camera view and
-measurement diagram. It keeps the AXIS stream at `1920x1080` and targets 10 FPS
-for capture, processing, browser updates, and saved clips. Live inference uses
+measurement diagram. It requests the AXIS stream at its configured
+`2880x2160` resolution and targets 10 FPS for capture, processing, browser
+updates, and processed clips. Live inference uses
 the individual-piece model at an initial confidence of `0.10`, applies the same
 geometric rules as the offline tool, filters boxes against configured exclusion
 zones before Sobel, and retains the full `box_rules` diagnostics. Measurements
@@ -200,8 +211,16 @@ are shown in compact sixteenth-inch format such as `40' 9 1/16"`.
 It connects to the PLC through OPC UA and records one 8-second clip when
 `MeasureLength` changes from `False` to `True`. The recording is provisional
 until the window closes: if YOLO did not detect any piece during those 8
-seconds, the MP4, processing captures, sidecar, and pending database event are
-discarded.
+seconds, the processed MP4, temporary raw MP4, processing captures, sidecar,
+and pending database event are discarded.
+
+Temporary raw capture is enabled by `--save-raw-clips`. For a camera source,
+the app opens a separate `2880x2160`, 60 FPS RTSP stream and copies its H.264
+packets directly to `<clip>_raw.mp4` without decoding or overlays. YOLO remains
+at 10 FPS. The AXIS P1388-LE must be in its `4K @ 50/60 fps (no WDR)` capture
+mode; otherwise the camera limits the requested raw stream to 30 FPS. Remove
+the flag and the three `--raw-*` launcher arguments when this temporary data
+collection is complete.
 
 The automatic per-piece measurements for a retained event come from the first
 processed frame at or after `PLC signal + 2.0 seconds`. At that instant, the
@@ -224,12 +243,13 @@ http://127.0.0.1:8767/history
 Each history entry contains a browser-compatible H.264 MP4, PLC event metadata,
 processing snapshots, and the overlays produced while the clip was recorded.
 The MP4 itself contains the processed live camera view with the YOLO-derived
-reference and front overlays; it is not the raw camera feed.
+reference and front overlays. While temporary raw capture is active, a
+`Raw clip` action opens the synchronized camera-only MP4.
 The Processing evidence section shows only the canonical `PLC + 2.0 seconds`
 camera frame with a green perimeter. All processing snapshots remain available
 in the sidecar JSON and selected database for audit, but are not rendered as a
-gallery. The app retains the 100 most recent clips and removes older clip
-artifacts and their database events automatically.
+gallery. The app retains the 100 most recent events and removes all processed,
+raw, sidecar, and evidence artifacts belonging to older events automatically.
 
 The selected database is the History system of record. Each PLC signal creates an
 idempotent event, snapshots the active model/homography/calibration hashes,
@@ -240,9 +260,10 @@ automatic value and create immutable audit revisions with optimistic
 concurrency checks. SQLite mirrors the PostgreSQL entities so it can be migrated
 later without changing the Live or History API.
 
-The live frame buffer is capped to avoid retaining several gigabytes of raw
-images. Clips are streamed directly to disk and resampled to the configured
-output FPS, so their playback duration matches the PLC recording window. If a
+The live frame buffer is capped to avoid retaining several gigabytes of images.
+Processed clips are streamed directly to disk and resampled to the configured
+output FPS. Temporary raw clips are copied directly from H.264, so their
+playback duration and native frame rate come from the camera stream. If a
 second PLC event arrives while another clip is active, both recording windows
 are preserved as separate clips.
 

@@ -51,6 +51,40 @@ class VideoPlaylistTests(unittest.TestCase):
         self.assertEqual(playlist["total_frames"], 180)
         self.assertAlmostEqual(playlist["duration_sec"], 6.0)
 
+    def test_discovery_recurses_and_prefers_raw_live_clips(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            day_dir = root / "2026-07-28"
+            day_dir.mkdir()
+            processed = day_dir / "live_0001.mp4"
+            raw = day_dir / "live_0001_raw.mp4"
+            legacy = root / "legacy.mkv"
+            processed.touch()
+            raw.touch()
+            legacy.touch()
+
+            paths = vision.discover_video_paths(
+                SimpleNamespace(video_dir=root, video=None)
+            )
+
+        self.assertEqual(paths, [raw])
+
+    def test_latest_format_filter_keeps_only_matching_raw_clips(self) -> None:
+        paths = [
+            Path("live_0001_raw.mp4"),
+            Path("live_0002_raw.mp4"),
+            Path("live_0003_raw.mp4"),
+        ]
+        metas = {
+            paths[0]: {"width": 1920, "height": 1080, "fps": 10.0},
+            paths[1]: {"width": 2560, "height": 1440, "fps": 10.0},
+            paths[2]: {"width": 2560, "height": 1440, "fps": 10.0},
+        }
+        with patch.object(vision, "video_meta", side_effect=lambda path: metas[path]):
+            matching = vision.latest_video_format_paths(paths)
+
+        self.assertEqual(matching, paths[1:])
+
     def test_frame_read_retains_source_video_traceability(self) -> None:
         playlist = {
             "fps": 30.0,

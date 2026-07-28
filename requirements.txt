@@ -1,5 +1,6 @@
 asyncua
 flask
+imageio-ffmpeg
 matplotlib
 numpy
 opencv-python

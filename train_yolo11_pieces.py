@@ -7,16 +7,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA = ROOT / "dataset_pieces_yolo11" / "tx2_pieces.yaml"
 DEFAULT_PROJECT = ROOT / "runs" / "detect" / "runs_tx2"
+CURRENT_MODEL = DEFAULT_PROJECT / "yolo11n_pieces_v1" / "weights" / "best.pt"
+DEFAULT_BASE_MODEL = str(CURRENT_MODEL) if CURRENT_MODEL.exists() else "yolo11n.pt"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the TX2 individual-piece YOLO11 detector.")
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
-    parser.add_argument("--base-model", default="yolo11n.pt")
-    parser.add_argument("--name", default="yolo11n_pieces_v1")
+    parser.add_argument("--base-model", default=DEFAULT_BASE_MODEL)
+    parser.add_argument("--name", default="yolo11n_pieces_v2")
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--patience", type=int, default=30)
-    parser.add_argument("--imgsz", type=int, default=960)
+    parser.add_argument("--imgsz", type=int, default=1280)
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--device", default="0")
     parser.add_argument("--workers", type=int, default=0)

@@ -22,14 +22,24 @@ DEFAULT_VIDEO_DIR = Path(r"C:\Users\luis_\Downloads\20260724_10")
 DEFAULT_VIDEO = DEFAULT_VIDEO_DIR / "20260724_100105_6439.mkv"
 DEFAULT_SECOND = 30.0
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs"
-DEFAULT_DATASET_DIR = Path(r"C:\Users\luis_\Desktop\tx2_cv_2026-05-11\dataset_pieces")
-DEFAULT_PIECE_MODEL = Path(
-    r"C:\Users\luis_\Desktop\tx2_cv_2026-05-11\runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt"
+DEFAULT_DATASET_DIR = PROJECT_ROOT / "dataset_pieces"
+DEFAULT_PIECE_MODEL_V2 = (
+    PROJECT_ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v2" / "weights" / "best.pt"
 )
-DEFAULT_LEGACY_MODEL = Path(
-    r"C:\Users\luis_\Desktop\tx2_cv_2026-05-11\runs\detect\runs_tx2\yolo11n_tubos_v1\weights\best.pt"
+DEFAULT_PIECE_MODEL_V1 = (
+    PROJECT_ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v1" / "weights" / "best.pt"
 )
-DEFAULT_MODEL = DEFAULT_PIECE_MODEL if DEFAULT_PIECE_MODEL.exists() else DEFAULT_LEGACY_MODEL
+DEFAULT_LEGACY_MODEL = (
+    PROJECT_ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_tubos_v1" / "weights" / "best.pt"
+)
+DEFAULT_MODEL = next(
+    (
+        path
+        for path in (DEFAULT_PIECE_MODEL_V2, DEFAULT_PIECE_MODEL_V1, DEFAULT_LEGACY_MODEL)
+        if path.exists()
+    ),
+    DEFAULT_LEGACY_MODEL,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +61,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=12,
         help="Evenly spaced pending annotation candidates generated for each playlist video.",
+    )
+    parser.add_argument(
+        "--latest-video-format-only",
+        action="store_true",
+        help="Use only videos matching the resolution and FPS of the newest source video.",
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--port", type=int, default=5050)
@@ -90,13 +105,37 @@ def discover_video_paths(args: argparse.Namespace) -> list[Path]:
         extensions = {".mkv", ".mp4", ".avi", ".mov", ".m4v"}
         paths = sorted(
             path
-            for path in video_dir.iterdir()
+            for path in video_dir.rglob("*")
             if path.is_file() and path.suffix.lower() in extensions
         )
+        raw_paths = [path for path in paths if path.stem.lower().endswith("_raw")]
+        if raw_paths:
+            paths = raw_paths
         if not paths:
             raise RuntimeError(f"No se encontraron videos en: {video_dir}")
         return paths
     return [Path(video or DEFAULT_VIDEO)]
+
+
+def latest_video_format_paths(video_paths: list[Path]) -> list[Path]:
+    if not video_paths:
+        return []
+    latest_meta = video_meta(video_paths[-1])
+    latest_signature = (
+        int(latest_meta["width"]),
+        int(latest_meta["height"]),
+        float(latest_meta["fps"]),
+    )
+    matching = []
+    for path in video_paths:
+        meta = video_meta(path)
+        signature = (int(meta["width"]), int(meta["height"]), float(meta["fps"]))
+        if (
+            signature[:2] == latest_signature[:2]
+            and abs(signature[2] - latest_signature[2]) <= 1e-3
+        ):
+            matching.append(path)
+    return matching
 
 
 def build_video_playlist(video_paths: list[Path]) -> dict:
@@ -4426,7 +4465,10 @@ def api_annotate_save():
 def main() -> None:
     global _args, _video_playlist, _image, _source_label
     _args = parse_args()
-    _video_playlist = build_video_playlist(discover_video_paths(_args))
+    video_paths = discover_video_paths(_args)
+    if _args.latest_video_format_only:
+        video_paths = latest_video_format_paths(video_paths)
+    _video_playlist = build_video_playlist(video_paths)
     _args.video = Path(_video_playlist["segments"][0]["path"])
     _args.output_dir.mkdir(parents=True, exist_ok=True)
     _args.dataset_dir.mkdir(parents=True, exist_ok=True)

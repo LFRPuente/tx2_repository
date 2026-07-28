@@ -49,6 +49,62 @@ SQLITE_BOOLEAN_COLUMNS = {
 }
 
 
+def _ensure_raw_video_asset_type(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        """
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'event_asset'
+        """
+    ).fetchone()
+    schema = str(row["sql"] if row is not None else "")
+    if "'raw_video'" in schema:
+        return
+
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE event_asset RENAME TO event_asset_legacy;
+            CREATE TABLE event_asset (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL
+                    REFERENCES measurement_event(id) ON DELETE CASCADE,
+                asset_type TEXT NOT NULL CHECK (asset_type IN (
+                    'video',
+                    'raw_video',
+                    'sidecar',
+                    'original_overlay',
+                    'rectified_overlay'
+                )),
+                relative_path TEXT NOT NULL,
+                mime_type TEXT,
+                size_bytes INTEGER,
+                sha256 TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE (event_id, asset_type, relative_path)
+            );
+            INSERT INTO event_asset (
+                id, event_id, asset_type, relative_path, mime_type,
+                size_bytes, sha256, created_at
+            )
+            SELECT
+                id, event_id, asset_type, relative_path, mime_type,
+                size_bytes, sha256, created_at
+            FROM event_asset_legacy;
+            DROP TABLE event_asset_legacy;
+            COMMIT;
+            """
+        )
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
+
+
 def _json_text(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
 
@@ -109,6 +165,7 @@ class SQLiteDatabaseRepository:
                 connection.execute("PRAGMA journal_mode = WAL")
                 connection.execute("PRAGMA synchronous = NORMAL")
                 connection.executescript(migration)
+                _ensure_raw_video_asset_type(connection)
                 connection.commit()
             finally:
                 connection.close()

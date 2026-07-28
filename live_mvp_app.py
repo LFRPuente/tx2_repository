@@ -13,6 +13,7 @@ import base64
 import json
 import math
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -22,6 +23,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import quote
 
 import cv2
 import numpy as np
@@ -52,9 +54,17 @@ from tx2_sqlite_database import SQLiteDatabaseRepository
 DEFAULT_VIDEO = Path(r"C:\Users\luis_\Downloads\20260724_10\20260724_100105_6439.mkv")
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
 DEFAULT_DATASET_DIR = ROOT / "dataset_pieces"
-DEFAULT_PIECE_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v1" / "weights" / "best.pt"
+DEFAULT_PIECE_MODEL_V2 = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v2" / "weights" / "best.pt"
+DEFAULT_PIECE_MODEL_V1 = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v1" / "weights" / "best.pt"
 DEFAULT_LEGACY_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_tubos_v1" / "weights" / "best.pt"
-DEFAULT_MODEL = DEFAULT_PIECE_MODEL if DEFAULT_PIECE_MODEL.exists() else DEFAULT_LEGACY_MODEL
+DEFAULT_MODEL = next(
+    (
+        path
+        for path in (DEFAULT_PIECE_MODEL_V2, DEFAULT_PIECE_MODEL_V1, DEFAULT_LEGACY_MODEL)
+        if path.exists()
+    ),
+    DEFAULT_LEGACY_MODEL,
+)
 DEFAULT_ENDPOINT = "opc.tcp://10.14.6.48:49320"
 DEFAULT_WATCHDOG_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.VisionWD"
 DEFAULT_EVENT_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.MeasureLength"
@@ -202,7 +212,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-ip", default="10.14.115.241")
     parser.add_argument("--rtsp-url", default=os.environ.get("AXIS_RTSP_URL", ""))
     parser.add_argument("--codec", choices=("jpeg", "h264"), default="h264")
-    parser.add_argument("--camera-resolution", default="1920x1080")
+    parser.add_argument("--camera-resolution", default="2880x2160")
     parser.add_argument("--camera-user", default=os.environ.get("AXIS_USER", ""))
     parser.add_argument("--camera-password", default=os.environ.get("AXIS_PASSWORD", ""))
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -216,6 +226,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--buffer-max-frames", type=int, default=60)
     parser.add_argument("--record-seconds", type=float, default=8.0)
     parser.add_argument("--record-fps", type=float, default=10.0)
+    parser.add_argument(
+        "--save-raw-clips",
+        action="store_true",
+        help="Temporarily save a camera-only MP4 beside each processed clip.",
+    )
+    parser.add_argument(
+        "--raw-rtsp-url",
+        default=os.environ.get("AXIS_RAW_RTSP_URL", ""),
+        help="Optional RTSP URL used only for temporary raw recordings.",
+    )
+    parser.add_argument("--raw-camera-resolution", default="2880x2160")
+    parser.add_argument("--raw-record-fps", type=float, default=60.0)
     parser.add_argument(
         "--measurement-delay-seconds",
         type=float,
@@ -249,20 +271,157 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--measurement-delay-seconds must be shorter than --record-seconds"
         )
+    if args.raw_record_fps <= 0 or args.raw_record_fps > 60:
+        parser.error("--raw-record-fps must be greater than zero and no more than 60")
     return args
 
 
-def build_rtsp_url(args: argparse.Namespace) -> str:
-    if args.rtsp_url:
-        return args.rtsp_url
+def _axis_rtsp_url(
+    args: argparse.Namespace,
+    resolution: str,
+    fps: float,
+    explicit_url: str = "",
+) -> str:
+    if explicit_url:
+        return explicit_url
     auth = ""
     if args.camera_user and args.camera_password:
-        auth = f"{args.camera_user}:{args.camera_password}@"
-    fps = max(1, int(round(float(args.capture_fps))))
+        user = quote(str(args.camera_user), safe="")
+        password = quote(str(args.camera_password), safe="")
+        auth = f"{user}:{password}@"
+    requested_fps = max(1, int(round(float(fps))))
     return (
         f"rtsp://{auth}{args.camera_ip}/axis-media/media.amp"
-        f"?videocodec={args.codec}&resolution={args.camera_resolution}&fps={fps}"
+        f"?videocodec={args.codec}&resolution={resolution}&fps={requested_fps}"
     )
+
+
+def build_rtsp_url(args: argparse.Namespace) -> str:
+    return _axis_rtsp_url(
+        args,
+        str(args.camera_resolution),
+        float(args.capture_fps),
+        str(args.rtsp_url),
+    )
+
+
+def build_raw_rtsp_url(args: argparse.Namespace) -> str:
+    url = _axis_rtsp_url(
+        args,
+        str(getattr(args, "raw_camera_resolution", "2880x2160")),
+        float(getattr(args, "raw_record_fps", 60.0)),
+        str(getattr(args, "raw_rtsp_url", "")),
+    )
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}dynamicfps=0"
+
+
+def direct_raw_capture_enabled(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "save_raw_clips", False)
+        and str(getattr(args, "source", "")) in ("rtsp", "auto")
+    )
+
+
+def start_direct_raw_capture(
+    args: argparse.Namespace,
+    output_path: Path,
+    duration_seconds: float,
+) -> subprocess.Popen:
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+    except ImportError as exc:
+        raise RuntimeError(
+            "Temporary raw recording requires imageio-ffmpeg. "
+            "Install the repository requirements."
+        ) from exc
+
+    command = [
+        get_ffmpeg_exe(),
+        "-y",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-i",
+        build_raw_rtsp_url(args),
+        "-t",
+        f"{float(duration_seconds):.3f}",
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "copy",
+        "-an",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=creationflags,
+    )
+
+
+def finish_direct_raw_capture(
+    process: subprocess.Popen,
+    output_path: Path,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    try:
+        process.communicate(timeout=max(5.0, timeout_seconds))
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try:
+            process.communicate(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+        return {"ok": False, "error": "Raw RTSP copy timed out"}
+
+    if process.returncode != 0 or not output_path.is_file() or output_path.stat().st_size <= 0:
+        return {
+            "ok": False,
+            "error": f"Raw RTSP copy failed with exit code {process.returncode}",
+        }
+
+    cap = cv2.VideoCapture(str(output_path))
+    try:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    finally:
+        cap.release()
+    duration = frame_count / fps if frame_count > 0 and fps > 0 else None
+    return {
+        "ok": True,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "frame_count": frame_count,
+        "duration_seconds": duration,
+        "size_bytes": output_path.stat().st_size,
+    }
+
+
+def stop_direct_raw_capture(process: subprocess.Popen | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.communicate(timeout=3.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
 
 
 def configure_vision_module(args: argparse.Namespace) -> None:
@@ -719,6 +878,7 @@ class LiveProcessor:
                 "utc": item["utc"],
                 "monotonic": float(item["monotonic"]),
                 "frame": original_viz,
+                "raw_frame": original,
             },
         }
 
@@ -769,6 +929,15 @@ class ClipRecorder:
                 "failed_recordings": [failure.copy() for failure in self.failed_recordings],
                 "error": self.error,
                 "record_seconds": self.args.record_seconds,
+                "save_raw_clips": bool(
+                    getattr(self.args, "save_raw_clips", False)
+                ),
+                "raw_camera_resolution": str(
+                    getattr(self.args, "raw_camera_resolution", "2880x2160")
+                ),
+                "raw_record_fps": float(
+                    getattr(self.args, "raw_record_fps", 60.0)
+                ),
                 "measurement_delay_seconds": measurement_delay_seconds,
                 "measurement_marker_active": measurement_marker_active_now,
                 "database_enabled": self.database is not None,
@@ -908,6 +1077,9 @@ class ClipRecorder:
         deadline = event_mono + record_seconds
         measurement_delay_seconds = self._measurement_delay_seconds()
         measurement_target_mono = event_mono + measurement_delay_seconds
+        save_raw_clips = bool(getattr(self.args, "save_raw_clips", False))
+        direct_raw_capture = direct_raw_capture_enabled(self.args)
+        buffer_raw_capture = save_raw_clips and not direct_raw_capture
         fps = max(1.0, min(float(self.args.record_fps or self.args.capture_fps or 10.0), 60.0))
         target_frame_count = max(1, int(round(record_seconds * fps)))
         frames_written = 0
@@ -917,7 +1089,13 @@ class ClipRecorder:
         first_written_source: dict[str, Any] | None = None
         last_written_source: dict[str, Any] | None = None
         writer: cv2.VideoWriter | None = None
+        raw_writer: cv2.VideoWriter | None = None
         video_path: Path | None = None
+        raw_video_path: Path | None = None
+        raw_capture_process: subprocess.Popen | None = None
+        raw_capture_result: dict[str, Any] | None = None
+        raw_capture_started_at: str | None = None
+        raw_capture_error = ""
         analysis_dir: Path | None = None
         json_path: Path | None = None
         measurement_marker_frames_written = 0
@@ -929,9 +1107,10 @@ class ClipRecorder:
             nonlocal last_written_source
             nonlocal measurement_marker_frames_written
             nonlocal measurement_marker_first_video_frame_index
-            if writer is None:
-                raise RuntimeError("VideoWriter is not available")
+            if writer is None or (buffer_raw_capture and raw_writer is None):
+                raise RuntimeError("Required VideoWriters are not available")
             frame = source["frame"]
+            raw_frame = source.get("raw_frame", frame)
             if measurement_marker_active(
                 sample_monotonic,
                 event_mono,
@@ -942,6 +1121,8 @@ class ClipRecorder:
                 measurement_marker_frames_written += 1
                 frame = draw_measurement_perimeter(frame)
             writer.write(frame)
+            if raw_writer is not None:
+                raw_writer.write(raw_frame)
             first_written_source = first_written_source or source
             last_written_source = source
             frames_written += 1
@@ -954,7 +1135,16 @@ class ClipRecorder:
             analysis_dir = day_dir / f"{base}_analysis"
             analysis_dir.mkdir(parents=True, exist_ok=True)
             video_path = day_dir / f"{base}.mp4"
+            if save_raw_clips:
+                raw_video_path = day_dir / f"{base}_raw.mp4"
             json_path = day_dir / f"{base}.json"
+            if direct_raw_capture and raw_video_path is not None:
+                raw_capture_started_at = utc_now()
+                raw_capture_process = start_direct_raw_capture(
+                    self.args,
+                    raw_video_path,
+                    record_seconds,
+                )
 
             while time.perf_counter() < deadline:
                 item = self._latest_recording_frame()
@@ -965,22 +1155,39 @@ class ClipRecorder:
                         source_frames_seen += 1
                         if writer is None:
                             height, width = item["frame"].shape[:2]
-                            writer_args = (
-                                str(video_path),
-                                cv2.VideoWriter_fourcc(*"avc1"),
-                                fps,
-                                (width, height),
-                            )
+                            raw_height, raw_width = item.get("raw_frame", item["frame"]).shape[:2]
+                            if buffer_raw_capture and (raw_width, raw_height) != (width, height):
+                                raise RuntimeError(
+                                    "Processed and raw recording frames must have the same dimensions"
+                                )
+                            writer_args = (cv2.VideoWriter_fourcc(*"avc1"), fps, (width, height))
                             if os.name == "nt":
                                 writer = cv2.VideoWriter(
-                                    writer_args[0],
+                                    str(video_path),
                                     cv2.CAP_MSMF,
-                                    *writer_args[1:],
+                                    *writer_args,
                                 )
+                                if buffer_raw_capture and raw_video_path is not None:
+                                    raw_writer = cv2.VideoWriter(
+                                        str(raw_video_path),
+                                        cv2.CAP_MSMF,
+                                        *writer_args,
+                                    )
                             else:
-                                writer = cv2.VideoWriter(*writer_args)
+                                writer = cv2.VideoWriter(str(video_path), *writer_args)
+                                if buffer_raw_capture and raw_video_path is not None:
+                                    raw_writer = cv2.VideoWriter(
+                                        str(raw_video_path),
+                                        *writer_args,
+                                    )
                             if not writer.isOpened():
                                 raise RuntimeError(f"Could not open VideoWriter: {video_path}")
+                            if buffer_raw_capture and raw_video_path is not None and (
+                                raw_writer is None or not raw_writer.isOpened()
+                            ):
+                                raise RuntimeError(
+                                    f"Could not open raw VideoWriter: {raw_video_path}"
+                                )
                         if last_source is None:
                             last_source = item
 
@@ -1014,6 +1221,20 @@ class ClipRecorder:
                 write_sample(last_source, sample_mono)
             writer.release()
             writer = None
+            if raw_writer is not None:
+                raw_writer.release()
+                raw_writer = None
+            if direct_raw_capture and raw_capture_process is not None and raw_video_path is not None:
+                raw_capture_result = finish_direct_raw_capture(
+                    raw_capture_process,
+                    raw_video_path,
+                    record_seconds + 8.0,
+                )
+                raw_capture_process = None
+                if not raw_capture_result.get("ok"):
+                    raw_capture_error = str(raw_capture_result.get("error") or "Raw recording failed")
+                    delete_clip_paths(self.args.output_dir, [raw_video_path])
+                    raw_video_path = None
 
             if first_written_source is None or last_written_source is None:
                 raise RuntimeError("No frames were written to the clip.")
@@ -1027,7 +1248,7 @@ class ClipRecorder:
                         database_cleanup_error = str(exc)
                 artifact_cleanup_errors = delete_clip_paths(
                     self.args.output_dir,
-                    [video_path, analysis_dir, json_path],
+                    [video_path, raw_video_path, analysis_dir, json_path],
                 )
                 discarded = {
                     "clip_index": clip_index,
@@ -1125,6 +1346,53 @@ class ClipRecorder:
                 "db_sync_attempts": 0,
                 "db_sync_last_attempt_at": None,
             }
+            if raw_video_path is not None:
+                if buffer_raw_capture:
+                    raw_height, raw_width = last_written_source.get(
+                        "raw_frame",
+                        last_written_source["frame"],
+                    ).shape[:2]
+                    raw_capture_result = {
+                        "ok": True,
+                        "width": raw_width,
+                        "height": raw_height,
+                        "fps": fps,
+                        "frame_count": frames_written,
+                        "duration_seconds": frames_written / fps,
+                        "size_bytes": raw_video_path.stat().st_size,
+                    }
+                sidecar.update(
+                    raw_video_path=str(raw_video_path),
+                    raw_video_codec="h264",
+                    raw_video_content="axis_camera_raw",
+                    raw_video_capture_mode=(
+                        "direct_rtsp_copy" if direct_raw_capture else "processed_buffer"
+                    ),
+                    raw_video_capture_started_at=raw_capture_started_at,
+                    raw_video_requested_resolution=str(
+                        getattr(
+                            self.args,
+                            "raw_camera_resolution",
+                            getattr(self.args, "camera_resolution", "unknown"),
+                        )
+                    ),
+                    raw_video_requested_fps=float(
+                        getattr(self.args, "raw_record_fps", fps)
+                    ),
+                    raw_video_width=raw_capture_result.get("width") if raw_capture_result else None,
+                    raw_video_height=raw_capture_result.get("height") if raw_capture_result else None,
+                    raw_video_fps=raw_capture_result.get("fps") if raw_capture_result else None,
+                    raw_video_frames=(
+                        raw_capture_result.get("frame_count") if raw_capture_result else None
+                    ),
+                    raw_video_duration_seconds=(
+                        raw_capture_result.get("duration_seconds")
+                        if raw_capture_result
+                        else None
+                    ),
+                )
+            elif save_raw_clips and raw_capture_error:
+                sidecar["raw_video_error"] = raw_capture_error
             write_json_atomic(json_path, sidecar)
             if self.database is not None:
                 sidecar["db_sync_attempts"] = 1
@@ -1153,12 +1421,17 @@ class ClipRecorder:
             with self.lock:
                 self.last_clip = sidecar
         except Exception as exc:
+            stop_direct_raw_capture(raw_capture_process)
+            raw_capture_process = None
             if writer is not None:
                 writer.release()
                 writer = None
+            if raw_writer is not None:
+                raw_writer.release()
+                raw_writer = None
             delete_clip_paths(
                 self.args.output_dir,
-                [video_path, analysis_dir, json_path],
+                [video_path, raw_video_path, analysis_dir, json_path],
             )
             failure = {
                 "clip_index": clip_index,
@@ -1178,8 +1451,11 @@ class ClipRecorder:
                 self.error = failure["error"]
                 self.failed_recordings.append(failure)
         finally:
+            stop_direct_raw_capture(raw_capture_process)
             if writer is not None:
                 writer.release()
+            if raw_writer is not None:
+                raw_writer.release()
             with self.lock:
                 self.active_recordings.pop(clip_index, None)
 
@@ -1744,6 +2020,7 @@ h2 { font-size: 16px; }
 .event span { color: #68787f; font-size: 12px; font-weight: 750; }
 .viewer { padding: 12px; display: grid; gap: 14px; }
 video, img { display: block; width: 100%; border-radius: 6px; background: #eef2f4; }
+.asset-actions { display: flex; justify-content: flex-end; }
 .meta { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid #d8e0e4; border-radius: 8px; overflow: hidden; }
 .metric { padding: 10px; min-height: 62px; border-right: 1px solid #d8e0e4; }
 .metric:last-child { border-right: 0; }
@@ -1915,6 +2192,7 @@ async function loadEvent(eventId) {
   $('detail-state').textContent = data.status || '';
   $('viewer').innerHTML = `
     ${data.video_url ? `<video controls preload="metadata" src="${esc(data.video_url)}"></video>` : '<div class="empty">No video asset is available.</div>'}
+    ${data.raw_video_url ? `<div class="asset-actions"><a class="btn" href="${esc(data.raw_video_url)}" target="_blank" rel="noopener">Raw clip</a></div>` : ''}
     <div class="meta">
       ${metric('PLC signal', dateTime(data.plc_source_timestamp || data.app_received_at))}
       ${metric('Recording', `${dateTime(data.recording_started_at)} - ${dateTime(data.recording_ended_at)}`)}
@@ -2111,6 +2389,8 @@ def read_clip_sidecar(
     data["clip_id"] = json_path.stem
     data["json_path"] = str(json_path)
     data["video_url"] = f"/api/live/clips/{json_path.stem}/video"
+    if data.get("raw_video_path"):
+        data["raw_video_url"] = f"/api/live/clips/{json_path.stem}/raw-video"
     data["detail_url"] = f"/history/{json_path.stem}"
     for snapshot in snapshots:
         if snapshot.get("original_overlay_file"):
@@ -2150,6 +2430,7 @@ def legacy_history_event(json_path: Path, *, detail: bool) -> dict[str, Any] | N
         "detected_piece_count": int(summary.get("detected_count") or 0),
         "valid_piece_count": int(summary.get("valid_count") or 0),
         "video_url": data.get("video_url"),
+        "raw_video_url": data.get("raw_video_url"),
         "detail_url": f"/history/{event_id}",
         "database_mode": "simulation",
     }
@@ -2211,10 +2492,19 @@ def database_event_detail(event_id: str) -> dict[str, Any] | None:
             if asset:
                 snapshot[url_key] = f"/api/history/events/{event_id}/assets/{asset['id']}"
     video = next((asset for asset in assets if asset.get("asset_type") == "video"), None)
+    raw_video = next(
+        (asset for asset in assets if asset.get("asset_type") == "raw_video"),
+        None,
+    )
     event["snapshots"] = snapshots
     event["assets"] = assets
     event["video_url"] = (
         f"/api/history/events/{event_id}/assets/{video['id']}" if video else None
+    )
+    event["raw_video_url"] = (
+        f"/api/history/events/{event_id}/assets/{raw_video['id']}"
+        if raw_video
+        else None
     )
     event["detail_url"] = f"/history/{event_id}"
     event["database_mode"] = database_mode()
@@ -2224,7 +2514,7 @@ def database_event_detail(event_id: str) -> dict[str, Any] | None:
 def delete_clip_artifacts(output_dir: Path, json_path: Path) -> None:
     data = read_clip_sidecar(json_path, snapshot_limit=0) or {}
     candidates: list[Path] = [json_path]
-    for key in ("video_path", "analysis_dir"):
+    for key in ("video_path", "raw_video_path", "analysis_dir"):
         value = data.get(key)
         if value:
             candidates.append(Path(value))
@@ -2357,6 +2647,47 @@ def api_history_event_video(event_id: str):
     return send_file(video_path, mimetype="video/mp4", conditional=True)
 
 
+@app.route("/api/history/events/<event_id>/raw-video")
+def api_history_event_raw_video(event_id: str):
+    try:
+        event = database_event_detail(event_id)
+    except DatabaseUnavailable:
+        abort(503)
+    if event is None:
+        abort(404)
+    if _database is None:
+        clip_id = event.get("clip_id")
+        json_path = find_clip_json(str(clip_id)) if clip_id else None
+        if json_path is None:
+            abort(404)
+        data = read_clip_sidecar(json_path, snapshot_limit=0) or {}
+        raw_video_path = Path(str(data.get("raw_video_path", "")))
+    else:
+        raw_video_asset = next(
+            (
+                asset
+                for asset in event.get("assets", [])
+                if asset.get("asset_type") == "raw_video"
+            ),
+            None,
+        )
+        if raw_video_asset is None:
+            abort(404)
+        try:
+            raw_video_path = resolve_asset_path(
+                raw_video_asset["relative_path"],
+                _args.output_dir,
+            )
+        except ValueError:
+            abort(404)
+    if not raw_video_path.is_file() or not path_is_inside(
+        raw_video_path,
+        _args.output_dir,
+    ):
+        abort(404)
+    return send_file(raw_video_path, mimetype="video/mp4", conditional=True)
+
+
 @app.route("/api/history/events/<event_id>/assets/<int:asset_id>")
 def api_history_event_asset(event_id: str, asset_id: int):
     if _database is None:
@@ -2477,6 +2808,21 @@ def api_live_clip_video(clip_id: str):
     if not video_path.exists() or not path_is_inside(video_path, clips_root(_args.output_dir)):
         abort(404)
     return send_file(video_path, mimetype="video/mp4", conditional=True)
+
+
+@app.route("/api/live/clips/<clip_id>/raw-video")
+def api_live_clip_raw_video(clip_id: str):
+    json_path = find_clip_json(clip_id)
+    if json_path is None:
+        abort(404)
+    data = read_clip_sidecar(json_path, snapshot_limit=0) or {}
+    raw_video_path = Path(str(data.get("raw_video_path", "")))
+    if not raw_video_path.exists() or not path_is_inside(
+        raw_video_path,
+        clips_root(_args.output_dir),
+    ):
+        abort(404)
+    return send_file(raw_video_path, mimetype="video/mp4", conditional=True)
 
 
 @app.route("/api/live/clips/<clip_id>/asset/<path:asset_name>")

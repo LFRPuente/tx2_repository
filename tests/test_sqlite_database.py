@@ -21,6 +21,8 @@ def write_sidecar(output_dir: Path) -> tuple[Path, str]:
     day_dir.mkdir(parents=True)
     video_path = day_dir / "clip.mp4"
     video_path.write_bytes(b"video")
+    raw_video_path = day_dir / "clip_raw.mp4"
+    raw_video_path.write_bytes(b"raw-video")
     event = {
         "event_edge": "rising",
         "event_value": True,
@@ -84,6 +86,7 @@ def write_sidecar(output_dir: Path) -> tuple[Path, str]:
         "first_frame_index": 9,
         "last_frame_index": 89,
         "video_path": str(video_path),
+        "raw_video_path": str(raw_video_path),
         "processing_snapshots": snapshots,
         "vision_configuration": {
             "homography_sha256": "h" * 64,
@@ -133,6 +136,9 @@ class SQLiteDatabaseTests(unittest.TestCase):
         self.assertEqual(len(detail["snapshots"]), 1)
         self.assertTrue(
             any(asset["asset_type"] == "video" for asset in detail["assets"])
+        )
+        self.assertTrue(
+            any(asset["asset_type"] == "raw_video" for asset in detail["assets"])
         )
         self.assertTrue(self.repository.health().ok)
 

@@ -22,6 +22,8 @@ from live_mvp_app import (
     ClipRecorder,
     FrameBuffer,
     LiveProcessor,
+    build_raw_rtsp_url,
+    direct_raw_capture_enabled,
     mark_measurement_evidence_snapshot,
     measurement_evidence_snapshots,
     measurement_marker_active,
@@ -41,6 +43,7 @@ class FakeOverlayProcessor:
             return None
         processed = item.copy()
         processed["frame"] = np.full_like(item["frame"], (0, 0, 240))
+        processed["raw_frame"] = item["frame"]
         return processed
 
     def snapshot(self, include_images: bool = False) -> dict:
@@ -123,6 +126,38 @@ class FrameBufferTests(unittest.TestCase):
         )
 
 
+class RawCaptureTests(unittest.TestCase):
+    def test_raw_rtsp_requests_camera_native_resolution_and_sixty_fps(self) -> None:
+        args = SimpleNamespace(
+            camera_user="axis user",
+            camera_password="p@ss word",
+            camera_ip="10.14.115.241",
+            codec="h264",
+            raw_camera_resolution="2880x2160",
+            raw_record_fps=60.0,
+            raw_rtsp_url="",
+        )
+
+        url = build_raw_rtsp_url(args)
+
+        self.assertIn("resolution=2880x2160", url)
+        self.assertIn("fps=60", url)
+        self.assertIn("dynamicfps=0", url)
+        self.assertIn("axis%20user:p%40ss%20word@", url)
+
+    def test_direct_raw_copy_is_only_used_for_camera_sources(self) -> None:
+        self.assertTrue(
+            direct_raw_capture_enabled(
+                SimpleNamespace(save_raw_clips=True, source="rtsp")
+            )
+        )
+        self.assertFalse(
+            direct_raw_capture_enabled(
+                SimpleNamespace(save_raw_clips=True, source="video")
+            )
+        )
+
+
 class LiveProcessorTests(unittest.TestCase):
     def test_recording_frame_is_available_without_entering_api_payloads(self) -> None:
         processor = LiveProcessor(SimpleNamespace(process_fps=10.0), FrameBuffer(maxlen=8))
@@ -166,6 +201,7 @@ class HistoryTests(unittest.TestCase):
     def test_history_only_renders_the_green_measurement_evidence(self) -> None:
         self.assertIn("PLC + 2 s measurement frame", HISTORY_HTML)
         self.assertIn('class="measurement-evidence"', HISTORY_HTML)
+        self.assertIn("Raw clip", HISTORY_HTML)
         self.assertNotIn("Up to 6 representative captures", HISTORY_HTML)
         self.assertNotIn("No diagram evidence", HISTORY_HTML)
         self.assertNotIn("SQLite temporal is active", HISTORY_HTML)
@@ -256,6 +292,7 @@ class ClipRecorderTests(unittest.TestCase):
                 record_seconds=0.4,
                 record_fps=10.0,
                 capture_fps=30.0,
+                save_raw_clips=True,
                 measurement_delay_seconds=0.2,
                 max_clips=10,
             )
@@ -319,6 +356,10 @@ class ClipRecorderTests(unittest.TestCase):
                 self.assertEqual(data["frames_written"], 4)
                 self.assertAlmostEqual(data["video_duration_seconds"], 0.4, places=3)
                 self.assertEqual(data["video_content"], "yolo_processed_overlay")
+                self.assertEqual(data["raw_video_content"], "axis_camera_raw")
+                self.assertEqual(data["raw_video_capture_mode"], "processed_buffer")
+                self.assertEqual(data["raw_video_fps"], 10.0)
+                self.assertEqual(data["raw_video_frames"], 4)
                 self.assertEqual(data["measurement_delay_seconds"], 0.2)
                 self.assertEqual(data["measurement_marker_first_video_frame_index"], 2)
                 self.assertEqual(data["measurement_marker_frames_written"], 2)
@@ -359,6 +400,43 @@ class ClipRecorderTests(unittest.TestCase):
                     self.assertTrue(green_perimeter_found)
                 finally:
                     video.release()
+
+                raw_video = cv2.VideoCapture(data["raw_video_path"])
+                try:
+                    self.assertTrue(raw_video.isOpened())
+                    self.assertEqual(int(raw_video.get(cv2.CAP_PROP_FRAME_COUNT)), 4)
+                    self.assertAlmostEqual(
+                        raw_video.get(cv2.CAP_PROP_FPS),
+                        10.0,
+                        delta=0.2,
+                    )
+                    green_perimeter_found = False
+                    red_overlay_found = False
+                    while True:
+                        ok, raw_frame = raw_video.read()
+                        if not ok:
+                            break
+                        blue, green, red = raw_frame.mean(axis=(0, 1))
+                        if red > blue + 100 and red > green + 100:
+                            red_overlay_found = True
+                        perimeter = np.concatenate(
+                            (
+                                raw_frame[:8].reshape(-1, 3),
+                                raw_frame[-8:].reshape(-1, 3),
+                                raw_frame[:, :8].reshape(-1, 3),
+                                raw_frame[:, -8:].reshape(-1, 3),
+                            )
+                        )
+                        green_pixels = (
+                            (perimeter[:, 1] > perimeter[:, 0] + 30)
+                            & (perimeter[:, 1] > perimeter[:, 2] + 30)
+                        )
+                        if float(green_pixels.mean()) > 0.10:
+                            green_perimeter_found = True
+                    self.assertFalse(red_overlay_found)
+                    self.assertFalse(green_perimeter_found)
+                finally:
+                    raw_video.release()
 
     def test_failed_overlapping_clip_is_not_hidden_by_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
