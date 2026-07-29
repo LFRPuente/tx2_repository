@@ -54,16 +54,22 @@ from tx2_sqlite_database import SQLiteDatabaseRepository
 DEFAULT_VIDEO = Path(r"C:\Users\luis_\Downloads\20260724_10\20260724_100105_6439.mkv")
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
 DEFAULT_DATASET_DIR = ROOT / "dataset_pieces"
-DEFAULT_PIECE_MODEL_V2 = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v2" / "weights" / "best.pt"
-DEFAULT_PIECE_MODEL_V1 = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v1" / "weights" / "best.pt"
+DEFAULT_PIECE_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v3" / "weights" / "best.pt"
+PREVIOUS_PIECE_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v2" / "weights" / "best.pt"
+OLDER_PIECE_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v1" / "weights" / "best.pt"
 DEFAULT_LEGACY_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_tubos_v1" / "weights" / "best.pt"
 DEFAULT_MODEL = next(
     (
         path
-        for path in (DEFAULT_PIECE_MODEL_V2, DEFAULT_PIECE_MODEL_V1, DEFAULT_LEGACY_MODEL)
+        for path in (
+            DEFAULT_PIECE_MODEL,
+            PREVIOUS_PIECE_MODEL,
+            OLDER_PIECE_MODEL,
+            DEFAULT_LEGACY_MODEL,
+        )
         if path.exists()
     ),
-    DEFAULT_LEGACY_MODEL,
+    DEFAULT_PIECE_MODEL,
 )
 DEFAULT_ENDPOINT = "opc.tcp://10.14.6.48:49320"
 DEFAULT_WATCHDOG_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.VisionWD"
@@ -1188,6 +1194,13 @@ class ClipRecorder:
                 )
 
             while time.perf_counter() < deadline:
+                self._capture_processing_snapshot(
+                    analysis_dir,
+                    processing_snapshots,
+                    seen_processing_frames,
+                    event_mono,
+                    deadline,
+                )
                 item = self._latest_recording_frame()
                 if item is not None and int(item["index"]) > last_index:
                     last_index = int(item["index"])
@@ -1238,13 +1251,6 @@ class ClipRecorder:
                                 break
                             write_sample(last_source, sample_mono)
                         last_source = item
-                self._capture_processing_snapshot(
-                    analysis_dir,
-                    processing_snapshots,
-                    seen_processing_frames,
-                    event_mono,
-                    deadline,
-                )
                 time.sleep(0.025)
             self._capture_processing_snapshot(
                 analysis_dir,

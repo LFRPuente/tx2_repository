@@ -202,13 +202,14 @@ desplegarse juntos:
 ```text
 outputs/homography_selection.json
 outputs/table_measurement_calibration.json
+runs/detect/runs_tx2/yolo11n_pieces_v3/weights/best.pt
 runs/detect/runs_tx2/yolo11n_pieces_v2/weights/best.pt
 runs/detect/runs_tx2/yolo11n_pieces_v1/weights/best.pt
 ```
 
-El checkpoint v2 es opcional hasta completar el nuevo entrenamiento; los
-launchers usan v1 mientras no exista. No se debe copiar solo el modelo ni solo
-la homografia. Las coordenadas de boxes,
+El checkpoint v3 es el modelo vigente. Los launchers usan v2, v1 y finalmente
+el modelo legacy como fallbacks explicitos. No se debe copiar solo el modelo ni
+solo la homografia. Las coordenadas de boxes,
 zonas, referencia y Sobel viven en la imagen rectificada; por eso dependen de la
 misma matriz y del mismo `output_size`.
 
@@ -243,6 +244,35 @@ El ROI usa:
 
 Estos valores son contexto, no constantes de codigo. La fuente de verdad sigue
 siendo `outputs/homography_selection.json`.
+
+#### 5.1.1 Mapa espacial de escala
+
+La imagen rectificada no se deforma para igualar los valores `px/in`. El tool
+conserva la homografia y construye un mapa local dentro de
+`table_measurement_calibration.json`:
+
+- segmentos verticales alimentan `scale_map.axes.y`;
+- segmentos horizontales alimentan `scale_map.axes.x`;
+- segmentos diagonales se ignoran para no mezclar escalas de ambos ejes.
+
+Con referencias distribuidas solamente en X o Y se usa interpolacion lineal
+limitada al valor del borde. Con cuatro o mas referencias que cubren ambos ejes
+se usa IDW 2D. Cada medicion de pieza integra `scaleY(x,y)` desde la linea de
+referencia hasta el frente Sobel. La regla manual integra `scaleX` y `scaleY`
+por toda su trayectoria.
+
+El Live recibe el mapa dentro del mismo JSON de calibracion, por lo que no
+requiere una transformacion nueva ni cambios en las cajas YOLO. Si una
+trayectoria queda fuera de cobertura se conserva el valor de escala del borde y
+el resultado incluye `scale_extrapolated` y `scale_coverage_ratio`.
+
+Flujo operativo:
+
+1. agregar referencias Y a izquierda, centro y derecha;
+2. agregar referencias X si se usara la regla horizontal o libre;
+3. pulsar `Guardar y crear mapa`;
+4. revisar overlay, rango y cobertura;
+5. validar medidas en `Reproductor`.
 
 ### 5.2 Calibracion actual
 
@@ -317,7 +347,7 @@ El porcentaje se calcula respecto al box, no respecto al area de la zona.
 Checkpoint:
 
 ```text
-runs/detect/runs_tx2/yolo11n_pieces_v1/weights/best.pt
+runs/detect/runs_tx2/yolo11n_pieces_v3/weights/best.pt
 ```
 
 Entrenamiento:
@@ -1649,7 +1679,7 @@ Extender `/api/live/status`:
     "last_write_utc": "..."
   },
   "configuration": {
-    "model": "yolo11n_pieces_v1",
+    "model": "yolo11n_pieces_v3",
     "homography_sha256": "...",
     "calibration_sha256": "...",
     "red_zone_count": 2,
@@ -1725,8 +1755,7 @@ Validar archivos:
 ```powershell
 Test-Path outputs\homography_selection.json
 Test-Path outputs\table_measurement_calibration.json
-Test-Path runs\detect\runs_tx2\yolo11n_pieces_v2\weights\best.pt
-Test-Path runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt
+Test-Path runs\detect\runs_tx2\yolo11n_pieces_v3\weights\best.pt
 ```
 
 Validar PostgreSQL:

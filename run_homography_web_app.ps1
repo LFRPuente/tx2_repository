@@ -5,22 +5,30 @@ $scriptPath = Join-Path $root "homography_web_app.py"
 $outputDir = Join-Path $root "outputs"
 $videoDir = Join-Path $outputDir "live_plc_clips"
 $datasetDir = Join-Path $root "dataset_pieces"
-$pieceModelV2Path = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v2\weights\best.pt"
-$pieceModelV1Path = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt"
+$pieceModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v3\weights\best.pt"
+$previousPieceModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v2\weights\best.pt"
+$olderPieceModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt"
 $legacyModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_tubos_v1\weights\best.pt"
-$modelPath = if (Test-Path -LiteralPath $pieceModelV2Path) {
-    $pieceModelV2Path
-}
-elseif (Test-Path -LiteralPath $pieceModelV1Path) {
-    $pieceModelV1Path
-}
-else {
-    $legacyModelPath
-}
+$modelPath = @($pieceModelPath, $previousPieceModelPath, $olderPieceModelPath, $legacyModelPath) |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    Select-Object -First 1
 
+if (-not $modelPath) {
+    throw "No YOLO model was found. Expected the current model at: $pieceModelPath"
+}
 if ($modelPath -eq $legacyModelPath) {
     Write-Warning "Individual-piece model not found. Annotation uses dataset_pieces; prediction still uses the legacy package model."
 }
+elseif ($modelPath -eq $previousPieceModelPath) {
+    Write-Warning "Current individual-piece model not found. Annotation is using the previous v2 model."
+}
+elseif ($modelPath -eq $olderPieceModelPath) {
+    Write-Warning "Current individual-piece models not found. Annotation is using the older v1 model."
+}
+
+$modelHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $modelPath).Hash
+Write-Host "Model: $modelPath"
+Write-Host "Model SHA-256: $modelHash"
 
 $candidates = @(
     (Join-Path $root ".venv-gpu\Scripts\python.exe")
