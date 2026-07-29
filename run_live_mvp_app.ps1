@@ -125,14 +125,15 @@ else {
   --conf $Confidence `
   --capture-fps 10 `
   --process-fps 10 `
-  --buffer-seconds 2 `
+  --buffer-seconds 3 `
   --buffer-max-frames 60 `
   --record-seconds 8 `
   --record-fps 10 `
+  --pre-trigger-seconds 2 `
   --save-raw-clips `
   --raw-camera-resolution 2880x2160 `
   --raw-record-fps 30 `
-  --measurement-delay-seconds 2 `
+  --measurement-delay-seconds 0 `
   --max-clips 100 `
   --plc-enabled `
   --plc-edge rising `

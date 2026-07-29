@@ -74,7 +74,8 @@ DEFAULT_MODEL = next(
 DEFAULT_ENDPOINT = "opc.tcp://10.14.6.48:49320"
 DEFAULT_WATCHDOG_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.VisionWD"
 DEFAULT_EVENT_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.MeasureLength"
-DEFAULT_MEASUREMENT_DELAY_SECONDS = 2.0
+DEFAULT_PRE_TRIGGER_SECONDS = 2.0
+DEFAULT_MEASUREMENT_DELAY_SECONDS = 0.0
 MEASUREMENT_MARKER_DURATION_SECONDS = 0.8
 
 
@@ -233,10 +234,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--capture-fps", type=float, default=10.0)
     parser.add_argument("--process-fps", type=float, default=10.0)
-    parser.add_argument("--buffer-seconds", type=float, default=2.0)
+    parser.add_argument("--buffer-seconds", type=float, default=3.0)
     parser.add_argument("--buffer-max-frames", type=int, default=60)
     parser.add_argument("--record-seconds", type=float, default=8.0)
     parser.add_argument("--record-fps", type=float, default=10.0)
+    parser.add_argument(
+        "--pre-trigger-seconds",
+        type=float,
+        default=DEFAULT_PRE_TRIGGER_SECONDS,
+        help="Seconds kept before the PLC event inside each fixed-duration clip.",
+    )
     parser.add_argument(
         "--save-raw-clips",
         action="store_true",
@@ -276,11 +283,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db-disabled", action="store_true")
     parser.add_argument("--db-retry-seconds", type=float, default=15.0)
     args = parser.parse_args()
+    if args.pre_trigger_seconds < 0:
+        parser.error("--pre-trigger-seconds must be zero or greater")
+    if args.pre_trigger_seconds >= args.record_seconds:
+        parser.error("--pre-trigger-seconds must be shorter than --record-seconds")
+    if args.buffer_seconds < args.pre_trigger_seconds:
+        parser.error("--buffer-seconds must be at least --pre-trigger-seconds")
     if args.measurement_delay_seconds < 0:
         parser.error("--measurement-delay-seconds must be zero or greater")
-    if args.measurement_delay_seconds >= args.record_seconds:
+    if args.measurement_delay_seconds >= (
+        args.record_seconds - args.pre_trigger_seconds
+    ):
         parser.error(
-            "--measurement-delay-seconds must be shorter than --record-seconds"
+            "--measurement-delay-seconds must fit after the PLC event inside the clip"
         )
     if args.raw_record_fps <= 0 or args.raw_record_fps > 60:
         parser.error("--raw-record-fps must be greater than zero and no more than 60")
@@ -619,6 +634,21 @@ class FrameBuffer:
             selected = [item for item in self._frames if int(item["index"]) > int(min_index)]
             return [item.copy() for item in selected]
 
+    def frames_between(
+        self,
+        start_monotonic: float,
+        end_monotonic: float,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            selected = [
+                item
+                for item in self._frames
+                if float(start_monotonic)
+                <= float(item["monotonic"])
+                < float(end_monotonic)
+            ]
+            return [item.copy() for item in selected]
+
     def stats(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -737,6 +767,21 @@ class LiveProcessor:
     def __init__(self, args: argparse.Namespace, buffer: FrameBuffer) -> None:
         self.args = args
         self.buffer = buffer
+        history_frames = int(
+            max(
+                8,
+                math.ceil(
+                    float(getattr(args, "buffer_seconds", 3.0))
+                    * max(1.0, float(getattr(args, "process_fps", 10.0)))
+                )
+                + 2,
+            )
+        )
+        history_limit = max(
+            8,
+            int(getattr(args, "buffer_max_frames", history_frames)),
+        )
+        self.recording_buffer = FrameBuffer(maxlen=min(history_frames, history_limit))
         device_info = vision.resolve_yolo_device(getattr(args, "device", "auto"))
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name="live-vision-processor", daemon=True)
@@ -795,6 +840,13 @@ class LiveProcessor:
             item = result.get("_recording_frame")
             return item.copy() if isinstance(item, dict) else None
 
+    def recording_frames_between(
+        self,
+        start_monotonic: float,
+        end_monotonic: float,
+    ) -> list[dict[str, Any]]:
+        return self.recording_buffer.frames_between(start_monotonic, end_monotonic)
+
     def _set_state(self, **updates: Any) -> None:
         with self.lock:
             self.state.update(updates)
@@ -815,6 +867,9 @@ class LiveProcessor:
                 result = self._process(item)
                 last_processed_index = int(item["index"])
                 duration_ms = round((time.perf_counter() - started) * 1000.0, 1)
+                recording_frame = result.get("_recording_frame")
+                if isinstance(recording_frame, dict):
+                    self.recording_buffer.append(recording_frame)
                 self._set_state(
                     ok=True,
                     processing=False,
@@ -932,6 +987,7 @@ class ClipRecorder:
         with self.lock:
             now = time.perf_counter()
             measurement_delay_seconds = self._measurement_delay_seconds()
+            pre_trigger_seconds = self._pre_trigger_seconds()
             measurement_marker_active_now = any(
                 measurement_marker_active(
                     now,
@@ -951,6 +1007,7 @@ class ClipRecorder:
                 "failed_recordings": [failure.copy() for failure in self.failed_recordings],
                 "error": self.error,
                 "record_seconds": self.args.record_seconds,
+                "pre_trigger_seconds": pre_trigger_seconds,
                 "save_raw_clips": bool(
                     getattr(self.args, "save_raw_clips", False)
                 ),
@@ -986,6 +1043,12 @@ class ClipRecorder:
                     DEFAULT_MEASUREMENT_DELAY_SECONDS,
                 )
             ),
+        )
+
+    def _pre_trigger_seconds(self) -> float:
+        return max(
+            0.0,
+            float(getattr(self.args, "pre_trigger_seconds", 0.0)),
         )
 
     def _latest_recording_frame(self) -> dict[str, Any] | None:
@@ -1121,7 +1184,13 @@ class ClipRecorder:
             db_sync_status = "pending"
             db_sync_error = str(exc)
         record_seconds = max(0.1, float(self.args.record_seconds))
-        deadline = event_mono + record_seconds
+        pre_trigger_seconds = min(
+            self._pre_trigger_seconds(),
+            max(0.0, record_seconds - 0.1),
+        )
+        clip_start_mono = event_mono - pre_trigger_seconds
+        deadline = clip_start_mono + record_seconds
+        post_trigger_seconds = max(0.0, deadline - event_mono)
         measurement_delay_seconds = self._measurement_delay_seconds()
         measurement_target_mono = event_mono + measurement_delay_seconds
         save_raw_clips = bool(getattr(self.args, "save_raw_clips", False))
@@ -1174,6 +1243,74 @@ class ClipRecorder:
             last_written_source = source
             frames_written += 1
 
+        def ensure_writers(source: dict[str, Any]) -> None:
+            nonlocal writer
+            nonlocal raw_writer
+            if writer is not None:
+                return
+            if video_path is None:
+                raise RuntimeError("Video output path is not available")
+            height, width = source["frame"].shape[:2]
+            raw_height, raw_width = source.get("raw_frame", source["frame"]).shape[:2]
+            if buffer_raw_capture and (raw_width, raw_height) != (width, height):
+                raise RuntimeError(
+                    "Processed and raw recording frames must have the same dimensions"
+                )
+            writer_args = (cv2.VideoWriter_fourcc(*"avc1"), fps, (width, height))
+            if os.name == "nt":
+                writer = cv2.VideoWriter(
+                    str(video_path),
+                    cv2.CAP_MSMF,
+                    *writer_args,
+                )
+                if buffer_raw_capture and raw_video_path is not None:
+                    raw_writer = cv2.VideoWriter(
+                        str(raw_video_path),
+                        cv2.CAP_MSMF,
+                        *writer_args,
+                    )
+            else:
+                writer = cv2.VideoWriter(str(video_path), *writer_args)
+                if buffer_raw_capture and raw_video_path is not None:
+                    raw_writer = cv2.VideoWriter(
+                        str(raw_video_path),
+                        *writer_args,
+                    )
+            if not writer.isOpened():
+                raise RuntimeError(f"Could not open VideoWriter: {video_path}")
+            if buffer_raw_capture and raw_video_path is not None and (
+                raw_writer is None or not raw_writer.isOpened()
+            ):
+                raise RuntimeError(f"Could not open raw VideoWriter: {raw_video_path}")
+
+        def consume_source(source: dict[str, Any]) -> None:
+            nonlocal last_index
+            nonlocal last_source
+            nonlocal source_frames_seen
+            source_index = int(source["index"])
+            if source_index <= last_index:
+                return
+            last_index = source_index
+            source_monotonic = float(source["monotonic"])
+            if source_monotonic < clip_start_mono or source_monotonic >= deadline:
+                return
+            source_frames_seen += 1
+            ensure_writers(source)
+            if last_source is None:
+                last_source = source
+            next_sample_mono = clip_start_mono + (frames_written / fps)
+            if (
+                float(last_source["monotonic"]) < event_mono <= source_monotonic
+                and next_sample_mono >= event_mono
+            ):
+                last_source = source
+            while frames_written < target_frame_count:
+                sample_mono = clip_start_mono + (frames_written / fps)
+                if sample_mono > source_monotonic:
+                    break
+                write_sample(last_source, sample_mono)
+            last_source = source
+
         try:
             day_dir = self.args.output_dir / "live_plc_clips" / datetime.now().strftime("%Y-%m-%d")
             day_dir.mkdir(parents=True, exist_ok=True)
@@ -1193,6 +1330,26 @@ class ClipRecorder:
                     record_seconds,
                 )
 
+            historical_frames: list[dict[str, Any]] = []
+            if pre_trigger_seconds > 0:
+                history_reader = getattr(
+                    self.processor,
+                    "recording_frames_between",
+                    None,
+                )
+                if callable(history_reader):
+                    historical_frames = history_reader(
+                        clip_start_mono,
+                        event_mono,
+                    )
+                elif self.processor is None:
+                    historical_frames = self.buffer.frames_between(
+                        clip_start_mono,
+                        event_mono,
+                    )
+            for historical_frame in historical_frames:
+                consume_source(historical_frame)
+
             while time.perf_counter() < deadline:
                 self._capture_processing_snapshot(
                     analysis_dir,
@@ -1202,55 +1359,8 @@ class ClipRecorder:
                     deadline,
                 )
                 item = self._latest_recording_frame()
-                if item is not None and int(item["index"]) > last_index:
-                    last_index = int(item["index"])
-                    item_mono = float(item["monotonic"])
-                    if item_mono >= event_mono:
-                        source_frames_seen += 1
-                        if writer is None:
-                            height, width = item["frame"].shape[:2]
-                            raw_height, raw_width = item.get("raw_frame", item["frame"]).shape[:2]
-                            if buffer_raw_capture and (raw_width, raw_height) != (width, height):
-                                raise RuntimeError(
-                                    "Processed and raw recording frames must have the same dimensions"
-                                )
-                            writer_args = (cv2.VideoWriter_fourcc(*"avc1"), fps, (width, height))
-                            if os.name == "nt":
-                                writer = cv2.VideoWriter(
-                                    str(video_path),
-                                    cv2.CAP_MSMF,
-                                    *writer_args,
-                                )
-                                if buffer_raw_capture and raw_video_path is not None:
-                                    raw_writer = cv2.VideoWriter(
-                                        str(raw_video_path),
-                                        cv2.CAP_MSMF,
-                                        *writer_args,
-                                    )
-                            else:
-                                writer = cv2.VideoWriter(str(video_path), *writer_args)
-                                if buffer_raw_capture and raw_video_path is not None:
-                                    raw_writer = cv2.VideoWriter(
-                                        str(raw_video_path),
-                                        *writer_args,
-                                    )
-                            if not writer.isOpened():
-                                raise RuntimeError(f"Could not open VideoWriter: {video_path}")
-                            if buffer_raw_capture and raw_video_path is not None and (
-                                raw_writer is None or not raw_writer.isOpened()
-                            ):
-                                raise RuntimeError(
-                                    f"Could not open raw VideoWriter: {raw_video_path}"
-                                )
-                        if last_source is None:
-                            last_source = item
-
-                        while frames_written < target_frame_count:
-                            sample_mono = event_mono + (frames_written / fps)
-                            if sample_mono > item_mono:
-                                break
-                            write_sample(last_source, sample_mono)
-                        last_source = item
+                if item is not None:
+                    consume_source(item)
                 time.sleep(0.025)
             self._capture_processing_snapshot(
                 analysis_dir,
@@ -1264,7 +1374,7 @@ class ClipRecorder:
                 raise RuntimeError("No frames were available to record the clip.")
 
             while frames_written < target_frame_count:
-                sample_mono = event_mono + (frames_written / fps)
+                sample_mono = clip_start_mono + (frames_written / fps)
                 write_sample(last_source, sample_mono)
             writer.release()
             writer = None
@@ -1348,6 +1458,11 @@ class ClipRecorder:
                 "camera_source": self._camera_source(),
                 "vision_configuration": vision_configuration,
                 "record_seconds": record_seconds,
+                "pre_trigger_seconds": pre_trigger_seconds,
+                "post_trigger_seconds": post_trigger_seconds,
+                "plc_event_video_offset_seconds": pre_trigger_seconds,
+                "clip_start_monotonic": clip_start_mono,
+                "clip_end_monotonic": deadline,
                 "video_fps": fps,
                 "video_codec": "h264",
                 "video_content": "yolo_processed_overlay" if self.processor is not None else "raw_fallback",
@@ -1414,6 +1529,12 @@ class ClipRecorder:
                     raw_video_content="axis_camera_raw",
                     raw_video_capture_mode=(
                         "direct_rtsp_copy" if direct_raw_capture else "processed_buffer"
+                    ),
+                    raw_video_pre_trigger_seconds=(
+                        0.0 if direct_raw_capture else pre_trigger_seconds
+                    ),
+                    raw_video_plc_event_offset_seconds=(
+                        0.0 if direct_raw_capture else pre_trigger_seconds
                     ),
                     raw_video_capture_started_at=raw_capture_started_at,
                     raw_video_requested_resolution=str(
@@ -2252,7 +2373,7 @@ async function loadEvent(eventId) {
     </div>
     <div class="section-head"><h3>Piece measurements</h3><span class="muted">Canonical processed frame</span></div>
     ${renderPieces(data.pieces, data.database_mode)}
-    <div class="section-head"><h3>Processing evidence</h3><span class="muted">PLC + 2 s measurement frame</span></div>
+    <div class="section-head"><h3>Processing evidence</h3><span class="muted">PLC signal measurement frame</span></div>
     ${renderSnapshots(data.snapshots)}
   `;
   document.querySelectorAll('.edit-piece').forEach((button) => button.addEventListener('click', () => openCorrection(button.dataset.pieceId)));

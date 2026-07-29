@@ -39,14 +39,32 @@ class FakeOverlayProcessor:
         self.buffer = buffer
         self.detects_piece = detects_piece
 
-    def recording_frame(self) -> dict | None:
-        item = self.buffer.latest()
+    def _overlay_item(self, item: dict | None) -> dict | None:
         if item is None:
             return None
         processed = item.copy()
-        processed["frame"] = np.full_like(item["frame"], (0, 0, 240))
+        color = (
+            (240, 0, 0)
+            if str(item.get("utc", "")).startswith("pre-")
+            else (0, 0, 240)
+        )
+        processed["frame"] = np.full_like(item["frame"], color)
         processed["raw_frame"] = item["frame"]
         return processed
+
+    def recording_frame(self) -> dict | None:
+        return self._overlay_item(self.buffer.latest())
+
+    def recording_frames_between(
+        self,
+        start_monotonic: float,
+        end_monotonic: float,
+    ) -> list[dict]:
+        return [
+            processed
+            for item in self.buffer.frames_between(start_monotonic, end_monotonic)
+            if (processed := self._overlay_item(item)) is not None
+        ]
 
     def snapshot(self, include_images: bool = False) -> dict:
         item = self.buffer.latest()
@@ -187,6 +205,22 @@ class FrameBufferTests(unittest.TestCase):
             {"count": 8, "first_index": 12, "last_index": 19},
         )
 
+    def test_frames_between_returns_the_pretrigger_window(self) -> None:
+        buffer = FrameBuffer(maxlen=8)
+        for index, frame_monotonic in enumerate((7.9, 8.0, 9.0, 10.0)):
+            buffer.append(
+                {
+                    "index": index,
+                    "utc": f"frame-{index}",
+                    "monotonic": frame_monotonic,
+                    "frame": np.zeros((4, 4, 3), dtype=np.uint8),
+                }
+            )
+
+        selected = buffer.frames_between(8.0, 10.0)
+
+        self.assertEqual([item["index"] for item in selected], [1, 2])
+
 
 class RawCaptureTests(unittest.TestCase):
     def test_raw_rtsp_requests_camera_native_resolution_and_thirty_fps(self) -> None:
@@ -262,7 +296,7 @@ class PlcEdgeTests(unittest.TestCase):
 
 class HistoryTests(unittest.TestCase):
     def test_history_only_renders_the_green_measurement_evidence(self) -> None:
-        self.assertIn("PLC + 2 s measurement frame", HISTORY_HTML)
+        self.assertIn("PLC signal measurement frame", HISTORY_HTML)
         self.assertIn('class="measurement-evidence"', HISTORY_HTML)
         self.assertIn("Raw clip", HISTORY_HTML)
         self.assertNotIn("Up to 6 representative captures", HISTORY_HTML)
@@ -390,11 +424,11 @@ class ClipRecorderTests(unittest.TestCase):
             self.assertTrue(snapshot["measurement_evidence"])
             self.assertGreater(float(green_pixels.mean()), 0.10)
 
-    def test_measurement_marker_starts_two_seconds_after_the_plc_event(self) -> None:
-        self.assertFalse(measurement_marker_active(11.999, 10.0))
-        self.assertTrue(measurement_marker_active(12.0, 10.0))
-        self.assertTrue(measurement_marker_active(12.799, 10.0))
-        self.assertFalse(measurement_marker_active(12.8, 10.0))
+    def test_measurement_marker_starts_at_the_plc_event(self) -> None:
+        self.assertFalse(measurement_marker_active(9.999, 10.0))
+        self.assertTrue(measurement_marker_active(10.0, 10.0))
+        self.assertTrue(measurement_marker_active(10.799, 10.0))
+        self.assertFalse(measurement_marker_active(10.8, 10.0))
 
     def test_processing_snapshots_are_strictly_inside_the_plc_window(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -417,6 +451,88 @@ class ClipRecorderTests(unittest.TestCase):
                 recorder._capture_processing_snapshot(analysis_dir, snapshots, seen, 10.0, 18.0)
 
             self.assertEqual([item["frame_index"] for item in snapshots], [2, 3])
+
+    def test_clip_starts_before_plc_and_marks_measurement_at_the_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = SimpleNamespace(
+                output_dir=Path(temp_dir),
+                record_seconds=3.0,
+                pre_trigger_seconds=0.2,
+                record_fps=10.0,
+                capture_fps=30.0,
+                save_raw_clips=False,
+                measurement_delay_seconds=0.0,
+                max_clips=10,
+            )
+            buffer = FrameBuffer(maxlen=30)
+            processor = FakeOverlayProcessor(buffer)
+            recorder = ClipRecorder(args, buffer, processor)
+            event_monotonic = time.perf_counter()
+            frame = np.zeros((48, 64, 3), dtype=np.uint8)
+            for index, offset in enumerate((-0.25, -0.15, -0.05)):
+                buffer.append(
+                    {
+                        "index": index,
+                        "utc": f"pre-{index}",
+                        "monotonic": event_monotonic + offset,
+                        "frame": frame.copy(),
+                    }
+                )
+
+            stop_feeder = threading.Event()
+
+            def feed_frames() -> None:
+                index = 3
+                while not stop_feeder.is_set():
+                    buffer.append(
+                        {
+                            "index": index,
+                            "utc": f"post-{index}",
+                            "monotonic": time.perf_counter(),
+                            "frame": frame.copy(),
+                        }
+                    )
+                    index += 1
+                    time.sleep(0.01)
+
+            feeder = threading.Thread(target=feed_frames, daemon=True)
+            feeder.start()
+            self.addCleanup(stop_feeder.set)
+            self.addCleanup(feeder.join, 1.0)
+
+            recorder.start_event_clip(
+                {
+                    "event_edge": "rising",
+                    "event_read_monotonic": event_monotonic,
+                }
+            )
+            deadline = time.perf_counter() + 5.0
+            while recorder.snapshot()["recording"] and time.perf_counter() < deadline:
+                time.sleep(0.02)
+            stop_feeder.set()
+            feeder.join(timeout=1.0)
+
+            sidecars = list(Path(temp_dir).rglob("*.json"))
+            self.assertEqual(len(sidecars), 1)
+            data = json.loads(sidecars[0].read_text(encoding="utf-8"))
+            self.assertEqual(data["frames_written"], 30)
+            self.assertEqual(data["first_frame_index"], 1)
+            self.assertEqual(data["pre_trigger_seconds"], 0.2)
+            self.assertAlmostEqual(data["post_trigger_seconds"], 2.8, places=3)
+            self.assertEqual(data["plc_event_video_offset_seconds"], 0.2)
+            self.assertEqual(data["measurement_delay_seconds"], 0.0)
+            self.assertEqual(data["measurement_marker_first_video_frame_index"], 2)
+            self.assertEqual(data["measurement_marker_frames_written"], 8)
+            video = cv2.VideoCapture(data["video_path"])
+            try:
+                video.set(cv2.CAP_PROP_POS_FRAMES, 2)
+                ok, measurement_frame = video.read()
+                self.assertTrue(ok)
+                center = measurement_frame[12:-12, 12:-12]
+                blue, _green, red = center.mean(axis=(0, 1))
+                self.assertGreater(red, blue + 100)
+            finally:
+                video.release()
 
     def test_overlapping_events_keep_separate_fixed_duration_clips(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

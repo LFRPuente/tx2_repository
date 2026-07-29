@@ -58,11 +58,12 @@ Cuando esta integracion termine, un ciclo de produccion debe verse asi:
 8. Cada frente se fuerza a una linea horizontal.
 9. Cada pieza se mide contra la linea de referencia usando la escala vigente.
 10. El frontend muestra la imagen original, el esquema y la tabla de piezas.
-11. Una señal rising del PLC crea un evento de medicion y comienza una
-    grabacion independiente de 8 segundos.
-12. La medida automatica se toma en el primer frame procesado a partir de
-    `señal PLC + 2.0 segundos`; el perimetro se muestra verde en Live y queda
-    grabado en verde durante 0.8 segundos dentro del MP4 procesado.
+11. Una señal rising del PLC crea un evento de medicion y conserva una
+    grabacion independiente de 8 segundos: 2 segundos anteriores a la señal y
+    6 segundos posteriores.
+12. La medida automatica se toma en el primer frame procesado a partir de la
+    señal PLC. El perimetro se muestra verde en Live y queda grabado en verde
+    durante 0.8 segundos, aproximadamente en el segundo 2 del MP4 procesado.
 13. Una nueva señal crea otra ventana fija de 8 segundos. Si ambas ventanas
     coinciden en el tiempo, se conservan como clips separados sin truncarlas.
 14. La ventana solo se conserva si YOLO detecta al menos una pieza. Si no
@@ -70,7 +71,9 @@ Cuando esta integracion termine, un ciclo de produccion debe verse asi:
 15. El evento, sus piezas, snapshots y rutas de assets se guardan en PostgreSQL.
 16. En `History`, el operador puede capturar una medida real para cada pieza.
 17. Temporalmente, cada evento valido tambien copia el H.264 crudo desde un
-    stream AXIS separado a `2880x2160`, 30 FPS y sin overlays.
+    stream AXIS separado a `2880x2160`, 30 FPS y sin overlays. Esta copia
+    directa comienza con la señal; el prebuffer de 2 segundos pertenece al MP4
+    procesado mostrado en History.
 18. La medida automatica nunca se sobrescribe. Cada cambio del operador queda
     auditado con usuario, hora, valor anterior, valor nuevo y motivo.
 
@@ -135,7 +138,10 @@ Responsabilidades actuales:
 - aplicar reglas geometricas y zonas rojas configuradas antes de Sobel;
 - conservar diagnosticos `box_rules` por snapshot;
 - leer `VisionWD` y `MeasureLength` por OPC UA;
-- iniciar clips fijos de 8 segundos con señales rising del PLC;
+- iniciar clips fijos de 8 segundos, desde 2 segundos antes hasta 6 segundos
+  despues de cada señal rising del PLC;
+- seleccionar la medida automatica en el primer frame procesado a partir de la
+  señal PLC;
 - conservar ventanas cercanas como clips independientes, incluso si se solapan;
 - guardar MP4 procesado, MP4 raw temporal, JSON y snapshots JPEG;
 - servir una interfaz ligera en ingles;
@@ -1031,8 +1037,8 @@ nueva fila por cada reconexion.
    8 segundos.
 4. Si no hubo piezas, eliminar ambos MP4, snapshots temporales y evento pendiente;
    no mostrar esa ventana en `History`.
-5. Elegir como snapshot canonico el primer frame procesado a partir de
-   `señal PLC + 2.0 segundos`.
+5. Elegir como snapshot canonico el primer frame procesado a partir de la
+   señal PLC.
 6. Insertar sus piezas en `piece_measurement`.
 7. Insertar rutas en `event_asset`.
 8. Actualizar conteos y timestamps del evento.
@@ -1052,7 +1058,7 @@ apariciones de `P1` durante 8 segundos como si fueran la misma pieza fisica.
 La regla aplicada en el Live MVP es:
 
 1. conservar `frame_monotonic` en cada resultado de `LiveProcessor`;
-2. calcular el objetivo como `event_read_monotonic + 2.0 segundos`;
+2. calcular el objetivo como `event_read_monotonic`;
 3. elegir el primer snapshot procesado cuyo tiempo sea igual o posterior al
    objetivo;
 4. usar el ultimo snapshot anterior solo como fallback si el clip termina sin
@@ -1163,7 +1169,7 @@ Debe devolver:
 - metadata PLC;
 - metadata de camara;
 - configuracion utilizada;
-- video y snapshot canonico de `PLC + 2.0 s`;
+- video desde `PLC - 2.0 s` y snapshot canonico en la señal PLC;
 - enlace al video raw temporal, cuando exista;
 - piezas ordenadas;
 - medida automatica;
@@ -1586,11 +1592,13 @@ continua pendiente.
 - se lee `MeasureLength` al cambiar watchdog;
 - rising edge crea un evento;
 - un segundo rising edge crea otra ventana sin cerrar la anterior;
-- cada ventana contiene solo frames desde su señal hasta su limite de 8 segundos;
+- cada ventana contiene 2 segundos previos y 6 segundos posteriores a su señal;
 - el MP4 procesado reporta 80 frames a 10 FPS y 8 segundos;
+- el MP4 procesado comienza 2 segundos antes de la señal y termina 6 segundos
+  despues;
 - el MP4 raw reporta aproximadamente 240 frames a 30 FPS y 8 segundos;
 - el raw no contiene overlays ni perimetro verde;
-- la medicion canonica usa el primer frame procesado a partir de `PLC + 2.0 s`;
+- la medicion canonica usa el primer frame procesado a partir de la señal PLC;
 - el perimetro verde marca ese instante en Live y en el MP4 procesado;
 - una ventana sin ninguna pieza detectada se descarta y no aparece en History;
 - dos ventanas cercanas se conservan como clips independientes;
@@ -1853,7 +1861,7 @@ La integracion esta terminada cuando:
 - [ ] La señal PLC crea exactamente un evento en la base seleccionada.
 - [x] Dos señales cercanas conservan dos clips independientes de 8 segundos.
 - [x] El evento tiene un snapshot canonico explicable.
-- [x] La medicion canonica se toma a `PLC + 2.0 s`.
+- [x] La medicion canonica se toma en la señal PLC.
 - [x] El perimetro verde queda visible en Live y grabado en el MP4.
 - [x] History lista eventos desde la base seleccionada.
 - [x] El operador puede corregir una pieza.
