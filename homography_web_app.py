@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -69,6 +70,11 @@ def parse_args() -> argparse.Namespace:
         help="Use only videos matching the resolution and FPS of the newest source video.",
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--device",
+        default=os.environ.get("TX2_YOLO_DEVICE", "auto"),
+        help="YOLO inference device: auto, cpu, cuda or cuda:N.",
+    )
     parser.add_argument("--port", type=int, default=5050)
     args = parser.parse_args()
     if args.video is None and args.video_dir is None:
@@ -1031,6 +1037,61 @@ def apply_piece_box_rules(
     return processed, diagnostics
 
 
+def resolve_yolo_device(requested: str | None = None) -> dict:
+    import torch
+
+    configured = str(requested or "auto").strip().lower()
+    if not configured:
+        configured = "auto"
+    if configured == "auto":
+        selected = "cuda:0" if torch.cuda.is_available() else "cpu"
+    elif configured == "cuda":
+        selected = "cuda:0"
+    elif configured == "cpu" or configured.startswith("cuda:"):
+        selected = configured
+    else:
+        raise RuntimeError(
+            f"Dispositivo YOLO no valido: {configured}. Usa auto, cpu, cuda o cuda:N."
+        )
+
+    cuda_available = bool(torch.cuda.is_available())
+    device_name = "CPU"
+    if selected.startswith("cuda"):
+        if not cuda_available:
+            raise RuntimeError(
+                f"Se solicito {selected}, pero PyTorch no tiene CUDA disponible."
+            )
+        device_index = torch.device(selected).index
+        if device_index is None:
+            device_index = 0
+        if device_index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"Se solicito {selected}, pero solo hay "
+                f"{torch.cuda.device_count()} GPU(s) CUDA."
+            )
+        device_name = str(torch.cuda.get_device_name(device_index))
+
+    return {
+        "requested": configured,
+        "device": selected,
+        "device_name": device_name,
+        "cuda_available": cuda_available,
+        "cuda_device_count": int(torch.cuda.device_count()),
+        "torch_version": str(torch.__version__),
+        "torch_cuda_version": str(torch.version.cuda or ""),
+    }
+
+
+def yolo_device_info() -> dict:
+    global _yolo_device_info
+    if _yolo_device_info is None:
+        args = globals().get("_args")
+        _yolo_device_info = resolve_yolo_device(
+            getattr(args, "device", "auto") if args is not None else "auto"
+        )
+    return _yolo_device_info.copy()
+
+
 def load_yolo_model():
     global _yolo_model
     if _yolo_model is None:
@@ -1039,6 +1100,7 @@ def load_yolo_model():
         if not _args.model.exists():
             raise RuntimeError(f"No existe el modelo YOLO: {_args.model}")
         _yolo_model = YOLO(str(_args.model))
+        _yolo_model.to(yolo_device_info()["device"])
     return _yolo_model
 
 
@@ -1128,7 +1190,13 @@ def predict_yolo_boxes_with_rules(
     exclusion_max_overlap: float = EXCLUSION_ZONE_MAX_BOX_OVERLAP,
 ) -> tuple[list[dict], dict]:
     model = load_yolo_model()
-    result = model.predict(rectified, conf=conf, imgsz=imgsz, verbose=False)[0]
+    result = model.predict(
+        rectified,
+        conf=conf,
+        imgsz=imgsz,
+        device=yolo_device_info()["device"],
+        verbose=False,
+    )[0]
     normalized_zones = normalize_exclusion_zones(exclusion_zones, image_shape=rectified.shape)
     if result.boxes is None or len(result.boxes) == 0:
         return [], {
@@ -3989,6 +4057,7 @@ _video_playlist: dict | None = None
 _image: np.ndarray | None = None
 _source_label = ""
 _yolo_model = None
+_yolo_device_info: dict | None = None
 _piece_box_profile_cache: dict | None = None
 
 

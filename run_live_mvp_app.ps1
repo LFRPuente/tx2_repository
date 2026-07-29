@@ -3,6 +3,8 @@ param(
     [string]$SqlitePath,
     [ValidateRange(0.01, 1.0)]
     [double]$Confidence = 0.10,
+    [ValidateSet("auto", "cpu", "cuda", "cuda:0")]
+    [string]$Device = "auto",
     [string]$CameraIp = "10.14.115.241"
 )
 
@@ -35,10 +37,12 @@ else {
 }
 Write-Host "Camera: $CameraIp"
 Write-Host "YOLO confidence: $Confidence"
+Write-Host "YOLO device: $Device"
 Write-Host "Homography: $(Join-Path $outputDir 'homography_selection.json')"
 Write-Host "Calibration: $(Join-Path $outputDir 'table_measurement_calibration.json')"
 
 $candidates = @(
+    (Join-Path $root ".venv-gpu\Scripts\python.exe")
     (Get-Command python -ErrorAction SilentlyContinue).Source
     (Get-Command python3 -ErrorAction SilentlyContinue).Source
     (Get-Command py -ErrorAction SilentlyContinue).Source
@@ -113,6 +117,7 @@ else {
   --output-dir $outputDir `
   --dataset-dir $datasetDir `
   --model $modelPath `
+  --device $Device `
   --conf $Confidence `
   --capture-fps 10 `
   --process-fps 10 `

@@ -16,6 +16,31 @@ import live_mvp_app as live
 
 
 class LiveVisionPipelineTests(unittest.TestCase):
+    def test_live_processor_reports_resolved_inference_device(self) -> None:
+        device_info = {
+            "requested": "auto",
+            "device": "cuda:0",
+            "device_name": "NVIDIA L40S",
+            "cuda_available": True,
+            "cuda_device_count": 1,
+            "torch_version": "2.12.1+cu130",
+            "torch_cuda_version": "13.0",
+        }
+        with patch.object(
+            live.vision,
+            "resolve_yolo_device",
+            return_value=device_info,
+        ):
+            processor = live.LiveProcessor(
+                SimpleNamespace(process_fps=10.0, device="auto"),
+                live.FrameBuffer(maxlen=8),
+            )
+
+        status = processor.snapshot()
+        self.assertEqual(status["inference_device"], "cuda:0")
+        self.assertEqual(status["inference_device_name"], "NVIDIA L40S")
+        self.assertTrue(status["cuda_available"])
+
     def test_live_processor_applies_calibrated_zones_and_keeps_box_rules(self) -> None:
         processor = live.LiveProcessor(
             SimpleNamespace(

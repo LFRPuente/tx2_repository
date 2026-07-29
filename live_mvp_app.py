@@ -218,6 +218,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--device",
+        default=os.environ.get("TX2_YOLO_DEVICE", "auto"),
+        help="YOLO inference device: auto, cpu, cuda or cuda:N.",
+    )
     parser.add_argument("--conf", type=float, default=0.10)
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--capture-fps", type=float, default=10.0)
@@ -434,6 +439,7 @@ def configure_vision_module(args: argparse.Namespace) -> None:
         output_dir=args.output_dir,
         dataset_dir=args.dataset_dir,
         model=args.model,
+        device=args.device,
         port=args.port,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -725,6 +731,7 @@ class LiveProcessor:
     def __init__(self, args: argparse.Namespace, buffer: FrameBuffer) -> None:
         self.args = args
         self.buffer = buffer
+        device_info = vision.resolve_yolo_device(getattr(args, "device", "auto"))
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name="live-vision-processor", daemon=True)
         self.lock = threading.Lock()
@@ -736,6 +743,11 @@ class LiveProcessor:
             "last_frame_index": None,
             "last_processed_utc": None,
             "last_duration_ms": None,
+            "inference_device": device_info["device"],
+            "inference_device_name": device_info["device_name"],
+            "cuda_available": device_info["cuda_available"],
+            "torch_version": device_info["torch_version"],
+            "torch_cuda_version": device_info["torch_cuda_version"],
             "result": None,
         }
 

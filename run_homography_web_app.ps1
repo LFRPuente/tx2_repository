@@ -23,6 +23,7 @@ if ($modelPath -eq $legacyModelPath) {
 }
 
 $candidates = @(
+    (Join-Path $root ".venv-gpu\Scripts\python.exe")
     (Get-Command python -ErrorAction SilentlyContinue).Source
     (Get-Command python3 -ErrorAction SilentlyContinue).Source
     (Get-Command py -ErrorAction SilentlyContinue).Source
@@ -59,4 +60,5 @@ if (-not (Get-ChildItem -LiteralPath $videoDir -Recurse -File -Filter "*_raw.mp4
   --output-dir $outputDir `
   --dataset-dir $datasetDir `
   --model $modelPath `
+  --device auto `
   --port 5050

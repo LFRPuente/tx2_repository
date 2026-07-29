@@ -187,6 +187,18 @@ $env:AXIS_PASSWORD="your-password"
 .\run_live_mvp_app.ps1
 ```
 
+On GPU hosts, create `.venv-gpu` with a CUDA-enabled PyTorch build. The
+launcher prefers `.venv-gpu\Scripts\python.exe` automatically and resolves
+`-Device auto` to `cuda:0` when CUDA is available:
+
+```powershell
+.\run_live_mvp_app.ps1 -Device auto
+```
+
+The selected device, GPU name, PyTorch version, and CUDA runtime are exposed
+under `processor` in `/api/live/status`. Use `-Device cpu` only for an explicit
+CPU fallback.
+
 Import existing clip sidecars before the first SQLite launch:
 
 ```powershell

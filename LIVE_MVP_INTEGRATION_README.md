@@ -354,8 +354,9 @@ pero no sustituyen ejemplos negativos.
 El siguiente entrenamiento se guarda como `yolo11n_pieces_v2`, parte del
 checkpoint v1 y usa `imgsz=1280`. Debe ejecutarse unicamente despues de revisar
 anotaciones representativas extraidas de los nuevos RAW `2880x2160`. La maquina
-actual tiene PyTorch sin CUDA; por ello el entrenamiento util queda pendiente de
-un host con GPU y del nuevo conjunto revisado.
+actual tiene una NVIDIA L40S y el entorno `.venv-gpu` usa PyTorch con CUDA 13.0.
+El launcher prefiere ese entorno y `-Device auto` selecciona `cuda:0`; el
+entrenamiento util sigue pendiente del nuevo conjunto revisado.
 
 ### 5.5 Confianza alineada para validacion
 
