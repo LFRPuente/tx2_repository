@@ -1516,10 +1516,8 @@ class ClipRecorder:
                     event_id = data.get("event_id")
                     if event_id:
                         self.database.delete_measurement_event(str(event_id))
-                except Exception as exc:
-                    with self.lock:
-                        self.error = f"Retention deferred for {json_path.name}: {exc}"
-                    continue
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    pass
             delete_clip_artifacts(self.args.output_dir, json_path)
 
 
@@ -2571,6 +2569,15 @@ def delete_clip_artifacts(output_dir: Path, json_path: Path) -> None:
         value = data.get(key)
         if value:
             candidates.append(Path(value))
+    if not data:
+        base = json_path.parent / json_path.stem
+        candidates.extend(
+            [
+                base.with_suffix(".mp4"),
+                json_path.parent / f"{json_path.stem}_raw.mp4",
+                json_path.parent / f"{json_path.stem}_analysis",
+            ]
+        )
     delete_clip_paths(output_dir, candidates)
 
 

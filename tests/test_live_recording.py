@@ -292,6 +292,39 @@ class HistoryTests(unittest.TestCase):
 
 
 class ClipRecorderTests(unittest.TestCase):
+    def test_retention_removes_corrupt_sidecar_and_inferred_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            clip_dir = output_dir / "live_plc_clips" / "2026-07-29"
+            clip_dir.mkdir(parents=True)
+            newest_sidecar = clip_dir / "live_0002.json"
+            newest_sidecar.write_text('{"event_id": "newest"}', encoding="utf-8")
+            expired_sidecar = clip_dir / "live_0001.json"
+            expired_sidecar.write_bytes(b"\x00" * 64)
+            expired_video = clip_dir / "live_0001.mp4"
+            expired_video.write_bytes(b"video")
+            expired_raw_video = clip_dir / "live_0001_raw.mp4"
+            expired_raw_video.write_bytes(b"raw")
+            expired_analysis = clip_dir / "live_0001_analysis"
+            expired_analysis.mkdir()
+            (expired_analysis / "evidence.jpg").write_bytes(b"image")
+            database = FakeDatabase()
+            recorder = ClipRecorder(
+                SimpleNamespace(output_dir=output_dir, max_clips=1),
+                FrameBuffer(maxlen=8),
+                database=database,
+            )
+
+            recorder._enforce_retention()
+
+            self.assertTrue(newest_sidecar.exists())
+            self.assertFalse(expired_sidecar.exists())
+            self.assertFalse(expired_video.exists())
+            self.assertFalse(expired_raw_video.exists())
+            self.assertFalse(expired_analysis.exists())
+            self.assertEqual(database.deleted_event_ids, [])
+            self.assertEqual(recorder.error, "")
+
     def test_configuration_snapshot_refreshes_after_calibration_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir)
