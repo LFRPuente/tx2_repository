@@ -649,6 +649,20 @@ class FrameBuffer:
             ]
             return [item.copy() for item in selected]
 
+    def latest_at_or_before(self, target_monotonic: float) -> dict[str, Any] | None:
+        with self._lock:
+            candidates = [
+                item
+                for item in self._frames
+                if float(item["monotonic"]) <= float(target_monotonic)
+            ]
+            if not candidates:
+                return None
+            return max(
+                candidates,
+                key=lambda item: float(item["monotonic"]),
+            ).copy()
+
     def stats(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -785,6 +799,7 @@ class LiveProcessor:
         device_info = vision.resolve_yolo_device(getattr(args, "device", "auto"))
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name="live-vision-processor", daemon=True)
+        self.inference_lock = threading.Lock()
         self.lock = threading.Lock()
         self.state: dict[str, Any] = {
             "ok": False,
@@ -847,6 +862,16 @@ class LiveProcessor:
     ) -> list[dict[str, Any]]:
         return self.recording_buffer.frames_between(start_monotonic, end_monotonic)
 
+    def process_event_frame(
+        self,
+        item: dict[str, Any],
+    ) -> tuple[dict[str, Any], float]:
+        started = time.perf_counter()
+        with self.inference_lock:
+            result = self._process(item)
+        duration_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        return result, duration_ms
+
     def _set_state(self, **updates: Any) -> None:
         with self.lock:
             self.state.update(updates)
@@ -864,7 +889,8 @@ class LiveProcessor:
             self._set_state(processing=True)
             started = time.perf_counter()
             try:
-                result = self._process(item)
+                with self.inference_lock:
+                    result = self._process(item)
                 last_processed_index = int(item["index"])
                 duration_ms = round((time.perf_counter() - started) * 1000.0, 1)
                 recording_frame = result.get("_recording_frame")
@@ -1114,11 +1140,18 @@ class ClipRecorder:
         seen_frame_indices: set[int],
         start_monotonic: float,
         end_monotonic: float,
+        *,
+        result_override: dict[str, Any] | None = None,
+        processing_duration_ms: float | None = None,
     ) -> None:
         if self.processor is None:
             return
-        processor_data = self.processor.snapshot(include_images=True)
-        result = processor_data.get("result")
+        processor_data: dict[str, Any] = {}
+        if result_override is None:
+            processor_data = self.processor.snapshot(include_images=True)
+            result = processor_data.get("result")
+        else:
+            result = result_override
         if not isinstance(result, dict):
             return
         frame_index = result.get("frame_index")
@@ -1136,10 +1169,14 @@ class ClipRecorder:
         snapshot: dict[str, Any] = {
             key: clean_value(value)
             for key, value in result.items()
-            if key not in ("original_image", "rectified_image")
+            if key not in ("original_image", "rectified_image", "_recording_frame")
         }
         snapshot["snapshot_index"] = snap_index
-        snapshot["processing_duration_ms"] = clean_value(processor_data.get("last_duration_ms"))
+        snapshot["processing_duration_ms"] = clean_value(
+            processing_duration_ms
+            if processing_duration_ms is not None
+            else processor_data.get("last_duration_ms")
+        )
 
         for image_key, suffix in (("original_image", "original_overlay"), ("rectified_image", "rectified_overlay")):
             image_b64 = result.get(image_key)
@@ -1157,6 +1194,7 @@ class ClipRecorder:
         processing_snapshots: list[dict[str, Any]] = []
         seen_processing_frames: set[int] = set()
         event_mono = float(event.get("event_read_monotonic") or time.perf_counter())
+        event_source_frame = self.buffer.latest_at_or_before(event_mono)
         event_key = build_event_key(
             event,
             str(getattr(self.args, "plc_endpoint", "")),
@@ -1216,6 +1254,9 @@ class ClipRecorder:
         json_path: Path | None = None
         measurement_marker_frames_written = 0
         measurement_marker_first_video_frame_index: int | None = None
+        measurement_source_frame_offset_seconds: float | None = None
+        event_frame_processing_error = ""
+        event_recording_frame: dict[str, Any] | None = None
 
         def write_sample(source: dict[str, Any], sample_monotonic: float) -> None:
             nonlocal frames_written
@@ -1330,6 +1371,49 @@ class ClipRecorder:
                     record_seconds,
                 )
 
+            event_processor = getattr(self.processor, "process_event_frame", None)
+            if event_source_frame is not None and callable(event_processor):
+                try:
+                    event_result, event_processing_duration_ms = event_processor(
+                        event_source_frame
+                    )
+                    source_frame_monotonic = float(
+                        event_result.get(
+                            "frame_monotonic",
+                            event_source_frame["monotonic"],
+                        )
+                    )
+                    measurement_source_frame_offset_seconds = (
+                        source_frame_monotonic - event_mono
+                    )
+                    event_result = event_result.copy()
+                    event_result["measurement_event_frame"] = True
+                    event_result["measurement_source_frame_monotonic"] = (
+                        source_frame_monotonic
+                    )
+                    event_result["measurement_source_frame_offset_seconds"] = (
+                        measurement_source_frame_offset_seconds
+                    )
+                    event_result["frame_monotonic"] = event_mono
+                    recording_frame = event_result.get("_recording_frame")
+                    if isinstance(recording_frame, dict):
+                        event_recording_frame = recording_frame.copy()
+                        event_recording_frame["source_monotonic"] = (
+                            source_frame_monotonic
+                        )
+                        event_recording_frame["monotonic"] = event_mono
+                    self._capture_processing_snapshot(
+                        analysis_dir,
+                        processing_snapshots,
+                        seen_processing_frames,
+                        event_mono,
+                        deadline,
+                        result_override=event_result,
+                        processing_duration_ms=event_processing_duration_ms,
+                    )
+                except Exception as exc:
+                    event_frame_processing_error = str(exc)
+
             historical_frames: list[dict[str, Any]] = []
             if pre_trigger_seconds > 0:
                 history_reader = getattr(
@@ -1349,6 +1433,8 @@ class ClipRecorder:
                     )
             for historical_frame in historical_frames:
                 consume_source(historical_frame)
+            if event_recording_frame is not None:
+                consume_source(event_recording_frame)
 
             while time.perf_counter() < deadline:
                 self._capture_processing_snapshot(
@@ -1469,6 +1555,13 @@ class ClipRecorder:
                 "measurement_delay_seconds": measurement_delay_seconds,
                 "measurement_target_monotonic": measurement_target_mono,
                 "measurement_actual_offset_seconds": measurement_actual_offset_seconds,
+                "measurement_source_frame_offset_seconds": (
+                    measurement_source_frame_offset_seconds
+                ),
+                "measurement_event_frame_processed": (
+                    measurement_source_frame_offset_seconds is not None
+                ),
+                "event_frame_processing_error": event_frame_processing_error,
                 "measurement_snapshot_utc": (
                     canonical_snapshot.get("frame_utc")
                     if canonical_snapshot is not None

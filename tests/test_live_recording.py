@@ -66,6 +66,17 @@ class FakeOverlayProcessor:
             if (processed := self._overlay_item(item)) is not None
         ]
 
+    def process_event_frame(
+        self,
+        item: dict,
+    ) -> tuple[dict, float]:
+        result = self.snapshot(include_images=True)["result"].copy()
+        result["frame_index"] = int(item["index"])
+        result["frame_utc"] = item["utc"]
+        result["frame_monotonic"] = float(item["monotonic"])
+        result["_recording_frame"] = self._overlay_item(item)
+        return result, 1.0
+
     def snapshot(self, include_images: bool = False) -> dict:
         item = self.buffer.latest()
         if item is None:
@@ -220,6 +231,23 @@ class FrameBufferTests(unittest.TestCase):
         selected = buffer.frames_between(8.0, 10.0)
 
         self.assertEqual([item["index"] for item in selected], [1, 2])
+
+    def test_latest_at_or_before_selects_the_camera_frame_nearest_the_plc(self) -> None:
+        buffer = FrameBuffer(maxlen=8)
+        for index, frame_monotonic in enumerate((9.8, 9.95, 10.05)):
+            buffer.append(
+                {
+                    "index": index,
+                    "utc": f"frame-{index}",
+                    "monotonic": frame_monotonic,
+                    "frame": np.zeros((4, 4, 3), dtype=np.uint8),
+                }
+            )
+
+        selected = buffer.latest_at_or_before(10.0)
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["index"], 1)
 
 
 class RawCaptureTests(unittest.TestCase):
@@ -521,6 +549,17 @@ class ClipRecorderTests(unittest.TestCase):
             self.assertAlmostEqual(data["post_trigger_seconds"], 2.8, places=3)
             self.assertEqual(data["plc_event_video_offset_seconds"], 0.2)
             self.assertEqual(data["measurement_delay_seconds"], 0.0)
+            self.assertEqual(data["measurement_actual_offset_seconds"], 0.0)
+            self.assertAlmostEqual(
+                data["measurement_source_frame_offset_seconds"],
+                -0.05,
+                places=3,
+            )
+            self.assertTrue(data["measurement_event_frame_processed"])
+            self.assertEqual(data["event_frame_processing_error"], "")
+            self.assertTrue(
+                data["processing_snapshots"][0]["measurement_event_frame"]
+            )
             self.assertEqual(data["measurement_marker_first_video_frame_index"], 2)
             self.assertEqual(data["measurement_marker_frames_written"], 8)
             video = cv2.VideoCapture(data["video_path"])

@@ -61,9 +61,10 @@ Cuando esta integracion termine, un ciclo de produccion debe verse asi:
 11. Una señal rising del PLC crea un evento de medicion y conserva una
     grabacion independiente de 8 segundos: 2 segundos anteriores a la señal y
     6 segundos posteriores.
-12. La medida automatica se toma en el primer frame procesado a partir de la
-    señal PLC. El perimetro se muestra verde en Live y queda grabado en verde
-    durante 0.8 segundos, aproximadamente en el segundo 2 del MP4 procesado.
+12. La medida automatica usa el frame de camara mas cercano inmediatamente
+    anterior a la señal PLC y lo procesa de forma dedicada. El perimetro se
+    muestra verde en Live y queda grabado en verde durante 0.8 segundos,
+    aproximadamente en el segundo 2 del MP4 procesado.
 13. Una nueva señal crea otra ventana fija de 8 segundos. Si ambas ventanas
     coinciden en el tiempo, se conservan como clips separados sin truncarlas.
 14. La ventana solo se conserva si YOLO detecta al menos una pieza. Si no
@@ -140,8 +141,8 @@ Responsabilidades actuales:
 - leer `VisionWD` y `MeasureLength` por OPC UA;
 - iniciar clips fijos de 8 segundos, desde 2 segundos antes hasta 6 segundos
   despues de cada señal rising del PLC;
-- seleccionar la medida automatica en el primer frame procesado a partir de la
-  señal PLC;
+- seleccionar la medida automatica desde el frame de camara mas cercano
+  inmediatamente anterior a la señal PLC;
 - conservar ventanas cercanas como clips independientes, incluso si se solapan;
 - guardar MP4 procesado, MP4 raw temporal, JSON y snapshots JPEG;
 - servir una interfaz ligera en ingles;
@@ -1037,8 +1038,8 @@ nueva fila por cada reconexion.
    8 segundos.
 4. Si no hubo piezas, eliminar ambos MP4, snapshots temporales y evento pendiente;
    no mostrar esa ventana en `History`.
-5. Elegir como snapshot canonico el primer frame procesado a partir de la
-   señal PLC.
+5. Procesar de forma dedicada el frame de camara mas cercano inmediatamente
+   anterior a la señal PLC y elegirlo como snapshot canonico.
 6. Insertar sus piezas en `piece_measurement`.
 7. Insertar rutas en `event_asset`.
 8. Actualizar conteos y timestamps del evento.
@@ -1058,15 +1059,15 @@ apariciones de `P1` durante 8 segundos como si fueran la misma pieza fisica.
 La regla aplicada en el Live MVP es:
 
 1. conservar `frame_monotonic` en cada resultado de `LiveProcessor`;
-2. calcular el objetivo como `event_read_monotonic`;
-3. elegir el primer snapshot procesado cuyo tiempo sea igual o posterior al
-   objetivo;
-4. usar el ultimo snapshot anterior solo como fallback si el clip termina sin
-   un frame posterior al objetivo;
+2. capturar del buffer el frame de camara mas cercano cuyo tiempo sea igual o
+   anterior a `event_read_monotonic`;
+3. procesar ese frame de forma dedicada y alinearlo al instante del evento;
+4. si el procesamiento dedicado falla, usar como fallback el primer snapshot
+   procesado a partir de la señal;
 5. guardar todos los snapshots como evidencia;
 6. crear `piece_measurement` solamente desde ese snapshot canonico;
-7. guardar en el sidecar el retraso configurado y el offset real del frame
-   seleccionado.
+7. guardar en el sidecar el retraso configurado, el offset canonico y el offset
+   real del frame fuente respecto a la señal.
 
 La seleccion es temporal y deliberadamente no cambia a otro frame por tener
 mayor confianza o mas piezas. Asi, la medida corresponde al instante definido
@@ -1598,7 +1599,8 @@ continua pendiente.
   despues;
 - el MP4 raw reporta aproximadamente 240 frames a 30 FPS y 8 segundos;
 - el raw no contiene overlays ni perimetro verde;
-- la medicion canonica usa el primer frame procesado a partir de la señal PLC;
+- la medicion canonica usa el frame de camara mas cercano inmediatamente
+  anterior a la señal PLC y conserva su offset fuente;
 - el perimetro verde marca ese instante en Live y en el MP4 procesado;
 - una ventana sin ninguna pieza detectada se descarta y no aparece en History;
 - dos ventanas cercanas se conservan como clips independientes;
