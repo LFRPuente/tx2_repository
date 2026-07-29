@@ -30,7 +30,7 @@ do not write values back to the PLC.
 | `homography_web_app.py` | Main local Flask tool for homography selection, YOLO review, Sobel detection, and measurement calibration. |
 | `outputs/homography_selection.json` | Saved perspective transform used by the live processor. |
 | `outputs/table_measurement_calibration.json` | Measurement calibration used to convert pixel position to inches. |
-| `runs/detect/runs_tx2/yolo11n_tubos_v1/weights/best.pt` | YOLO model used by the TX2 app. |
+| `runs/detect/runs_tx2/yolo11n_pieces_v1/weights/best.pt` | Individual-piece YOLO model used when available. |
 
 ## PLC Connection
 
@@ -174,11 +174,11 @@ What the live processor does:
 1. Opens the AXIS RTSP stream.
 2. Loads `outputs/homography_selection.json`.
 3. Warps each processed frame into the calibrated/rectified view.
-4. Runs YOLO using `runs/detect/runs_tx2/yolo11n_tubos_v1/weights/best.pt`.
-5. Chooses the strongest tube ROI.
-6. Runs Sobel projection inside the ROI to find the front edge.
+4. Runs YOLO using `runs/detect/runs_tx2/yolo11n_pieces_v1/weights/best.pt`.
+5. Orders every detected piece from left to right.
+6. Runs Sobel Y in the lower front band of every piece ROI.
 7. Loads `outputs/table_measurement_calibration.json`.
-8. Converts the detected edge to a calibrated measurement.
+8. Converts every detected edge to an independent calibrated measurement.
 9. Displays an OpenCV overlay.
 
 Keyboard controls:

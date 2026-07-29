@@ -7,6 +7,10 @@ __pycache__/
 .venv/
 venv/
 env/
+.env
+.env.*
+!.env.example
+pgpass.conf
 .vscode/
 .uv-cache-check/
 
@@ -32,13 +36,22 @@ mvp_react_app/dist/
 *.jpg
 *.jpeg
 
+# Curated raw training clips are versioned through Git LFS.
+!training_videos/**/*.mp4
+
 # Keep curated YOLO datasets in Git.
 !dataset/images/**/*.jpg
 !dataset_yolo11/images/**/*.jpg
+!dataset_pieces/images/**/*.jpg
+!dataset_pieces_yolo11/images/**/*.jpg
 dataset_yolo11/**/*.cache
+dataset_pieces_yolo11/**/*.cache
+dataset_pieces_yolo11_v*/
+dataset_pieces_4k_*/
 
 # Generated outputs. Keep calibration/config JSON needed by the local apps.
 outputs/*
+outputs_*/
 !outputs/homography_selection.json
 !outputs/roi_selection.json
 !outputs/table_measurement_calibration.json
@@ -55,3 +68,18 @@ runs/**
 !runs/detect/runs_tx2/yolo11n_tubos_v1/results.csv
 !runs/detect/runs_tx2/yolo11n_tubos_v1/weights/
 !runs/detect/runs_tx2/yolo11n_tubos_v1/weights/best.pt
+!runs/detect/runs_tx2/yolo11n_pieces_v1/
+!runs/detect/runs_tx2/yolo11n_pieces_v1/args.yaml
+!runs/detect/runs_tx2/yolo11n_pieces_v1/results.csv
+!runs/detect/runs_tx2/yolo11n_pieces_v1/weights/
+!runs/detect/runs_tx2/yolo11n_pieces_v1/weights/best.pt
+!runs/detect/runs_tx2/yolo11n_pieces_v2/
+!runs/detect/runs_tx2/yolo11n_pieces_v2/args.yaml
+!runs/detect/runs_tx2/yolo11n_pieces_v2/results.csv
+!runs/detect/runs_tx2/yolo11n_pieces_v2/weights/
+!runs/detect/runs_tx2/yolo11n_pieces_v2/weights/best.pt
+!runs/detect/runs_tx2/yolo11n_pieces_v3/
+!runs/detect/runs_tx2/yolo11n_pieces_v3/args.yaml
+!runs/detect/runs_tx2/yolo11n_pieces_v3/results.csv
+!runs/detect/runs_tx2/yolo11n_pieces_v3/weights/
+!runs/detect/runs_tx2/yolo11n_pieces_v3/weights/best.pt

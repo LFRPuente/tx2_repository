@@ -1,7 +1,9 @@
 asyncua
 flask
+imageio-ffmpeg
 matplotlib
 numpy
 opencv-python
 pillow
+psycopg[binary,pool]>=3.2,<4
 ultralytics

@@ -2,7 +2,7 @@
 YOLO Annotator — Flask web app.
 
 Carga frames del video con homografia aplicada.
-Permite anotar bounding boxes de tubos para entrenar YOLOv11.
+Permite anotar una bounding box por pieza para entrenar YOLOv11.
 Guarda anotaciones en formato YOLO (labels/frame_XXXXX.txt + images/frame_XXXXX.jpg).
 
 Usage:
@@ -21,7 +21,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 DEFAULT_VIDEO          = Path(r"C:\Users\luis_\Downloads\20260508_000307_7F66.mkv")
 DEFAULT_HOMOGRAPHY     = Path(r"C:\Users\luis_\Desktop\tx2_cv_2026-05-11\outputs\homography_selection.json")
-DEFAULT_OUTPUT_DIR     = Path(r"C:\Users\luis_\Desktop\tx2_cv_2026-05-11\dataset")
+DEFAULT_OUTPUT_DIR     = Path(r"C:\Users\luis_\Desktop\tx2_cv_2026-05-11\dataset_pieces")
 DEFAULT_PORT           = 5052
 
 def parse_args() -> argparse.Namespace:
@@ -112,11 +112,11 @@ canvas { display: block; }
 <body>
 
 <header>
-  <h1>YOLO Annotator — Tubos</h1>
+  <h1>YOLO Annotator - Piezas</h1>
   <span class="badge" id="badge-frame">frame —</span>
   <span class="badge" id="badge-boxes">0 boxes</span>
   <span class="badge" id="badge-saved">0 frames anotados</span>
-  <span class="badge yellow" id="badge-mode">modo: tubos</span>
+  <span class="badge yellow" id="badge-mode">modo: piezas</span>
 </header>
 
 <div class="toolbar">
@@ -613,7 +613,7 @@ def api_save():
     img_path = images_dir / f"{stem}.jpg"
     cv2.imwrite(str(img_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-    # Save YOLO label (class 0 = tubo)
+    # Save YOLO label (class 0 = piece)
     label_path = labels_dir / f"{stem}.txt"
     lines = []
     for b in boxes:

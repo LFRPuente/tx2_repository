@@ -11,19 +11,23 @@ import argparse
 import asyncio
 import base64
 import json
+import math
 import os
+import subprocess
 import sys
 import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import quote
 
 import cv2
 import numpy as np
-from flask import Flask, abort, jsonify, render_template_string, send_file
+from flask import Flask, abort, jsonify, render_template_string, request, send_file
 
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000")
 
@@ -32,15 +36,46 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import homography_web_app as vision
+from tx2_database import (
+    DatabaseRepository,
+    DatabaseUnavailable,
+    RecordNotFound,
+    RevisionConflict,
+    build_event_key,
+    build_vision_configuration,
+    event_uuid,
+    resolve_asset_path,
+    select_canonical_snapshot,
+    snapshot_pieces,
+    snapshot_summary,
+)
+from tx2_sqlite_database import SQLiteDatabaseRepository
 
-DEFAULT_VIDEO = Path(r"C:\Users\luis_\Downloads\20260508_000307_7F66.mkv")
+DEFAULT_VIDEO = Path(r"C:\Users\luis_\Downloads\20260724_10\20260724_100105_6439.mkv")
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
-DEFAULT_DATASET_DIR = ROOT / "dataset"
-DEFAULT_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_tubos_v1" / "weights" / "best.pt"
+DEFAULT_DATASET_DIR = ROOT / "dataset_pieces"
+DEFAULT_PIECE_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v3" / "weights" / "best.pt"
+PREVIOUS_PIECE_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v2" / "weights" / "best.pt"
+OLDER_PIECE_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v1" / "weights" / "best.pt"
+DEFAULT_LEGACY_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_tubos_v1" / "weights" / "best.pt"
+DEFAULT_MODEL = next(
+    (
+        path
+        for path in (
+            DEFAULT_PIECE_MODEL,
+            PREVIOUS_PIECE_MODEL,
+            OLDER_PIECE_MODEL,
+            DEFAULT_LEGACY_MODEL,
+        )
+        if path.exists()
+    ),
+    DEFAULT_PIECE_MODEL,
+)
 DEFAULT_ENDPOINT = "opc.tcp://10.14.6.48:49320"
 DEFAULT_WATCHDOG_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.VisionWD"
 DEFAULT_EVENT_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.MeasureLength"
-HISTORY_SNAPSHOT_LIMIT = 6
+DEFAULT_MEASUREMENT_DELAY_SECONDS = 2.0
+MEASUREMENT_MARKER_DURATION_SECONDS = 0.8
 
 
 def utc_now() -> str:
@@ -58,6 +93,8 @@ def clean_value(value: Any) -> Any:
         return value.hex()
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, Decimal):
+        return float(value)
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     if isinstance(value, dict):
@@ -65,6 +102,12 @@ def clean_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [clean_value(item) for item in value]
     return str(value)
+
+
+def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
 
 
 def representative_snapshots(snapshots: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -77,6 +120,87 @@ def representative_snapshots(snapshots: list[dict[str, Any]], limit: int) -> lis
     last_index = len(snapshots) - 1
     indices = [round(position * last_index / (limit - 1)) for position in range(limit)]
     return [snapshots[index] for index in indices]
+
+
+def measurement_evidence_snapshots(
+    snapshots: list[dict[str, Any]],
+    *,
+    event_monotonic: float | None = None,
+    measurement_delay_seconds: float | None = None,
+) -> list[dict[str, Any]]:
+    if not snapshots:
+        return []
+    canonical = next(
+        (
+            snapshot
+            for snapshot in snapshots
+            if snapshot.get("is_canonical") is True
+            or snapshot.get("is_canonical") == 1
+        ),
+        None,
+    )
+    if canonical is None:
+        canonical = select_canonical_snapshot(
+            snapshots,
+            event_monotonic=event_monotonic,
+            target_offset_seconds=measurement_delay_seconds,
+        )
+    return [canonical] if canonical is not None else []
+
+
+def snapshots_contain_piece(snapshots: list[dict[str, Any]]) -> bool:
+    for snapshot in snapshots:
+        if snapshot_pieces(snapshot):
+            return True
+        try:
+            if int(snapshot_summary(snapshot).get("detected_count") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def measurement_marker_active(
+    sample_monotonic: float,
+    event_monotonic: float,
+    delay_seconds: float = DEFAULT_MEASUREMENT_DELAY_SECONDS,
+    duration_seconds: float = MEASUREMENT_MARKER_DURATION_SECONDS,
+) -> bool:
+    marker_start = float(event_monotonic) + max(0.0, float(delay_seconds))
+    marker_end = marker_start + max(0.0, float(duration_seconds))
+    return marker_start <= float(sample_monotonic) < marker_end
+
+
+def draw_measurement_perimeter(frame: np.ndarray) -> np.ndarray:
+    marked = frame.copy()
+    height, width = marked.shape[:2]
+    thickness = max(4, int(round(min(height, width) * 0.012)))
+    inset = max(1, thickness // 2)
+    cv2.rectangle(
+        marked,
+        (inset, inset),
+        (max(inset, width - inset - 1), max(inset, height - inset - 1)),
+        (46, 204, 113),
+        thickness,
+        cv2.LINE_AA,
+    )
+    return marked
+
+
+def mark_measurement_evidence_snapshot(snapshot: dict[str, Any] | None) -> bool:
+    if snapshot is None:
+        return False
+    value = snapshot.get("original_overlay_path")
+    if not value:
+        return False
+    image_path = Path(str(value))
+    image = cv2.imread(str(image_path))
+    if image is None:
+        return False
+    if not cv2.imwrite(str(image_path), draw_measurement_perimeter(image)):
+        raise RuntimeError(f"Could not mark measurement evidence: {image_path}")
+    snapshot["measurement_evidence"] = True
+    return True
 
 
 def img_to_b64(img: np.ndarray, quality: int = 82) -> str:
@@ -94,13 +218,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-ip", default="10.14.115.241")
     parser.add_argument("--rtsp-url", default=os.environ.get("AXIS_RTSP_URL", ""))
     parser.add_argument("--codec", choices=("jpeg", "h264"), default="h264")
-    parser.add_argument("--camera-resolution", default="1920x1080")
+    parser.add_argument("--camera-resolution", default="2880x2160")
     parser.add_argument("--camera-user", default=os.environ.get("AXIS_USER", ""))
     parser.add_argument("--camera-password", default=os.environ.get("AXIS_PASSWORD", ""))
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument("--conf", type=float, default=0.50)
+    parser.add_argument("--conf", type=float, default=0.10)
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--capture-fps", type=float, default=10.0)
     parser.add_argument("--process-fps", type=float, default=10.0)
@@ -108,6 +232,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--buffer-max-frames", type=int, default=60)
     parser.add_argument("--record-seconds", type=float, default=8.0)
     parser.add_argument("--record-fps", type=float, default=10.0)
+    parser.add_argument(
+        "--save-raw-clips",
+        action="store_true",
+        help="Temporarily save a camera-only MP4 beside each processed clip.",
+    )
+    parser.add_argument(
+        "--raw-rtsp-url",
+        default=os.environ.get("AXIS_RAW_RTSP_URL", ""),
+        help="Optional RTSP URL used only for temporary raw recordings.",
+    )
+    parser.add_argument("--raw-camera-resolution", default="2880x2160")
+    parser.add_argument("--raw-record-fps", type=float, default=30.0)
+    parser.add_argument(
+        "--measurement-delay-seconds",
+        type=float,
+        default=DEFAULT_MEASUREMENT_DELAY_SECONDS,
+    )
     parser.add_argument("--max-clips", type=int, default=100)
     parser.add_argument("--plc-enabled", action="store_true")
     parser.add_argument("--plc-endpoint", default=DEFAULT_ENDPOINT)
@@ -116,20 +257,180 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plc-poll-interval", type=float, default=0.01)
     parser.add_argument("--plc-timeout", type=float, default=8.0)
     parser.add_argument("--plc-edge", choices=("changed", "rising", "falling", "any"), default="rising")
-    return parser.parse_args()
+    parser.add_argument("--postgres-dsn", default=os.environ.get("TX2_POSTGRES_DSN", ""))
+    parser.add_argument(
+        "--sqlite-path",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "TX2_SQLITE_PATH",
+                str(DEFAULT_OUTPUT_DIR / "tx2_live_mvp.sqlite3"),
+            )
+        ),
+    )
+    parser.add_argument("--db-disabled", action="store_true")
+    parser.add_argument("--db-retry-seconds", type=float, default=15.0)
+    args = parser.parse_args()
+    if args.measurement_delay_seconds < 0:
+        parser.error("--measurement-delay-seconds must be zero or greater")
+    if args.measurement_delay_seconds >= args.record_seconds:
+        parser.error(
+            "--measurement-delay-seconds must be shorter than --record-seconds"
+        )
+    if args.raw_record_fps <= 0 or args.raw_record_fps > 60:
+        parser.error("--raw-record-fps must be greater than zero and no more than 60")
+    return args
+
+
+def _axis_rtsp_url(
+    args: argparse.Namespace,
+    resolution: str,
+    fps: float,
+    explicit_url: str = "",
+) -> str:
+    if explicit_url:
+        return explicit_url
+    auth = ""
+    if args.camera_user and args.camera_password:
+        user = quote(str(args.camera_user), safe="")
+        password = quote(str(args.camera_password), safe="")
+        auth = f"{user}:{password}@"
+    requested_fps = max(1, int(round(float(fps))))
+    return (
+        f"rtsp://{auth}{args.camera_ip}/axis-media/media.amp"
+        f"?videocodec={args.codec}&resolution={resolution}&fps={requested_fps}"
+    )
 
 
 def build_rtsp_url(args: argparse.Namespace) -> str:
-    if args.rtsp_url:
-        return args.rtsp_url
-    auth = ""
-    if args.camera_user and args.camera_password:
-        auth = f"{args.camera_user}:{args.camera_password}@"
-    fps = max(1, int(round(float(args.capture_fps))))
-    return (
-        f"rtsp://{auth}{args.camera_ip}/axis-media/media.amp"
-        f"?videocodec={args.codec}&resolution={args.camera_resolution}&fps={fps}"
+    return _axis_rtsp_url(
+        args,
+        str(args.camera_resolution),
+        float(args.capture_fps),
+        str(args.rtsp_url),
     )
+
+
+def build_raw_rtsp_url(args: argparse.Namespace) -> str:
+    url = _axis_rtsp_url(
+        args,
+        str(getattr(args, "raw_camera_resolution", "2880x2160")),
+        float(getattr(args, "raw_record_fps", 30.0)),
+        str(getattr(args, "raw_rtsp_url", "")),
+    )
+    separator = "&" if "?" in url else "?"
+    return (
+        f"{url}{separator}videozfpsmode=fixed"
+        "&videokeyframeinterval=30"
+    )
+
+
+def direct_raw_capture_enabled(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "save_raw_clips", False)
+        and str(getattr(args, "source", "")) in ("rtsp", "auto")
+    )
+
+
+def start_direct_raw_capture(
+    args: argparse.Namespace,
+    output_path: Path,
+    duration_seconds: float,
+) -> subprocess.Popen:
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+    except ImportError as exc:
+        raise RuntimeError(
+            "Temporary raw recording requires imageio-ffmpeg. "
+            "Install the repository requirements."
+        ) from exc
+
+    command = [
+        get_ffmpeg_exe(),
+        "-y",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-i",
+        build_raw_rtsp_url(args),
+        "-t",
+        f"{float(duration_seconds):.3f}",
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "copy",
+        "-an",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=creationflags,
+    )
+
+
+def finish_direct_raw_capture(
+    process: subprocess.Popen,
+    output_path: Path,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    try:
+        process.communicate(timeout=max(5.0, timeout_seconds))
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try:
+            process.communicate(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+        return {"ok": False, "error": "Raw RTSP copy timed out"}
+
+    if process.returncode != 0 or not output_path.is_file() or output_path.stat().st_size <= 0:
+        return {
+            "ok": False,
+            "error": f"Raw RTSP copy failed with exit code {process.returncode}",
+        }
+
+    cap = cv2.VideoCapture(str(output_path))
+    try:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    finally:
+        cap.release()
+    duration = frame_count / fps if frame_count > 0 and fps > 0 else None
+    return {
+        "ok": True,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "frame_count": frame_count,
+        "duration_seconds": duration,
+        "size_bytes": output_path.stat().st_size,
+    }
+
+
+def stop_direct_raw_capture(process: subprocess.Popen | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.communicate(timeout=3.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
 
 
 def configure_vision_module(args: argparse.Namespace) -> None:
@@ -165,6 +466,24 @@ def line_is_valid(line: dict | None) -> bool:
     return bool(line) and all(np.isfinite(float(line[key])) for key in ("x1", "y1", "x2", "y2"))
 
 
+def format_inches_compact(value: float | int | Decimal | None) -> str:
+    if value is None or not np.isfinite(float(value)):
+        return "-"
+    total_sixteenths = int(math.floor(abs(float(value)) * 16.0 + 0.5))
+    sign = "-" if float(value) < 0 else ""
+    feet, remainder = divmod(total_sixteenths, 12 * 16)
+    inches, numerator = divmod(remainder, 16)
+    if numerator:
+        denominator = 16
+        while numerator % 2 == 0:
+            numerator //= 2
+            denominator //= 2
+        inch_text = f"{inches} {numerator}/{denominator}"
+    else:
+        inch_text = str(inches)
+    return f"{sign}{feet}' {inch_text}\""
+
+
 def draw_line(img: np.ndarray, line: dict | None, color: tuple[int, int, int], label: str) -> None:
     if not line_is_valid(line):
         return
@@ -182,35 +501,94 @@ def draw_line(img: np.ndarray, line: dict | None, color: tuple[int, int, int], l
     cv2.putText(img, label, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
 
-def draw_rectified_overlay(rectified: np.ndarray, boxes: list[dict], sobel: dict, calibration: dict) -> np.ndarray:
+def draw_rectified_overlay(
+    rectified: np.ndarray,
+    pieces: list[dict],
+    calibration: dict,
+) -> np.ndarray:
     out = rectified.copy()
-    for box in boxes:
+    exclusion_zones = vision.normalize_exclusion_zones(
+        calibration.get("exclusion_zones"),
+        image_shape=rectified.shape,
+    )
+    if exclusion_zones:
+        zone_layer = out.copy()
+        for zone in exclusion_zones:
+            x0 = int(round(float(zone["x"])))
+            y0 = int(round(float(zone["y"])))
+            x1 = int(round(float(zone["x"]) + float(zone["w"])))
+            y1 = int(round(float(zone["y"]) + float(zone["h"])))
+            cv2.rectangle(zone_layer, (x0, y0), (x1, y1), (48, 62, 210), -1)
+        out = cv2.addWeighted(zone_layer, 0.22, out, 0.78, 0.0)
+        for zone in exclusion_zones:
+            x0 = int(round(float(zone["x"])))
+            y0 = int(round(float(zone["y"])))
+            x1 = int(round(float(zone["x"]) + float(zone["w"])))
+            y1 = int(round(float(zone["y"]) + float(zone["h"])))
+            cv2.rectangle(out, (x0, y0), (x1, y1), (38, 48, 210), 2, cv2.LINE_AA)
+    for index, piece in enumerate(pieces):
+        box = piece["box"]
+        piece_id = int(piece["piece_id"])
+        color = (62, 214, 166) if piece.get("valid") else (48, 156, 220)
         x0 = int(float(box["x"]))
         y0 = int(float(box["y"]))
         x1 = int(float(box["x"]) + float(box["w"]))
         y1 = int(float(box["y"]) + float(box["h"]))
-        cv2.rectangle(out, (x0, y0), (x1, y1), (62, 214, 166), 2, cv2.LINE_AA)
+        cv2.rectangle(out, (x0, y0), (x1, y1), color, 2, cv2.LINE_AA)
         cv2.putText(
             out,
-            f"{float(box.get('conf', 0.0)):.2f}",
+            f"P{piece_id} {float(box.get('conf', 0.0)):.2f}",
             (x0 + 3, max(18, y0 - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            (62, 214, 166),
+            color,
             2,
             cv2.LINE_AA,
         )
+        draw_line(out, (piece.get("sobel") or {}).get("line"), color, f"P{piece_id}")
+        measurement = piece.get("measurement")
+        if isinstance(measurement, dict):
+            label = format_inches_compact(measurement["measurement_in"])
+            label_y = min(
+                out.shape[0] - 8,
+                max(24, int(float(measurement["line_y"])) + 24 + (index % 2) * 18),
+            )
+            cv2.putText(
+                out,
+                label,
+                (x0 + 2, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                out,
+                label,
+                (x0 + 2, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
     if calibration.get("reference_y") is not None:
         y = float(calibration["reference_y"])
         draw_line(out, {"x1": 0, "y1": y, "x2": out.shape[1] - 1, "y2": y}, (210, 130, 48), "REF")
-    draw_line(out, (sobel or {}).get("line"), (40, 210, 128), "front")
     return out
 
 
 def draw_original_overlay(original: np.ndarray, overlay: dict) -> np.ndarray:
     out = original.copy()
     draw_line(out, overlay.get("reference_line"), (210, 130, 48), "REF")
-    draw_line(out, overlay.get("front_line"), (40, 210, 128), "front")
+    piece_fronts = overlay.get("piece_fronts") or []
+    if piece_fronts:
+        for item in piece_fronts:
+            color = (40, 210, 128) if item.get("valid") else (48, 156, 220)
+            draw_line(out, item.get("line"), color, f"P{int(item['piece_id'])}")
+    else:
+        draw_line(out, overlay.get("front_line"), (40, 210, 128), "front")
     return out
 
 
@@ -447,37 +825,35 @@ class LiveProcessor:
         original = item["frame"]
         matrix, out_size, _homography = vision.load_homography()
         rectified = cv2.warpPerspective(original, matrix, out_size)
-        boxes = vision.predict_yolo_boxes(rectified, conf=float(self.args.conf), imgsz=int(self.args.imgsz))
-        box = max(
-            boxes,
-            key=lambda candidate: float(candidate["w"]) * float(candidate["h"]) * float(candidate.get("conf", 1.0)),
-            default=None,
+        calibration = vision.load_measurement_calibration()
+        boxes, box_rules = vision.predict_yolo_boxes_with_rules(
+            rectified,
+            conf=float(self.args.conf),
+            imgsz=int(self.args.imgsz),
+            exclusion_zones=calibration.get("exclusion_zones"),
+            exclusion_max_overlap=float(
+                calibration.get(
+                    "exclusion_max_box_overlap",
+                    vision.EXCLUSION_ZONE_MAX_BOX_OVERLAP,
+                )
+            ),
         )
-
-        if box is None:
-            sobel = {
-                "frame_idx": int(item["index"]),
-                "time_sec": None,
-                "has_roi": False,
-                "is_valid": False,
-                "roi": None,
-                "roi_box": None,
-                "line": None,
-                "points": [],
-                "edge_confidence": 0.0,
-                "crm_px": 0.0,
-            }
-        else:
-            sobel = vision.sobel_projection_for_box(rectified, box)
-            sobel.update(frame_idx=int(item["index"]), time_sec=None)
 
         rect_h, rect_w = rectified.shape[:2]
         src_h, src_w = original.shape[:2]
-        calibration = vision.load_measurement_calibration()
-        measurement = vision.measurement_from_sobel(sobel, calibration, rect_w)
-        original_overlay = vision.mvp_original_overlay(sobel, calibration, matrix, rect_w)
+        pieces, measurement_summary = vision.analyze_piece_boxes(
+            rectified,
+            boxes,
+            calibration,
+            frame_idx=int(item["index"]),
+            time_sec=None,
+        )
+        primary = vision.primary_piece_analysis(pieces)
+        sobel = primary["sobel"] if primary else vision.empty_sobel_result(int(item["index"]), None)
+        measurement = primary["measurement"] if primary else None
+        original_overlay = vision.mvp_original_overlay_for_pieces(pieces, calibration, matrix, rect_w)
         original_viz = draw_original_overlay(original, original_overlay)
-        rectified_viz = draw_rectified_overlay(rectified, boxes, sobel, calibration)
+        rectified_viz = draw_rectified_overlay(rectified, pieces, calibration)
 
         return {
             "frame_index": int(item["index"]),
@@ -491,11 +867,19 @@ class LiveProcessor:
             "original_image": img_to_b64(original_viz, quality=80),
             "rectified_image": img_to_b64(rectified_viz, quality=82),
             "boxes": boxes,
+            "box_rules": box_rules,
             "count": len(boxes),
+            "pieces": pieces,
+            "measurement_summary": measurement_summary,
             "sobel": sobel,
             "calibration": calibration,
             "measurement": measurement,
             "front_y_ratio": (float(sobel["line"]["y"]) / float(rect_h)) if sobel.get("line") else None,
+            "piece_front_y_ratios": [
+                float(piece["sobel"]["line"]["y"]) / float(rect_h)
+                for piece in pieces
+                if (piece.get("sobel") or {}).get("line")
+            ],
             "model": str(self.args.model),
             "conf": float(self.args.conf),
             "_recording_frame": {
@@ -503,47 +887,150 @@ class LiveProcessor:
                 "utc": item["utc"],
                 "monotonic": float(item["monotonic"]),
                 "frame": original_viz,
+                "raw_frame": original,
             },
         }
 
 
 class ClipRecorder:
-    def __init__(self, args: argparse.Namespace, buffer: FrameBuffer, processor: LiveProcessor | None = None) -> None:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        buffer: FrameBuffer,
+        processor: LiveProcessor | None = None,
+        database: DatabaseRepository | SQLiteDatabaseRepository | None = None,
+    ) -> None:
         self.args = args
         self.buffer = buffer
         self.processor = processor
+        self.database = database
         self.lock = threading.Lock()
-        self.active_recordings: set[int] = set()
+        self.configuration_lock = threading.Lock()
+        self.vision_configuration: dict[str, Any] | None = None
+        self.configuration_fingerprint: tuple[tuple[str, int | None, int | None], ...] | None = None
+        self.active_recordings: dict[int, float] = {}
         self.clip_index = 0
         self.last_clip: dict[str, Any] | None = None
+        self.discarded_clip_count = 0
+        self.last_discarded_clip: dict[str, Any] | None = None
         self.failed_recordings: deque[dict[str, Any]] = deque(maxlen=20)
         self.error = ""
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
+            now = time.perf_counter()
+            measurement_delay_seconds = self._measurement_delay_seconds()
+            measurement_marker_active_now = any(
+                measurement_marker_active(
+                    now,
+                    event_monotonic,
+                    measurement_delay_seconds,
+                )
+                for event_monotonic in self.active_recordings.values()
+            )
             return {
                 "recording": bool(self.active_recordings),
                 "active_recordings": len(self.active_recordings),
                 "clip_index": self.clip_index,
                 "last_clip": self.last_clip,
+                "discarded_clip_count": self.discarded_clip_count,
+                "last_discarded_clip": self.last_discarded_clip,
                 "failed_recording_count": len(self.failed_recordings),
                 "failed_recordings": [failure.copy() for failure in self.failed_recordings],
                 "error": self.error,
                 "record_seconds": self.args.record_seconds,
+                "save_raw_clips": bool(
+                    getattr(self.args, "save_raw_clips", False)
+                ),
+                "raw_camera_resolution": str(
+                    getattr(self.args, "raw_camera_resolution", "2880x2160")
+                ),
+                "raw_record_fps": float(
+                    getattr(self.args, "raw_record_fps", 30.0)
+                ),
+                "measurement_delay_seconds": measurement_delay_seconds,
+                "measurement_marker_active": measurement_marker_active_now,
+                "database_enabled": self.database is not None,
             }
 
     def start_event_clip(self, event: dict[str, Any]) -> None:
+        event = dict(event)
+        event_monotonic = float(event.get("event_read_monotonic") or time.perf_counter())
+        event["event_read_monotonic"] = event_monotonic
         with self.lock:
             self.clip_index += 1
             clip_index = self.clip_index
-            self.active_recordings.add(clip_index)
+            self.active_recordings[clip_index] = event_monotonic
         thread = threading.Thread(target=self._record_clip, args=(clip_index, event), daemon=True)
         thread.start()
+
+    def _measurement_delay_seconds(self) -> float:
+        return max(
+            0.0,
+            float(
+                getattr(
+                    self.args,
+                    "measurement_delay_seconds",
+                    DEFAULT_MEASUREMENT_DELAY_SECONDS,
+                )
+            ),
+        )
 
     def _latest_recording_frame(self) -> dict[str, Any] | None:
         if self.processor is not None:
             return self.processor.recording_frame()
         return self.buffer.latest()
+
+    def _configuration_files_fingerprint(
+        self,
+    ) -> tuple[tuple[str, int | None, int | None], ...]:
+        output_dir = Path(self.args.output_dir).resolve()
+        paths = (
+            output_dir / "homography_selection.json",
+            output_dir / "table_measurement_calibration.json",
+            Path(self.args.model).resolve(),
+        )
+        fingerprint = []
+        for path in paths:
+            try:
+                stat = path.stat()
+                fingerprint.append((str(path), stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                fingerprint.append((str(path), None, None))
+        return tuple(fingerprint)
+
+    def _configuration_snapshot(self) -> dict[str, Any] | None:
+        with self.configuration_lock:
+            if self.vision_configuration is not None:
+                if self.configuration_fingerprint is None:
+                    return self.vision_configuration
+                fingerprint = self._configuration_files_fingerprint()
+                if fingerprint == self.configuration_fingerprint:
+                    return self.vision_configuration
+            else:
+                fingerprint = self._configuration_files_fingerprint()
+            try:
+                self.vision_configuration = build_vision_configuration(self.args, ROOT)
+                self.configuration_fingerprint = fingerprint
+            except (AttributeError, FileNotFoundError, ValueError):
+                if self.database is not None:
+                    raise
+                return None
+            return self.vision_configuration
+
+    def validate_configuration(self) -> dict[str, Any]:
+        configuration = self._configuration_snapshot()
+        if configuration is None:
+            raise RuntimeError("The vision configuration could not be snapshotted")
+        return configuration
+
+    def _camera_source(self) -> str:
+        source = str(getattr(self.args, "source", "unknown"))
+        if source == "rtsp":
+            return f"rtsp://{getattr(self.args, 'camera_ip', 'camera')}"
+        if source == "video":
+            return str(getattr(self.args, "video", "video"))
+        return source
 
     def _capture_processing_snapshot(
         self,
@@ -577,6 +1064,7 @@ class ClipRecorder:
             if key not in ("original_image", "rectified_image")
         }
         snapshot["snapshot_index"] = snap_index
+        snapshot["processing_duration_ms"] = clean_value(processor_data.get("last_duration_ms"))
 
         for image_key, suffix in (("original_image", "original_overlay"), ("rectified_image", "rectified_overlay")):
             image_b64 = result.get(image_key)
@@ -594,8 +1082,39 @@ class ClipRecorder:
         processing_snapshots: list[dict[str, Any]] = []
         seen_processing_frames: set[int] = set()
         event_mono = float(event.get("event_read_monotonic") or time.perf_counter())
+        event_key = build_event_key(
+            event,
+            str(getattr(self.args, "plc_endpoint", "")),
+            str(getattr(self.args, "event_node", "")),
+        )
+        measurement_event_id = event_uuid(event_key)
+        vision_configuration: dict[str, Any] | None = None
+        db_sync_status = "disabled" if self.database is None else "pending"
+        db_sync_error = ""
+        try:
+            vision_configuration = self._configuration_snapshot()
+            if self.database is not None and vision_configuration is not None:
+                measurement_event_id = self.database.create_measurement_event(
+                    event_id=measurement_event_id,
+                    event_key=event_key,
+                    event=event,
+                    configuration=vision_configuration,
+                    plc_endpoint=str(getattr(self.args, "plc_endpoint", "")),
+                    plc_event_node=str(getattr(self.args, "event_node", "")),
+                    plc_watchdog_node=str(getattr(self.args, "watchdog_node", "")),
+                    camera_source=self._camera_source(),
+                )
+                db_sync_status = "recording"
+        except Exception as exc:
+            db_sync_status = "pending"
+            db_sync_error = str(exc)
         record_seconds = max(0.1, float(self.args.record_seconds))
         deadline = event_mono + record_seconds
+        measurement_delay_seconds = self._measurement_delay_seconds()
+        measurement_target_mono = event_mono + measurement_delay_seconds
+        save_raw_clips = bool(getattr(self.args, "save_raw_clips", False))
+        direct_raw_capture = direct_raw_capture_enabled(self.args)
+        buffer_raw_capture = save_raw_clips and not direct_raw_capture
         fps = max(1.0, min(float(self.args.record_fps or self.args.capture_fps or 10.0), 60.0))
         target_frame_count = max(1, int(round(record_seconds * fps)))
         frames_written = 0
@@ -605,7 +1124,43 @@ class ClipRecorder:
         first_written_source: dict[str, Any] | None = None
         last_written_source: dict[str, Any] | None = None
         writer: cv2.VideoWriter | None = None
+        raw_writer: cv2.VideoWriter | None = None
         video_path: Path | None = None
+        raw_video_path: Path | None = None
+        raw_capture_process: subprocess.Popen | None = None
+        raw_capture_result: dict[str, Any] | None = None
+        raw_capture_started_at: str | None = None
+        raw_capture_error = ""
+        analysis_dir: Path | None = None
+        json_path: Path | None = None
+        measurement_marker_frames_written = 0
+        measurement_marker_first_video_frame_index: int | None = None
+
+        def write_sample(source: dict[str, Any], sample_monotonic: float) -> None:
+            nonlocal frames_written
+            nonlocal first_written_source
+            nonlocal last_written_source
+            nonlocal measurement_marker_frames_written
+            nonlocal measurement_marker_first_video_frame_index
+            if writer is None or (buffer_raw_capture and raw_writer is None):
+                raise RuntimeError("Required VideoWriters are not available")
+            frame = source["frame"]
+            raw_frame = source.get("raw_frame", frame)
+            if measurement_marker_active(
+                sample_monotonic,
+                event_mono,
+                measurement_delay_seconds,
+            ):
+                if measurement_marker_first_video_frame_index is None:
+                    measurement_marker_first_video_frame_index = frames_written
+                measurement_marker_frames_written += 1
+                frame = draw_measurement_perimeter(frame)
+            writer.write(frame)
+            if raw_writer is not None:
+                raw_writer.write(raw_frame)
+            first_written_source = first_written_source or source
+            last_written_source = source
+            frames_written += 1
 
         try:
             day_dir = self.args.output_dir / "live_plc_clips" / datetime.now().strftime("%Y-%m-%d")
@@ -615,9 +1170,25 @@ class ClipRecorder:
             analysis_dir = day_dir / f"{base}_analysis"
             analysis_dir.mkdir(parents=True, exist_ok=True)
             video_path = day_dir / f"{base}.mp4"
+            if save_raw_clips:
+                raw_video_path = day_dir / f"{base}_raw.mp4"
             json_path = day_dir / f"{base}.json"
+            if direct_raw_capture and raw_video_path is not None:
+                raw_capture_started_at = utc_now()
+                raw_capture_process = start_direct_raw_capture(
+                    self.args,
+                    raw_video_path,
+                    record_seconds,
+                )
 
             while time.perf_counter() < deadline:
+                self._capture_processing_snapshot(
+                    analysis_dir,
+                    processing_snapshots,
+                    seen_processing_frames,
+                    event_mono,
+                    deadline,
+                )
                 item = self._latest_recording_frame()
                 if item is not None and int(item["index"]) > last_index:
                     last_index = int(item["index"])
@@ -626,22 +1197,39 @@ class ClipRecorder:
                         source_frames_seen += 1
                         if writer is None:
                             height, width = item["frame"].shape[:2]
-                            writer_args = (
-                                str(video_path),
-                                cv2.VideoWriter_fourcc(*"avc1"),
-                                fps,
-                                (width, height),
-                            )
+                            raw_height, raw_width = item.get("raw_frame", item["frame"]).shape[:2]
+                            if buffer_raw_capture and (raw_width, raw_height) != (width, height):
+                                raise RuntimeError(
+                                    "Processed and raw recording frames must have the same dimensions"
+                                )
+                            writer_args = (cv2.VideoWriter_fourcc(*"avc1"), fps, (width, height))
                             if os.name == "nt":
                                 writer = cv2.VideoWriter(
-                                    writer_args[0],
+                                    str(video_path),
                                     cv2.CAP_MSMF,
-                                    *writer_args[1:],
+                                    *writer_args,
                                 )
+                                if buffer_raw_capture and raw_video_path is not None:
+                                    raw_writer = cv2.VideoWriter(
+                                        str(raw_video_path),
+                                        cv2.CAP_MSMF,
+                                        *writer_args,
+                                    )
                             else:
-                                writer = cv2.VideoWriter(*writer_args)
+                                writer = cv2.VideoWriter(str(video_path), *writer_args)
+                                if buffer_raw_capture and raw_video_path is not None:
+                                    raw_writer = cv2.VideoWriter(
+                                        str(raw_video_path),
+                                        *writer_args,
+                                    )
                             if not writer.isOpened():
                                 raise RuntimeError(f"Could not open VideoWriter: {video_path}")
+                            if buffer_raw_capture and raw_video_path is not None and (
+                                raw_writer is None or not raw_writer.isOpened()
+                            ):
+                                raise RuntimeError(
+                                    f"Could not open raw VideoWriter: {raw_video_path}"
+                                )
                         if last_source is None:
                             last_source = item
 
@@ -649,18 +1237,8 @@ class ClipRecorder:
                             sample_mono = event_mono + (frames_written / fps)
                             if sample_mono > item_mono:
                                 break
-                            writer.write(last_source["frame"])
-                            first_written_source = first_written_source or last_source
-                            last_written_source = last_source
-                            frames_written += 1
+                            write_sample(last_source, sample_mono)
                         last_source = item
-                self._capture_processing_snapshot(
-                    analysis_dir,
-                    processing_snapshots,
-                    seen_processing_frames,
-                    event_mono,
-                    deadline,
-                )
                 time.sleep(0.025)
             self._capture_processing_snapshot(
                 analysis_dir,
@@ -674,24 +1252,112 @@ class ClipRecorder:
                 raise RuntimeError("No frames were available to record the clip.")
 
             while frames_written < target_frame_count:
-                writer.write(last_source["frame"])
-                first_written_source = first_written_source or last_source
-                last_written_source = last_source
-                frames_written += 1
+                sample_mono = event_mono + (frames_written / fps)
+                write_sample(last_source, sample_mono)
             writer.release()
             writer = None
+            if raw_writer is not None:
+                raw_writer.release()
+                raw_writer = None
+            if direct_raw_capture and raw_capture_process is not None and raw_video_path is not None:
+                raw_capture_result = finish_direct_raw_capture(
+                    raw_capture_process,
+                    raw_video_path,
+                    record_seconds + 8.0,
+                )
+                raw_capture_process = None
+                if not raw_capture_result.get("ok"):
+                    raw_capture_error = str(raw_capture_result.get("error") or "Raw recording failed")
+                    delete_clip_paths(self.args.output_dir, [raw_video_path])
+                    raw_video_path = None
 
             if first_written_source is None or last_written_source is None:
                 raise RuntimeError("No frames were written to the clip.")
 
+            if not snapshots_contain_piece(processing_snapshots):
+                database_cleanup_error = ""
+                if self.database is not None:
+                    try:
+                        self.database.delete_measurement_event(measurement_event_id)
+                    except Exception as exc:
+                        database_cleanup_error = str(exc)
+                artifact_cleanup_errors = delete_clip_paths(
+                    self.args.output_dir,
+                    [video_path, raw_video_path, analysis_dir, json_path],
+                )
+                discarded = {
+                    "clip_index": clip_index,
+                    "discarded_at": utc_now(),
+                    "event_id": measurement_event_id,
+                    "event": clean_value(event),
+                    "reason": "no_piece_detected",
+                    "processing_snapshot_count": len(processing_snapshots),
+                    "database_cleanup_error": database_cleanup_error,
+                    "artifact_cleanup_errors": artifact_cleanup_errors,
+                }
+                with self.lock:
+                    self.discarded_clip_count += 1
+                    self.last_discarded_clip = discarded
+                    cleanup_errors = [
+                        error
+                        for error in [database_cleanup_error, *artifact_cleanup_errors]
+                        if error
+                    ]
+                    if cleanup_errors:
+                        self.error = (
+                            "The empty clip was discarded with cleanup errors: "
+                            + "; ".join(cleanup_errors)
+                        )
+                return
+
+            canonical_snapshot = select_canonical_snapshot(
+                processing_snapshots,
+                event_monotonic=event_mono,
+                target_offset_seconds=measurement_delay_seconds,
+            )
+            measurement_evidence_marked = mark_measurement_evidence_snapshot(
+                canonical_snapshot
+            )
+            measurement_actual_offset_seconds = (
+                float(canonical_snapshot["frame_monotonic"]) - event_mono
+                if canonical_snapshot is not None
+                and canonical_snapshot.get("frame_monotonic") is not None
+                else None
+            )
             sidecar = {
                 "clip_index": clip_index,
                 "saved_at": utc_now(),
+                "event_id": measurement_event_id,
+                "event_key": event_key,
                 "event": event,
+                "plc_endpoint": str(getattr(self.args, "plc_endpoint", "")),
+                "plc_event_node": str(getattr(self.args, "event_node", "")),
+                "plc_watchdog_node": str(getattr(self.args, "watchdog_node", "")),
+                "camera_source": self._camera_source(),
+                "vision_configuration": vision_configuration,
                 "record_seconds": record_seconds,
                 "video_fps": fps,
                 "video_codec": "h264",
                 "video_content": "yolo_processed_overlay" if self.processor is not None else "raw_fallback",
+                "measurement_delay_seconds": measurement_delay_seconds,
+                "measurement_target_monotonic": measurement_target_mono,
+                "measurement_actual_offset_seconds": measurement_actual_offset_seconds,
+                "measurement_snapshot_utc": (
+                    canonical_snapshot.get("frame_utc")
+                    if canonical_snapshot is not None
+                    else None
+                ),
+                "measurement_snapshot_frame_index": (
+                    int(canonical_snapshot["frame_index"])
+                    if canonical_snapshot is not None
+                    else None
+                ),
+                "measurement_evidence_marked": measurement_evidence_marked,
+                "measurement_marker_duration_seconds": MEASUREMENT_MARKER_DURATION_SECONDS,
+                "measurement_marker_frames_written": measurement_marker_frames_written,
+                "measurement_marker_first_video_frame_index": (
+                    measurement_marker_first_video_frame_index
+                ),
                 "video_duration_seconds": frames_written / fps,
                 "frames_captured": source_frames_seen,
                 "frames_written": frames_written,
@@ -704,40 +1370,300 @@ class ClipRecorder:
                 "analysis_dir": str(analysis_dir),
                 "processing_snapshots": processing_snapshots,
                 "processing_snapshot_count": len(processing_snapshots),
+                "canonical_snapshot_frame_index": (
+                    int(canonical_snapshot["frame_index"])
+                    if canonical_snapshot is not None
+                    else None
+                ),
+                "db_sync_status": db_sync_status,
+                "db_sync_backend": None,
+                "db_sync_error": db_sync_error,
+                "db_sync_attempts": 0,
+                "db_sync_last_attempt_at": None,
             }
-            json_path.write_text(json.dumps(sidecar, indent=2, ensure_ascii=False), encoding="utf-8")
+            if raw_video_path is not None:
+                if buffer_raw_capture:
+                    raw_height, raw_width = last_written_source.get(
+                        "raw_frame",
+                        last_written_source["frame"],
+                    ).shape[:2]
+                    raw_capture_result = {
+                        "ok": True,
+                        "width": raw_width,
+                        "height": raw_height,
+                        "fps": fps,
+                        "frame_count": frames_written,
+                        "duration_seconds": frames_written / fps,
+                        "size_bytes": raw_video_path.stat().st_size,
+                    }
+                sidecar.update(
+                    raw_video_path=str(raw_video_path),
+                    raw_video_codec="h264",
+                    raw_video_content="axis_camera_raw",
+                    raw_video_capture_mode=(
+                        "direct_rtsp_copy" if direct_raw_capture else "processed_buffer"
+                    ),
+                    raw_video_capture_started_at=raw_capture_started_at,
+                    raw_video_requested_resolution=str(
+                        getattr(
+                            self.args,
+                            "raw_camera_resolution",
+                            getattr(self.args, "camera_resolution", "unknown"),
+                        )
+                    ),
+                    raw_video_requested_fps=float(
+                        getattr(self.args, "raw_record_fps", fps)
+                    ),
+                    raw_video_width=raw_capture_result.get("width") if raw_capture_result else None,
+                    raw_video_height=raw_capture_result.get("height") if raw_capture_result else None,
+                    raw_video_fps=raw_capture_result.get("fps") if raw_capture_result else None,
+                    raw_video_frames=(
+                        raw_capture_result.get("frame_count") if raw_capture_result else None
+                    ),
+                    raw_video_duration_seconds=(
+                        raw_capture_result.get("duration_seconds")
+                        if raw_capture_result
+                        else None
+                    ),
+                )
+            elif save_raw_clips and raw_capture_error:
+                sidecar["raw_video_error"] = raw_capture_error
+            write_json_atomic(json_path, sidecar)
+            if self.database is not None:
+                sidecar["db_sync_attempts"] = 1
+                sidecar["db_sync_last_attempt_at"] = utc_now()
+                sidecar["db_sync_status"] = "pending"
+                sidecar["db_sync_error"] = ""
+                write_json_atomic(json_path, sidecar)
+                try:
+                    self.database.mark_measurement_event_processing(
+                        measurement_event_id,
+                        str(sidecar["last_frame_utc"]),
+                    )
+                    actual_event_id = self.database.sync_sidecar(json_path, self.args.output_dir)
+                    if actual_event_id != sidecar["event_id"]:
+                        sidecar["event_id"] = actual_event_id
+                        write_json_atomic(json_path, sidecar)
+                        self.database.sync_sidecar(json_path, self.args.output_dir)
+                    sidecar["db_sync_status"] = "synced"
+                    sidecar["db_sync_backend"] = self.database.backend_name
+                    write_json_atomic(json_path, sidecar)
+                except Exception as exc:
+                    sidecar["db_sync_status"] = "pending"
+                    sidecar["db_sync_error"] = str(exc)
+                    write_json_atomic(json_path, sidecar)
             self._enforce_retention()
             with self.lock:
                 self.last_clip = sidecar
         except Exception as exc:
+            stop_direct_raw_capture(raw_capture_process)
+            raw_capture_process = None
             if writer is not None:
                 writer.release()
                 writer = None
-            if video_path is not None and video_path.exists():
-                try:
-                    video_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            if raw_writer is not None:
+                raw_writer.release()
+                raw_writer = None
+            delete_clip_paths(
+                self.args.output_dir,
+                [video_path, raw_video_path, analysis_dir, json_path],
+            )
             failure = {
                 "clip_index": clip_index,
                 "failed_at": utc_now(),
                 "event": clean_value(event),
                 "error": str(exc),
             }
+            if self.database is not None:
+                try:
+                    self.database.mark_measurement_event_failed(
+                        measurement_event_id,
+                        failure["error"],
+                    )
+                except Exception:
+                    pass
             with self.lock:
                 self.error = failure["error"]
                 self.failed_recordings.append(failure)
         finally:
+            stop_direct_raw_capture(raw_capture_process)
             if writer is not None:
                 writer.release()
+            if raw_writer is not None:
+                raw_writer.release()
             with self.lock:
-                self.active_recordings.discard(clip_index)
+                self.active_recordings.pop(clip_index, None)
 
     def _enforce_retention(self) -> None:
         max_clips = max(1, int(self.args.max_clips or 100))
         sidecars = clip_sidecars(self.args.output_dir)
         for json_path in sidecars[max_clips:]:
+            if self.database is not None:
+                try:
+                    data = json.loads(json_path.read_text(encoding="utf-8"))
+                    event_id = data.get("event_id")
+                    if event_id:
+                        self.database.delete_measurement_event(str(event_id))
+                except Exception as exc:
+                    with self.lock:
+                        self.error = f"Retention deferred for {json_path.name}: {exc}"
+                    continue
             delete_clip_artifacts(self.args.output_dir, json_path)
+
+
+class DatabaseReconciler:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        database: DatabaseRepository | SQLiteDatabaseRepository,
+    ) -> None:
+        self.args = args
+        self.database = database
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="database-sidecar-reconciler",
+            daemon=True,
+        )
+        self.lock = threading.Lock()
+        self.vision_configuration = build_vision_configuration(args, ROOT)
+        self.state: dict[str, Any] = {
+            "running": False,
+            "pending": 0,
+            "synced": 0,
+            "failed": 0,
+            "pruned": 0,
+            "last_run_utc": None,
+            "last_error": "",
+        }
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return self.state.copy()
+
+    def _set_state(self, **updates: Any) -> None:
+        with self.lock:
+            self.state.update(updates)
+
+    def _enrich_sidecar(self, data: dict[str, Any]) -> dict[str, Any]:
+        event = data.get("event") if isinstance(data.get("event"), dict) else {}
+        plc_endpoint = str(data.get("plc_endpoint") or self.args.plc_endpoint)
+        plc_event_node = str(data.get("plc_event_node") or self.args.event_node)
+        event_key = str(
+            data.get("event_key")
+            or build_event_key(event, plc_endpoint, plc_event_node)
+        )
+        data.setdefault("event_key", event_key)
+        data.setdefault("event_id", event_uuid(event_key))
+        data.setdefault("vision_configuration", self.vision_configuration)
+        data.setdefault("plc_endpoint", plc_endpoint)
+        data.setdefault("plc_event_node", plc_event_node)
+        data.setdefault("plc_watchdog_node", str(self.args.watchdog_node))
+        data.setdefault("camera_source", "legacy_live_mvp")
+        return data
+
+    def sync_once(self) -> None:
+        pending_paths = []
+        backend = self.database.backend_name
+        all_event_ids = getattr(
+            self.database,
+            "all_measurement_event_ids",
+            None,
+        )
+        existing_event_ids = all_event_ids() if callable(all_event_ids) else None
+        for path in clip_sidecars(self.args.output_dir):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                data = None
+            if data and (
+                data.get("db_sync_status") == "pending"
+                or data.get("db_sync_backend") != backend
+                or (
+                    existing_event_ids is not None
+                    and data.get("event_id")
+                    and str(data["event_id"]) not in existing_event_ids
+                )
+            ):
+                pending_paths.append(path)
+        self._set_state(running=True, pending=len(pending_paths), last_run_utc=utc_now())
+        synced = 0
+        failed = 0
+        last_error = ""
+        for path in pending_paths:
+            if self.stop_event.is_set():
+                break
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                data = None
+            if not data:
+                continue
+            data = self._enrich_sidecar(data)
+            data["db_sync_attempts"] = int(data.get("db_sync_attempts") or 0) + 1
+            data["db_sync_last_attempt_at"] = utc_now()
+            data["db_sync_status"] = "pending"
+            data["db_sync_error"] = ""
+            write_json_atomic(path, data)
+            try:
+                actual_event_id = self.database.sync_sidecar(path, self.args.output_dir)
+                if actual_event_id != data.get("event_id"):
+                    data["event_id"] = actual_event_id
+                    write_json_atomic(path, data)
+                    self.database.sync_sidecar(path, self.args.output_dir)
+                data["db_sync_status"] = "synced"
+                data["db_sync_backend"] = backend
+                data["db_sync_error"] = ""
+                write_json_atomic(path, data)
+                synced += 1
+            except Exception as exc:
+                data["db_sync_status"] = "pending"
+                data["db_sync_error"] = str(exc)
+                last_error = str(exc)
+                failed += 1
+                write_json_atomic(path, data)
+        pruned = 0
+        if callable(all_event_ids):
+            retained_event_ids: set[str] = set()
+            can_prune = True
+            for path in clip_sidecars(self.args.output_dir):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    can_prune = False
+                    break
+                event_id = data.get("event_id")
+                if event_id:
+                    retained_event_ids.add(str(event_id))
+            if can_prune:
+                for stale_event_id in all_event_ids() - retained_event_ids:
+                    self.database.delete_measurement_event(stale_event_id)
+                    pruned += 1
+        self._set_state(
+            running=False,
+            pending=max(0, len(pending_paths) - synced),
+            synced=int(self.state.get("synced") or 0) + synced,
+            failed=int(self.state.get("failed") or 0) + failed,
+            pruned=int(self.state.get("pruned") or 0) + pruned,
+            last_error=last_error,
+        )
+
+    def _run(self) -> None:
+        delay = max(2.0, float(getattr(self.args, "db_retry_seconds", 15.0)))
+        while not self.stop_event.is_set():
+            try:
+                self.sync_once()
+            except Exception as exc:
+                self._set_state(running=False, last_error=str(exc), last_run_utc=utc_now())
+            self.stop_event.wait(delay)
 
 
 class PLCMonitor:
@@ -883,7 +1809,9 @@ h2 { font-size: 16px; }
 .grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(360px, .75fr); gap: 12px; align-items: start; }
 .panel { border: 1px solid #d8e0e4; border-radius: 8px; background: #ffffff; overflow: hidden; box-shadow: 0 14px 28px rgba(23,32,37,.08); }
 .panel-head { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #d8e0e4; }
-.stage { display: grid; place-items: center; min-height: 300px; background: #eef2f4; }
+.stage { position: relative; display: grid; place-items: center; min-height: 300px; background: #eef2f4; }
+.stage::after { content: ""; position: absolute; inset: 0; border: 0 solid #2ecc71; pointer-events: none; }
+.stage.measurement-taken::after { border-width: 8px; box-shadow: inset 0 0 0 2px rgba(255,255,255,.85); }
 .stage img { display: block; width: 100%; height: auto; max-height: calc(100vh - 260px); object-fit: contain; }
 .side { display: grid; gap: 12px; }
 .diagram { width: 100%; height: auto; display: block; background: #f7faf8; }
@@ -920,13 +1848,20 @@ h2 { font-size: 16px; }
 
     <section class="panel">
       <svg class="diagram" viewBox="0 0 760 310" role="img" aria-label="Measurement diagram">
+        <defs>
+          <linearGradient id="live-steel" x1="0" x2="1">
+            <stop offset="0%" stop-color="#69777c" />
+            <stop offset="42%" stop-color="#d6dcde" />
+            <stop offset="72%" stop-color="#929da1" />
+            <stop offset="100%" stop-color="#5a666b" />
+          </linearGradient>
+        </defs>
         <rect x="38" y="34" width="684" height="232" rx="8" fill="#f7faf8" stroke="#cbd6cf" stroke-width="2" />
-        <rect x="86" y="82" width="588" height="132" rx="6" fill="#e5ece8" stroke="#c0cbc6" />
-        <line x1="92" x2="668" y1="156" y2="156" stroke="#d28230" stroke-width="5" stroke-linecap="round" stroke-dasharray="12 9" />
-        <text x="104" y="184" fill="#a66324" font-size="20" font-weight="900">REF</text>
-        <line id="diagram-front" x1="92" x2="668" y1="205" y2="205" stroke="#28a96e" stroke-width="7" stroke-linecap="round" />
-        <text id="diagram-label" x="104" y="235" fill="#14784f" font-size="20" font-weight="900">front</text>
-        <line id="diagram-measure" x1="700" x2="700" y1="156" y2="205" stroke="#243c48" stroke-width="3" stroke-dasharray="8 7" />
+        <rect x="86" y="58" width="588" height="182" rx="6" fill="#edf2ef" stroke="#c0cbc6" />
+        <line id="diagram-reference" x1="92" x2="668" y1="156" y2="156" stroke="#d28230" stroke-width="4" stroke-linecap="round" stroke-dasharray="10 8" />
+        <text id="diagram-reference-label" x="100" y="180" fill="#a66324" font-size="16" font-weight="900">REFERENCE</text>
+        <g id="diagram-pieces"></g>
+        <text id="diagram-summary" x="380" y="286" text-anchor="middle" fill="#243c48" font-size="17" font-weight="900">Waiting for pieces</text>
       </svg>
     </section>
   </main>
@@ -957,13 +1892,62 @@ function pill(el, text, tone) {
   el.className = `pill ${tone || ''}`.trim();
 }
 
-function updateDiagram(ratio) {
-  const has = Number.isFinite(Number(ratio));
-  const y = has ? Math.max(112, Math.min(238, 92 + Number(ratio) * 160)) : 205;
-  $('diagram-front').setAttribute('y1', y);
-  $('diagram-front').setAttribute('y2', y);
-  $('diagram-label').setAttribute('y', Math.max(118, Math.min(252, y + 30)));
-  $('diagram-measure').setAttribute('y2', y);
+function compactMeasurement(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '-';
+  let total = Math.round(Math.abs(numeric) * 16);
+  const sign = numeric < 0 ? '-' : '';
+  const feet = Math.floor(total / 192);
+  total -= feet * 192;
+  const inches = Math.floor(total / 16);
+  let numerator = total % 16;
+  let denominator = 16;
+  while (numerator && numerator % 2 === 0) {
+    numerator /= 2;
+    denominator /= 2;
+  }
+  const inchText = numerator ? `${inches} ${numerator}/${denominator}` : `${inches}`;
+  return `${sign}${feet}' ${inchText}"`;
+}
+
+function updateDiagram(result) {
+  const pieces = Array.isArray(result?.pieces) ? result.pieces : [];
+  const rectWidth = Math.max(1, Number(result?.rectified_width || 1));
+  const rectHeight = Math.max(1, Number(result?.rectified_height || 1));
+  const mapY = (value) => Math.max(66, Math.min(232, 58 + (Number(value) / rectHeight) * 182));
+  const referenceValue = result?.calibration?.reference_y;
+  const referenceY = Number.isFinite(Number(referenceValue)) ? mapY(referenceValue) : 156;
+  $('diagram-reference').setAttribute('y1', referenceY);
+  $('diagram-reference').setAttribute('y2', referenceY);
+  $('diagram-reference-label').setAttribute('y', Math.min(252, referenceY + 22));
+
+  $('diagram-pieces').innerHTML = pieces.map((piece, index) => {
+    const box = piece.box || {};
+    const lineY = piece?.sobel?.line?.y;
+    if (!Number.isFinite(Number(lineY))) return '';
+    const centerRatio = (Number(box.x || 0) + Number(box.w || 0) / 2) / rectWidth;
+    const x = 92 + Math.max(0, Math.min(1, centerRatio)) * 576;
+    const width = Math.max(12, Math.min(34, (Number(box.w || 0) / rectWidth) * 576));
+    const frontY = mapY(lineY);
+    const valid = Boolean(piece.valid);
+    const color = valid ? '#16845a' : '#c5782d';
+    const measurement = piece.measurement?.measurement_in;
+    const label = compactMeasurement(measurement);
+    return `
+      <g>
+        <rect x="${x - width / 2}" y="68" width="${width}" height="${Math.max(8, frontY - 68)}" rx="3"
+          fill="url(#live-steel)" stroke="#536066" stroke-width="1" />
+        <line x1="${x - width / 2 - 2}" x2="${x + width / 2 + 2}" y1="${frontY}" y2="${frontY}"
+          stroke="${color}" stroke-width="5" stroke-linecap="round" />
+        <text x="${x}" y="${Math.min(254, frontY + 17 + (index % 2) * 14)}" text-anchor="middle"
+          fill="${color}" font-size="11" font-weight="900">P${Number(piece.piece_id)} ${label}</text>
+      </g>`;
+  }).join('');
+
+  const summary = result?.measurement_summary || {};
+  $('diagram-summary').textContent = pieces.length
+    ? `${Number(summary.valid_count || 0)} / ${pieces.length} valid piece measurements`
+    : 'No pieces detected';
 }
 
 function signalTime(trigger) {
@@ -995,7 +1979,7 @@ function updatePlcSignal(plc) {
     const highlighting = Date.now() < plcSignalHighlightUntil;
     const time = signalTime(trigger);
     signal.className = `plc-signal ${highlighting ? 'received' : 'seen'}`;
-    text.textContent = `${highlighting ? 'PLC signal received' : 'Last PLC signal'}${time ? ` | ${time}` : ''}`;
+    text.textContent = `${highlighting ? 'PLC signal received' : 'Last PLC Cut Signal'}${time ? ` | ${time}` : ''}`;
     signal.title = trigger.event_source_timestamp || trigger.read_utc || '';
   }
   lastPlcEventCount = count;
@@ -1009,7 +1993,11 @@ async function refreshFrame() {
     const result = data.result;
     if (!result) return;
     setImage($('original-stage'), result.original_image, 'Live camera');
-    updateDiagram(result.front_y_ratio);
+    $('original-stage').classList.toggle(
+      'measurement-taken',
+      Boolean(data.recorder?.measurement_marker_active),
+    );
+    updateDiagram(result);
   } catch (err) {
     pill($('top-state'), 'frame error', 'err');
   }
@@ -1022,9 +2010,11 @@ async function refreshStatus() {
     if (!response.ok) throw new Error(data.error || 'status error');
     const camera = data.camera || {};
     const processor = data.processor || {};
+    const database = data.database || {};
     updatePlcSignal(data.plc || {});
-    const healthy = camera.connected && processor.ok;
-    pill($('top-state'), healthy ? 'live' : 'check status', healthy ? 'ok' : 'warn');
+    const healthy = camera.connected && processor.ok && (!database.enabled || database.ok);
+    const label = database.enabled ? (healthy ? 'live' : 'check status') : 'simulation';
+    pill($('top-state'), label, healthy && database.enabled ? 'ok' : 'warn');
   } catch (err) {
     pill($('top-state'), 'error', 'err');
   }
@@ -1046,148 +2036,303 @@ HISTORY_HTML = r"""
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TX2 Clip History</title>
+<title>TX2 Measurement History</title>
 <style>
 :root { color: #172025; background: #f5f7f8; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: #f5f7f8; }
-.app { width: min(1500px, calc(100vw - 24px)); margin: 0 auto; padding: 14px 0 22px; }
-.topbar { display: flex; align-items: end; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
-h1, h2, p { margin: 0; letter-spacing: 0; }
-h1 { font-size: 27px; line-height: 1.05; }
+button, input, textarea { font: inherit; }
+.app { width: min(1580px, calc(100vw - 24px)); margin: 0 auto; padding: 14px 0 22px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
+h1, h2, h3, p { margin: 0; letter-spacing: 0; }
+h1 { font-size: 25px; line-height: 1.1; }
 h2 { font-size: 16px; }
-.eyebrow { color: #68787f; font-size: 12px; font-weight: 800; text-transform: uppercase; margin-bottom: 4px; }
-.nav a, .btn { border: 1px solid #cbd5da; border-radius: 8px; padding: 9px 12px; color: #172025; background: #ffffff; text-decoration: none; font-weight: 900; cursor: pointer; }
-.grid { display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 12px; align-items: start; }
-.panel { border: 1px solid #d8e0e4; border-radius: 8px; background: #ffffff; overflow: hidden; box-shadow: 0 14px 28px rgba(23,32,37,.08); }
+.nav a, .btn { border: 1px solid #cbd5da; border-radius: 8px; padding: 9px 12px; color: #172025; background: #fff; text-decoration: none; font-weight: 800; cursor: pointer; }
+.btn.primary { border-color: #247654; background: #247654; color: #fff; }
+.btn.danger { border-color: #c77a7a; color: #9d2d2d; }
+.grid { display: grid; grid-template-columns: 360px minmax(0, 1fr); gap: 12px; align-items: start; }
+.panel { min-width: 0; border: 1px solid #d8e0e4; border-radius: 8px; background: #fff; overflow: hidden; box-shadow: 0 10px 24px rgba(23,32,37,.07); }
 .panel-head { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #d8e0e4; }
+.muted { color: #68787f; font-size: 12px; font-weight: 750; }
 .list { display: grid; max-height: calc(100vh - 120px); overflow: auto; }
-.clip { display: grid; gap: 5px; padding: 11px 12px; color: #2c3a40; background: transparent; border: 0; border-bottom: 1px solid rgba(23,32,37,.08); text-align: left; cursor: pointer; }
-.clip:hover, .clip.active { background: #edf5f8; }
-.clip strong { color: #172025; overflow-wrap: anywhere; }
-.clip span { color: #68787f; font-size: 12px; font-weight: 800; }
-.viewer { padding: 12px; display: grid; gap: 12px; }
-video, img { display: block; width: 100%; border-radius: 8px; background: #eef2f4; }
-.meta { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-.metric { border: 1px solid #d8e0e4; border-radius: 8px; background: #ffffff; padding: 10px; min-height: 62px; }
-.metric span { display: block; color: #68787f; font-size: 12px; font-weight: 800; }
-.metric strong { display: block; margin-top: 5px; color: #172025; font-size: 18px; overflow-wrap: anywhere; }
+.event { display: grid; gap: 5px; padding: 12px; color: #2c3a40; background: transparent; border: 0; border-bottom: 1px solid rgba(23,32,37,.08); text-align: left; cursor: pointer; }
+.event:hover, .event.active { background: #edf5f8; }
+.event strong { color: #172025; overflow-wrap: anywhere; }
+.event span { color: #68787f; font-size: 12px; font-weight: 750; }
+.viewer { padding: 12px; display: grid; gap: 14px; }
+video, img { display: block; width: 100%; border-radius: 6px; background: #eef2f4; }
+.asset-actions { display: flex; justify-content: flex-end; }
+.meta { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid #d8e0e4; border-radius: 8px; overflow: hidden; }
+.metric { padding: 10px; min-height: 62px; border-right: 1px solid #d8e0e4; }
+.metric:last-child { border-right: 0; }
+.metric span { display: block; color: #68787f; font-size: 12px; font-weight: 750; }
+.metric strong { display: block; margin-top: 5px; color: #172025; font-size: 17px; overflow-wrap: anywhere; }
+.section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.pieces { width: 100%; border-collapse: collapse; border: 1px solid #d8e0e4; }
+.pieces th, .pieces td { padding: 9px 10px; border-bottom: 1px solid #e2e8eb; text-align: left; vertical-align: middle; }
+.pieces th { color: #5b6b72; background: #f6f8f9; font-size: 12px; }
+.pieces td { font-size: 13px; }
+.pieces tr:last-child td { border-bottom: 0; }
+.state { display: inline-flex; border-radius: 999px; padding: 4px 8px; background: #edf2f4; color: #4f6067; font-size: 11px; font-weight: 850; }
+.state.ok { background: #e9f8f0; color: #14784f; }
+.state.review { background: #fff4df; color: #8a5a0a; }
+.revision-log { border: 1px solid #d8e0e4; border-top: 0; }
+.revision { display: grid; grid-template-columns: 90px 150px minmax(0, 1fr); gap: 10px; padding: 8px 10px; border-bottom: 1px solid #e2e8eb; color: #4d5e65; font-size: 12px; }
+.revision:last-child { border-bottom: 0; }
 .snapshots { display: grid; gap: 10px; }
-.snapshot { border: 1px solid #d8e0e4; border-radius: 8px; overflow: hidden; background: #ffffff; }
-.snapshot-head { display: flex; justify-content: space-between; gap: 10px; padding: 9px 10px; border-bottom: 1px solid rgba(23,32,37,.08); color: #3c4d54; font-size: 13px; font-weight: 900; }
-.snapshot-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 8px; }
-.empty { color: #68787f; font-weight: 800; padding: 44px 12px; text-align: center; }
-@media (max-width: 980px) { .grid { grid-template-columns: 1fr; } .meta { grid-template-columns: repeat(2, minmax(0, 1fr)); } .snapshot-grid { grid-template-columns: 1fr; } }
+.snapshot { border: 1px solid #d8e0e4; border-radius: 8px; overflow: hidden; background: #fff; }
+.snapshot-head { display: flex; justify-content: space-between; gap: 10px; padding: 9px 10px; border-bottom: 1px solid #e2e8eb; color: #3c4d54; font-size: 12px; font-weight: 800; }
+.snapshot-grid { padding: 8px; }
+.measurement-evidence { border: 8px solid #2ecc71; border-radius: 6px; }
+.empty { color: #68787f; font-weight: 750; padding: 44px 12px; text-align: center; }
+dialog { width: min(520px, calc(100vw - 24px)); border: 1px solid #cbd5da; border-radius: 8px; padding: 0; box-shadow: 0 24px 60px rgba(23,32,37,.22); }
+dialog::backdrop { background: rgba(23,32,37,.35); }
+.dialog-body { display: grid; gap: 12px; padding: 16px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid #d8e0e4; }
+.measure-inputs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+label { display: grid; gap: 5px; color: #4d5e65; font-size: 12px; font-weight: 800; }
+input, textarea { width: 100%; border: 1px solid #bac7cc; border-radius: 6px; padding: 9px; color: #172025; background: #fff; }
+textarea { min-height: 78px; resize: vertical; }
+@media (max-width: 1050px) { .grid { grid-template-columns: 1fr; } .list { max-height: 340px; } }
+@media (max-width: 760px) { .meta { grid-template-columns: repeat(2, 1fr); } .metric:nth-child(2) { border-right: 0; } .pieces { display: block; overflow-x: auto; } }
+@media (max-width: 520px) { .topbar h1 { font-size: 21px; } .meta { grid-template-columns: 1fr; } .metric { border-right: 0; border-bottom: 1px solid #d8e0e4; } .metric:last-child { border-bottom: 0; } .revision { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <div class="app">
   <header class="topbar">
-    <div>
-      <p class="eyebrow">TX2 Vision</p>
-      <h1>Video history</h1>
-    </div>
-    <div class="nav"><a href="/">Live</a></div>
+    <h1>Measurement history</h1>
+    <nav class="nav"><a href="/">Live</a></nav>
   </header>
   <main class="grid">
     <section class="panel">
       <div class="panel-head">
-        <div>
-          <p class="eyebrow">PLC clips</p>
-          <h2 id="clip-count">Loading...</h2>
-        </div>
+        <h2 id="event-count">Loading...</h2>
       </div>
-      <div class="list" id="clip-list"><div class="empty">Loading clips...</div></div>
+      <div class="list" id="event-list"><div class="empty">Loading events...</div></div>
     </section>
     <section class="panel">
       <div class="panel-head">
-        <div>
-          <p class="eyebrow">Replay</p>
-          <h2 id="detail-title">Select a clip</h2>
-        </div>
+        <h2 id="detail-title">Select an event</h2>
+        <span class="muted" id="detail-state"></span>
       </div>
-      <div class="viewer" id="viewer"><div class="empty">Select a saved PLC clip.</div></div>
+      <div class="viewer" id="viewer"><div class="empty">Select a saved PLC event.</div></div>
     </section>
   </main>
 </div>
+
+<dialog id="correction-dialog">
+  <form id="correction-form">
+    <div class="dialog-body">
+      <h2 id="correction-title">Operator measurement</h2>
+      <div class="measure-inputs">
+        <label>Feet<input id="feet" type="number" min="0" step="1" required></label>
+        <label>Inches<input id="inches" type="number" min="0" max="11" step="1" required></label>
+        <label>Sixteenths<input id="sixteenths" type="number" min="0" max="15" step="1" required></label>
+      </div>
+      <label>Operator ID<input id="operator-id" autocomplete="username" required></label>
+      <label>Display name<input id="operator-name"></label>
+      <label>Reason<textarea id="reason" required></textarea></label>
+      <div id="form-error" class="muted"></div>
+    </div>
+    <div class="dialog-actions">
+      <button type="button" class="btn" id="cancel-correction">Cancel</button>
+      <button type="submit" class="btn primary">Save correction</button>
+    </div>
+  </form>
+</dialog>
+
 <script>
 const $ = (id) => document.getElementById(id);
-const fmt = (value, digits = 3) => {
-  const n = Number(value);
-  return Number.isFinite(n) ? n.toFixed(digits) : '-';
-};
-let activeClip = '';
-const initialClipId = location.pathname.startsWith('/history/') ? decodeURIComponent(location.pathname.split('/').pop() || '') : '';
+const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));
+const number = (value, digits = 3) => Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : '-';
+const dateTime = (value) => value ? new Date(value).toLocaleString() : '-';
+let activeEventId = '';
+let activeEvent = null;
+let editingPiece = null;
+const initialEventId = location.pathname.startsWith('/history/') ? decodeURIComponent(location.pathname.split('/').pop() || '') : '';
 
-function clipLabel(clip) {
-  return clip.saved_at || clip.first_frame_utc || clip.clip_id;
+function measurement(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '-';
+  let total = Math.round(Math.abs(numeric) * 16);
+  const sign = numeric < 0 ? '-' : '';
+  const feet = Math.floor(total / 192);
+  total -= feet * 192;
+  const inches = Math.floor(total / 16);
+  let numerator = total % 16;
+  let denominator = 16;
+  while (numerator && numerator % 2 === 0) {
+    numerator /= 2;
+    denominator /= 2;
+  }
+  const inchText = numerator ? `${inches} ${numerator}/${denominator}` : `${inches}`;
+  return `${sign}${feet}' ${inchText}"`;
 }
 
 function metric(label, value) {
-  return `<div class="metric"><span>${label}</span><strong>${value ?? '-'}</strong></div>`;
+  return `<div class="metric"><span>${esc(label)}</span><strong>${esc(value ?? '-')}</strong></div>`;
+}
+
+function renderPieces(pieces, databaseMode) {
+  if (!pieces?.length) return '<div class="empty">No pieces were stored for the canonical frame.</div>';
+  const table = `<table class="pieces">
+    <thead><tr><th>Piece</th><th>Automatic</th><th>Operator</th><th>Effective</th><th>Difference</th><th>Confidence</th><th>Status</th><th></th></tr></thead>
+    <tbody>${pieces.map((piece) => {
+      const automatic = Number(piece.automatic_measurement_in);
+      const operator = Number(piece.operator_measurement_in);
+      const hasOperator = Number.isFinite(operator);
+      const difference = hasOperator && Number.isFinite(automatic) ? measurement(operator - automatic) : '-';
+      const state = piece.review_required || !piece.is_valid ? 'review' : 'ok';
+      return `<tr>
+        <td><strong>${esc(piece.piece_number)}</strong></td>
+        <td>${esc(measurement(piece.automatic_measurement_in))}</td>
+        <td>${esc(hasOperator ? measurement(piece.operator_measurement_in) : '-')}</td>
+        <td><strong>${esc(measurement(piece.effective_measurement_in))}</strong></td>
+        <td>${esc(difference)}</td>
+        <td>YOLO ${number(piece.yolo_confidence, 2)} / Edge ${number(piece.sobel_confidence, 2)}</td>
+        <td><span class="state ${state}">${state === 'ok' ? 'Valid' : 'Review'}</span><br><span class="muted">rev ${esc(piece.operator_revision ?? 0)}</span></td>
+        <td>${databaseMode !== 'simulation' ? `<button class="btn edit-piece" data-piece-id="${esc(piece.id)}">Edit</button>${hasOperator ? ` <button class="btn danger clear-piece" data-piece-id="${esc(piece.id)}">Clear</button>` : ''}` : ''}</td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table>`;
+  const revisions = pieces.flatMap((piece) => (piece.revisions || []).map((revision) => ({piece, revision})));
+  if (!revisions.length) return table;
+  return `${table}<div class="revision-log">${revisions.map(({piece, revision}) => `
+    <div class="revision">
+      <strong>Piece ${esc(piece.piece_number)} / rev ${esc(revision.revision)}</strong>
+      <span>${esc(revision.action)} | ${esc(dateTime(revision.changed_at))}</span>
+      <span>${esc(revision.operator_display_name || revision.operator_id)}: ${esc(revision.reason)} (${esc(measurement(revision.previous_operator_measurement_in))} to ${esc(measurement(revision.new_operator_measurement_in))})</span>
+    </div>`).join('')}</div>`;
 }
 
 function renderSnapshots(snapshots) {
-  if (!snapshots || !snapshots.length) return '<div class="empty">No processing snapshots saved for this clip.</div>';
-  return `<div class="snapshots">${snapshots.map((snap) => {
-    const measurement = snap.measurement || {};
-    const total = measurement.measurement_in != null ? `${fmt(measurement.measurement_in)} in` : '-';
-    const delta = measurement.delta_in != null ? `${fmt(measurement.delta_in)} in` : '-';
+  if (!snapshots?.length) return '<div class="empty">No processing evidence was stored.</div>';
+  return `<div class="snapshots">${snapshots.map((snapshot) => {
+    const summary = snapshot.measurement_summary || {};
     return `<article class="snapshot">
       <div class="snapshot-head">
-        <span>${snap.processed_utc || snap.frame_utc || '-'}</span>
-        <span>YOLO ${snap.count ?? 0} | Total ${total} | REF ${delta}</span>
+        <span>${esc(dateTime(snapshot.processed_utc || snapshot.frame_utc))}</span>
+        <span>${esc(summary.valid_count ?? snapshot.valid_piece_count ?? 0)} valid of ${esc(summary.detected_count ?? snapshot.detected_piece_count ?? 0)}</span>
       </div>
       <div class="snapshot-grid">
-        ${snap.original_overlay_url ? `<img src="${snap.original_overlay_url}" alt="Original overlay">` : '<div class="empty">No original overlay</div>'}
-        ${snap.rectified_overlay_url ? `<img src="${snap.rectified_overlay_url}" alt="Rectified overlay">` : '<div class="empty">No rectified overlay</div>'}
+        ${snapshot.original_overlay_url ? `<img class="measurement-evidence" src="${esc(snapshot.original_overlay_url)}" alt="Measurement evidence">` : '<div class="empty">No camera evidence</div>'}
       </div>
     </article>`;
   }).join('')}</div>`;
 }
 
-async function loadClip(clipId) {
-  activeClip = clipId;
-  document.querySelectorAll('.clip').forEach((el) => el.classList.toggle('active', el.dataset.clipId === clipId));
-  const response = await fetch(`/api/live/clips/${clipId}`);
+async function loadEvent(eventId) {
+  activeEventId = eventId;
+  document.querySelectorAll('.event').forEach((element) => element.classList.toggle('active', element.dataset.eventId === eventId));
+  const response = await fetch(`/api/history/events/${encodeURIComponent(eventId)}`);
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || 'Could not load clip');
-  $('detail-title').textContent = data.clip_id;
-  const snapshotsShown = data.processing_snapshots_shown ?? data.processing_snapshots?.length ?? 0;
+  if (!response.ok) throw new Error(data.error || 'Could not load measurement event');
+  activeEvent = data;
+  $('detail-title').textContent = dateTime(data.plc_source_timestamp || data.app_received_at || data.created_at);
+  $('detail-state').textContent = data.status || '';
   $('viewer').innerHTML = `
-    <video controls src="${data.video_url}"></video>
+    ${data.video_url ? `<video controls preload="metadata" src="${esc(data.video_url)}"></video>` : '<div class="empty">No video asset is available.</div>'}
+    ${data.raw_video_url ? `<div class="asset-actions"><a class="btn" href="${esc(data.raw_video_url)}" target="_blank" rel="noopener">Raw clip</a></div>` : ''}
     <div class="meta">
-      ${metric('Saved', data.saved_at || '-')}
-      ${metric('Duration', `${data.record_seconds ?? '-'} s`)}
-      ${metric('PLC edge', data.event?.event_edge || '-')}
-      ${metric('Captures', `${snapshotsShown} of ${data.processing_snapshot_count ?? snapshotsShown}`)}
+      ${metric('PLC signal', dateTime(data.plc_source_timestamp || data.app_received_at))}
+      ${metric('Recording', `${dateTime(data.recording_started_at)} - ${dateTime(data.recording_ended_at)}`)}
+      ${metric('Pieces', `${data.valid_piece_count ?? 0} valid / ${data.detected_piece_count ?? 0} detected`)}
+      ${metric('Status', data.status || '-')}
     </div>
-    ${renderSnapshots(data.processing_snapshots)}
+    <div class="section-head"><h3>Piece measurements</h3><span class="muted">Canonical processed frame</span></div>
+    ${renderPieces(data.pieces, data.database_mode)}
+    <div class="section-head"><h3>Processing evidence</h3><span class="muted">PLC + 2 s measurement frame</span></div>
+    ${renderSnapshots(data.snapshots)}
   `;
+  document.querySelectorAll('.edit-piece').forEach((button) => button.addEventListener('click', () => openCorrection(button.dataset.pieceId)));
+  document.querySelectorAll('.clear-piece').forEach((button) => button.addEventListener('click', () => clearCorrection(button.dataset.pieceId)));
 }
 
 async function loadHistory() {
-  const response = await fetch('/api/live/clips');
+  const response = await fetch('/api/history/events?limit=100');
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || 'Could not load history');
-  $('clip-count').textContent = `${data.count} saved clips`;
-  if (!data.clips.length) {
-    $('clip-list').innerHTML = '<div class="empty">No PLC videos saved yet.</div>';
+  $('event-count').textContent = `${data.count} saved events`;
+  if (!data.events.length) {
+    $('event-list').innerHTML = '<div class="empty">No PLC events have been saved.</div>';
     return;
   }
-  $('clip-list').innerHTML = data.clips.map((clip) => `
-    <button class="clip" data-clip-id="${clip.clip_id}">
-      <strong>${clipLabel(clip)}</strong>
-      <span>${clip.record_seconds ?? '-'} s | ${clip.processing_snapshot_count ?? 0} snapshots | ${clip.event?.event_edge || 'event'}</span>
+  $('event-list').innerHTML = data.events.map((event) => `
+    <button class="event" data-event-id="${esc(event.id)}">
+      <strong>${esc(dateTime(event.plc_source_timestamp || event.app_received_at || event.created_at))}</strong>
+      <span>${esc(event.valid_piece_count ?? 0)} valid / ${esc(event.detected_piece_count ?? 0)} detected | ${esc(event.status || '-')}</span>
     </button>
   `).join('');
-  document.querySelectorAll('.clip').forEach((button) => button.addEventListener('click', () => loadClip(button.dataset.clipId)));
-  const initial = data.clips.find((clip) => clip.clip_id === initialClipId) || data.clips[0];
-  loadClip(initial.clip_id);
+  document.querySelectorAll('.event').forEach((button) => button.addEventListener('click', () => loadEvent(button.dataset.eventId)));
+  const initial = data.events.find((event) => String(event.id) === initialEventId) || data.events[0];
+  await loadEvent(String(initial.id));
 }
 
-loadHistory().catch((err) => {
-  $('clip-list').innerHTML = `<div class="empty">${err.message || err}</div>`;
+function openCorrection(pieceId) {
+  editingPiece = activeEvent?.pieces?.find((piece) => String(piece.id) === String(pieceId));
+  if (!editingPiece) return;
+  const total = Number(editingPiece.operator_measurement_in ?? editingPiece.automatic_measurement_in ?? 0);
+  let units = Math.max(0, Math.round(total * 16));
+  $('feet').value = Math.floor(units / 192);
+  units %= 192;
+  $('inches').value = Math.floor(units / 16);
+  $('sixteenths').value = units % 16;
+  $('operator-id').value = localStorage.getItem('tx2OperatorId') || '';
+  $('operator-name').value = localStorage.getItem('tx2OperatorName') || '';
+  $('reason').value = '';
+  $('form-error').textContent = '';
+  $('correction-title').textContent = `Piece ${editingPiece.piece_number} operator measurement`;
+  $('correction-dialog').showModal();
+}
+
+async function clearCorrection(pieceId) {
+  const piece = activeEvent?.pieces?.find((item) => String(item.id) === String(pieceId));
+  if (!piece || !confirm(`Clear the operator correction for piece ${piece.piece_number}?`)) return;
+  const operatorId = localStorage.getItem('tx2OperatorId') || '';
+  const reason = prompt('Reason for clearing this correction:') || '';
+  if (!operatorId || !reason) {
+    alert('Operator ID and reason are required. Open Edit once to store the operator ID.');
+    return;
+  }
+  await patchCorrection(piece, {clear: true, reason, operator_id: operatorId, operator_display_name: localStorage.getItem('tx2OperatorName') || null});
+}
+
+async function patchCorrection(piece, payload) {
+  const response = await fetch(`/api/history/events/${encodeURIComponent(activeEventId)}/pieces/${encodeURIComponent(piece.id)}/operator-measurement`, {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({...payload, expected_revision: piece.operator_revision ?? 0}),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Could not save correction');
+  await loadEvent(activeEventId);
+}
+
+$('correction-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const operatorId = $('operator-id').value.trim();
+  const operatorName = $('operator-name').value.trim();
+  localStorage.setItem('tx2OperatorId', operatorId);
+  localStorage.setItem('tx2OperatorName', operatorName);
+  try {
+    await patchCorrection(editingPiece, {
+      feet: Number($('feet').value),
+      inches: Number($('inches').value),
+      sixteenths: Number($('sixteenths').value),
+      operator_id: operatorId,
+      operator_display_name: operatorName || null,
+      reason: $('reason').value.trim(),
+    });
+    $('correction-dialog').close();
+  } catch (error) {
+    $('form-error').textContent = error.message || error;
+  }
+});
+$('cancel-correction').addEventListener('click', () => $('correction-dialog').close());
+
+loadHistory().catch((error) => {
+  $('event-list').innerHTML = `<div class="empty">${esc(error.message || error)}</div>`;
 });
 </script>
 </body>
@@ -1202,6 +2347,14 @@ _camera: CameraReader
 _processor: LiveProcessor
 _recorder: ClipRecorder
 _plc: PLCMonitor
+_database: DatabaseRepository | SQLiteDatabaseRepository | None = None
+_reconciler: DatabaseReconciler | None = None
+
+
+def database_mode() -> str:
+    if _database is None:
+        return "simulation"
+    return str(getattr(_database, "backend_name", "postgresql"))
 
 
 def clips_root(output_dir: Path) -> Path:
@@ -1212,7 +2365,13 @@ def clip_sidecars(output_dir: Path) -> list[Path]:
     root = clips_root(output_dir)
     if not root.exists():
         return []
-    return sorted(root.rglob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    existing = []
+    for path in root.rglob("*.json"):
+        try:
+            existing.append((path.stat().st_mtime, path))
+        except FileNotFoundError:
+            continue
+    return [path for _mtime, path in sorted(existing, reverse=True)]
 
 
 def path_is_inside(path: Path, root: Path) -> bool:
@@ -1224,20 +2383,55 @@ def path_is_inside(path: Path, root: Path) -> bool:
     return resolved == resolved_root or resolved_root in resolved.parents
 
 
-def read_clip_sidecar(json_path: Path, snapshot_limit: int | None = None) -> dict[str, Any] | None:
+def delete_clip_paths(output_dir: Path, candidates: list[Path | None]) -> list[str]:
+    root = clips_root(output_dir)
+    errors = []
+    for candidate in candidates:
+        if candidate is None or not path_is_inside(candidate, root):
+            continue
+        try:
+            if candidate.is_dir():
+                for child in sorted(candidate.rglob("*"), reverse=True):
+                    if child.is_file():
+                        child.unlink(missing_ok=True)
+                    elif child.is_dir():
+                        child.rmdir()
+                candidate.rmdir()
+            else:
+                candidate.unlink(missing_ok=True)
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+    return errors
+
+
+def read_clip_sidecar(
+    json_path: Path,
+    snapshot_limit: int | None = None,
+    *,
+    measurement_evidence_only: bool = False,
+) -> dict[str, Any] | None:
     try:
         data = json.loads(json_path.read_text(encoding="utf-8"))
     except Exception:
         return None
     snapshots = data.get("processing_snapshots", []) or []
     data["processing_snapshot_count"] = int(data.get("processing_snapshot_count", len(snapshots)))
-    if snapshot_limit is not None:
+    if measurement_evidence_only:
+        snapshots = measurement_evidence_snapshots(
+            snapshots,
+            event_monotonic=(data.get("event") or {}).get("event_read_monotonic"),
+            measurement_delay_seconds=data.get("measurement_delay_seconds"),
+        )
+        data["processing_snapshots"] = snapshots
+    elif snapshot_limit is not None:
         snapshots = representative_snapshots(snapshots, snapshot_limit)
         data["processing_snapshots"] = snapshots
     data["processing_snapshots_shown"] = len(snapshots)
     data["clip_id"] = json_path.stem
     data["json_path"] = str(json_path)
     data["video_url"] = f"/api/live/clips/{json_path.stem}/video"
+    if data.get("raw_video_path"):
+        data["raw_video_url"] = f"/api/live/clips/{json_path.stem}/raw-video"
     data["detail_url"] = f"/history/{json_path.stem}"
     for snapshot in snapshots:
         if snapshot.get("original_overlay_file"):
@@ -1254,29 +2448,118 @@ def find_clip_json(clip_id: str) -> Path | None:
     return None
 
 
+def legacy_history_event(json_path: Path, *, detail: bool) -> dict[str, Any] | None:
+    data = read_clip_sidecar(
+        json_path,
+        snapshot_limit=None if detail else 0,
+        measurement_evidence_only=detail,
+    )
+    if data is None:
+        return None
+    evidence_snapshots = data.get("processing_snapshots", [])
+    canonical = evidence_snapshots[0] if evidence_snapshots else None
+    summary = snapshot_summary(canonical) if canonical else {}
+    event_id = str(data.get("event_id") or data["clip_id"])
+    result: dict[str, Any] = {
+        "id": event_id,
+        "clip_id": data["clip_id"],
+        "status": "simulation",
+        "created_at": data.get("saved_at"),
+        "app_received_at": (data.get("event") or {}).get("read_utc"),
+        "plc_source_timestamp": (data.get("event") or {}).get("event_source_timestamp"),
+        "plc_edge": (data.get("event") or {}).get("event_edge"),
+        "detected_piece_count": int(summary.get("detected_count") or 0),
+        "valid_piece_count": int(summary.get("valid_count") or 0),
+        "video_url": data.get("video_url"),
+        "raw_video_url": data.get("raw_video_url"),
+        "detail_url": f"/history/{event_id}",
+        "database_mode": "simulation",
+    }
+    if not detail:
+        return result
+    canonical_pieces = snapshot_pieces(canonical) if canonical else []
+    result.update(
+        recording_started_at=data.get("first_frame_utc"),
+        recording_ended_at=data.get("last_frame_utc"),
+        snapshots=data.get("processing_snapshots", []),
+        pieces=[
+            {
+                "id": f"legacy-{index}",
+                "piece_number": int(piece.get("piece_id") or index),
+                "is_valid": bool(piece.get("valid")),
+                "review_required": not bool(piece.get("valid")),
+                "yolo_confidence": piece.get("confidence"),
+                "sobel_confidence": (piece.get("sobel") or {}).get("edge_confidence"),
+                "distance_to_reference_in": (piece.get("measurement") or {}).get("delta_in"),
+                "automatic_measurement_in": (piece.get("measurement") or {}).get("measurement_in"),
+                "operator_measurement_in": None,
+                "effective_measurement_in": (piece.get("measurement") or {}).get("measurement_in"),
+                "operator_revision": 0,
+                "revisions": [],
+            }
+            for index, piece in enumerate(canonical_pieces, start=1)
+        ],
+        assets=[],
+    )
+    return result
+
+
+def database_event_detail(event_id: str) -> dict[str, Any] | None:
+    if _database is None:
+        json_path = find_clip_json(event_id)
+        if json_path is None:
+            for candidate in clip_sidecars(_args.output_dir):
+                try:
+                    raw = json.loads(candidate.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if str(raw.get("event_id")) == event_id:
+                    json_path = candidate
+                    break
+        return legacy_history_event(json_path, detail=True) if json_path else None
+
+    event = _database.get_measurement_event(event_id)
+    if event is None:
+        return None
+    assets = [clean_value(asset) for asset in event.get("assets", [])]
+    asset_by_path = {asset["relative_path"]: asset for asset in assets}
+    snapshots = measurement_evidence_snapshots(event.get("snapshots", []))
+    for snapshot in snapshots:
+        for path_key, url_key in (
+            ("original_overlay_path", "original_overlay_url"),
+            ("rectified_overlay_path", "rectified_overlay_url"),
+        ):
+            asset = asset_by_path.get(snapshot.get(path_key))
+            if asset:
+                snapshot[url_key] = f"/api/history/events/{event_id}/assets/{asset['id']}"
+    video = next((asset for asset in assets if asset.get("asset_type") == "video"), None)
+    raw_video = next(
+        (asset for asset in assets if asset.get("asset_type") == "raw_video"),
+        None,
+    )
+    event["snapshots"] = snapshots
+    event["assets"] = assets
+    event["video_url"] = (
+        f"/api/history/events/{event_id}/assets/{video['id']}" if video else None
+    )
+    event["raw_video_url"] = (
+        f"/api/history/events/{event_id}/assets/{raw_video['id']}"
+        if raw_video
+        else None
+    )
+    event["detail_url"] = f"/history/{event_id}"
+    event["database_mode"] = database_mode()
+    return clean_value(event)
+
+
 def delete_clip_artifacts(output_dir: Path, json_path: Path) -> None:
-    root = clips_root(output_dir)
     data = read_clip_sidecar(json_path, snapshot_limit=0) or {}
     candidates: list[Path] = [json_path]
-    for key in ("video_path", "analysis_dir"):
+    for key in ("video_path", "raw_video_path", "analysis_dir"):
         value = data.get(key)
         if value:
             candidates.append(Path(value))
-    for candidate in candidates:
-        if not path_is_inside(candidate, root):
-            continue
-        try:
-            if candidate.is_dir():
-                for child in sorted(candidate.rglob("*"), reverse=True):
-                    if child.is_file():
-                        child.unlink(missing_ok=True)
-                    elif child.is_dir():
-                        child.rmdir()
-                candidate.rmdir()
-            else:
-                candidate.unlink(missing_ok=True)
-        except Exception:
-            pass
+    delete_clip_paths(output_dir, candidates)
 
 
 @app.route("/")
@@ -1296,11 +2579,23 @@ def history_clip(clip_id: str):
 
 @app.route("/api/live/status")
 def api_live_status():
+    database_status = (
+        _database.health().as_dict()
+        if _database is not None
+        else {
+            "enabled": False,
+            "ok": False,
+            "error": "Database disabled explicitly for simulation",
+            "mode": "simulation",
+        }
+    )
     return jsonify(
         camera=_camera.snapshot(),
         processor=_processor.snapshot(include_images=False),
         plc=_plc.snapshot(),
         recorder=_recorder.snapshot(),
+        database=database_status,
+        reconciler=_reconciler.snapshot() if _reconciler is not None else None,
     )
 
 
@@ -1309,7 +2604,218 @@ def api_live_frame():
     data = _processor.snapshot(include_images=True)
     if data.get("result") is None:
         return jsonify(error=data.get("error") or "No processed frame is available yet", processor=data), 503
+    data["recorder"] = _recorder.snapshot()
     return jsonify(data)
+
+
+@app.route("/api/history/events")
+def api_history_events():
+    try:
+        limit = int(request.args.get("limit", 50))
+    except ValueError:
+        return jsonify(error="limit must be an integer"), 400
+    limit = max(1, min(limit, 100))
+    if _database is None:
+        events = []
+        for json_path in clip_sidecars(_args.output_dir)[:limit]:
+            event = legacy_history_event(json_path, detail=False)
+            if event is not None:
+                events.append(event)
+        return jsonify(
+            events=events,
+            count=len(events),
+            database_mode="simulation",
+            warning="The database is disabled explicitly; operator corrections are unavailable.",
+        )
+    mode = database_mode()
+    try:
+        events = _database.list_measurement_events(
+            limit=limit,
+            before=request.args.get("before"),
+        )
+    except DatabaseUnavailable as exc:
+        return jsonify(error=str(exc), database_mode=mode), 503
+    for event in events:
+        event["id"] = str(event["id"])
+        event["detail_url"] = f"/history/{event['id']}"
+        event["video_url"] = f"/api/history/events/{event['id']}/video"
+    return jsonify(
+        events=clean_value(events),
+        count=len(events),
+        database_mode=mode,
+    )
+
+
+@app.route("/api/history/events/<event_id>")
+def api_history_event(event_id: str):
+    try:
+        event = database_event_detail(event_id)
+    except DatabaseUnavailable as exc:
+        return jsonify(error=str(exc)), 503
+    if event is None:
+        return jsonify(error="Measurement event not found"), 404
+    return jsonify(event)
+
+
+@app.route("/api/history/events/<event_id>/video")
+def api_history_event_video(event_id: str):
+    try:
+        event = database_event_detail(event_id)
+    except DatabaseUnavailable:
+        abort(503)
+    if event is None:
+        abort(404)
+    if _database is None:
+        clip_id = event.get("clip_id")
+        json_path = find_clip_json(str(clip_id)) if clip_id else None
+        if json_path is None:
+            abort(404)
+        data = read_clip_sidecar(json_path, snapshot_limit=0) or {}
+        video_path = Path(str(data.get("video_path", "")))
+    else:
+        video_asset = next(
+            (asset for asset in event.get("assets", []) if asset.get("asset_type") == "video"),
+            None,
+        )
+        if video_asset is None:
+            abort(404)
+        try:
+            video_path = resolve_asset_path(video_asset["relative_path"], _args.output_dir)
+        except ValueError:
+            abort(404)
+    if not video_path.is_file() or not path_is_inside(video_path, _args.output_dir):
+        abort(404)
+    return send_file(video_path, mimetype="video/mp4", conditional=True)
+
+
+@app.route("/api/history/events/<event_id>/raw-video")
+def api_history_event_raw_video(event_id: str):
+    try:
+        event = database_event_detail(event_id)
+    except DatabaseUnavailable:
+        abort(503)
+    if event is None:
+        abort(404)
+    if _database is None:
+        clip_id = event.get("clip_id")
+        json_path = find_clip_json(str(clip_id)) if clip_id else None
+        if json_path is None:
+            abort(404)
+        data = read_clip_sidecar(json_path, snapshot_limit=0) or {}
+        raw_video_path = Path(str(data.get("raw_video_path", "")))
+    else:
+        raw_video_asset = next(
+            (
+                asset
+                for asset in event.get("assets", [])
+                if asset.get("asset_type") == "raw_video"
+            ),
+            None,
+        )
+        if raw_video_asset is None:
+            abort(404)
+        try:
+            raw_video_path = resolve_asset_path(
+                raw_video_asset["relative_path"],
+                _args.output_dir,
+            )
+        except ValueError:
+            abort(404)
+    if not raw_video_path.is_file() or not path_is_inside(
+        raw_video_path,
+        _args.output_dir,
+    ):
+        abort(404)
+    return send_file(raw_video_path, mimetype="video/mp4", conditional=True)
+
+
+@app.route("/api/history/events/<event_id>/assets/<int:asset_id>")
+def api_history_event_asset(event_id: str, asset_id: int):
+    if _database is None:
+        abort(404)
+    try:
+        event = database_event_detail(event_id)
+    except DatabaseUnavailable:
+        abort(503)
+    if event is None:
+        abort(404)
+    asset = next(
+        (item for item in event.get("assets", []) if int(item["id"]) == asset_id),
+        None,
+    )
+    if asset is None:
+        abort(404)
+    try:
+        asset_path = resolve_asset_path(asset["relative_path"], _args.output_dir)
+    except ValueError:
+        abort(404)
+    if not asset_path.is_file():
+        abort(404)
+    return send_file(
+        asset_path,
+        mimetype=asset.get("mime_type") or "application/octet-stream",
+        conditional=True,
+    )
+
+
+def operator_measurement_inches(payload: dict[str, Any]) -> Decimal:
+    if payload.get("measurement_in") is not None:
+        return Decimal(str(payload["measurement_in"]))
+    try:
+        feet = int(payload.get("feet", 0))
+        inches = int(payload.get("inches", 0))
+        sixteenths = int(payload.get("sixteenths", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Feet, inches and sixteenths must be integers") from exc
+    if feet < 0 or not 0 <= inches <= 11 or not 0 <= sixteenths <= 15:
+        raise ValueError("Use non-negative feet, 0-11 inches and 0-15 sixteenths")
+    return Decimal(feet * 12 + inches) + (Decimal(sixteenths) / Decimal(16))
+
+
+@app.route(
+    "/api/history/events/<event_id>/pieces/<piece_id>/operator-measurement",
+    methods=["PATCH"],
+)
+def api_history_operator_measurement(event_id: str, piece_id: str):
+    if _database is None:
+        return jsonify(error="Operator corrections require a database"), 503
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="A JSON request body is required"), 400
+    try:
+        expected_revision = int(payload["expected_revision"])
+        common = {
+            "event_id": event_id,
+            "piece_id": piece_id,
+            "reason": str(payload.get("reason") or ""),
+            "operator_id": str(payload.get("operator_id") or ""),
+            "operator_display_name": (
+                str(payload["operator_display_name"])
+                if payload.get("operator_display_name")
+                else None
+            ),
+            "expected_revision": expected_revision,
+            "source_ip": request.remote_addr,
+        }
+        if payload.get("clear") is True:
+            _database.clear_operator_measurement(**common)
+        else:
+            _database.set_operator_measurement(
+                **common,
+                measurement_in=operator_measurement_inches(payload),
+            )
+        event = database_event_detail(event_id)
+        return jsonify(event)
+    except KeyError:
+        return jsonify(error="expected_revision is required"), 400
+    except RevisionConflict as exc:
+        return jsonify(error=str(exc), conflict=True), 409
+    except RecordNotFound as exc:
+        return jsonify(error=str(exc)), 404
+    except (ValueError, ArithmeticError) as exc:
+        return jsonify(error=str(exc)), 400
+    except DatabaseUnavailable as exc:
+        return jsonify(error=str(exc)), 503
 
 
 @app.route("/api/live/clips")
@@ -1327,7 +2833,7 @@ def api_live_clip(clip_id: str):
     json_path = find_clip_json(clip_id)
     if json_path is None:
         return jsonify(error="Clip not found"), 404
-    data = read_clip_sidecar(json_path, snapshot_limit=HISTORY_SNAPSHOT_LIMIT)
+    data = read_clip_sidecar(json_path, measurement_evidence_only=True)
     if data is None:
         return jsonify(error="Clip metadata could not be read"), 500
     return jsonify(data)
@@ -1345,6 +2851,21 @@ def api_live_clip_video(clip_id: str):
     return send_file(video_path, mimetype="video/mp4", conditional=True)
 
 
+@app.route("/api/live/clips/<clip_id>/raw-video")
+def api_live_clip_raw_video(clip_id: str):
+    json_path = find_clip_json(clip_id)
+    if json_path is None:
+        abort(404)
+    data = read_clip_sidecar(json_path, snapshot_limit=0) or {}
+    raw_video_path = Path(str(data.get("raw_video_path", "")))
+    if not raw_video_path.exists() or not path_is_inside(
+        raw_video_path,
+        clips_root(_args.output_dir),
+    ):
+        abort(404)
+    return send_file(raw_video_path, mimetype="video/mp4", conditional=True)
+
+
 @app.route("/api/live/clips/<clip_id>/asset/<path:asset_name>")
 def api_live_clip_asset(clip_id: str, asset_name: str):
     json_path = find_clip_json(clip_id)
@@ -1359,26 +2880,67 @@ def api_live_clip_asset(clip_id: str, asset_name: str):
 
 
 def main() -> int:
-    global _args, _buffer, _camera, _processor, _recorder, _plc
+    global _args, _buffer, _camera, _processor, _recorder, _plc, _database, _reconciler
     _args = parse_args()
     configure_vision_module(_args)
+    if not _args.db_disabled:
+        try:
+            if _args.postgres_dsn.strip():
+                _database = DatabaseRepository(_args.postgres_dsn)
+            else:
+                _database = SQLiteDatabaseRepository(_args.sqlite_path)
+            _database.open(timeout=float(_args.plc_timeout))
+            _database.validate_schema()
+            _database.recover_stale_measurement_events(
+                older_than_seconds=max(60, int(float(_args.record_seconds) * 3))
+            )
+        except Exception as exc:
+            if _database is not None:
+                _database.close()
+                _database = None
+            print(f"ERROR: Database startup validation failed: {exc}", file=sys.stderr)
+            return 2
 
     requested_buffer_frames = int(max(8, float(_args.buffer_seconds) * max(1.0, float(_args.capture_fps))))
     buffer_len = min(requested_buffer_frames, max(8, int(_args.buffer_max_frames)))
     _buffer = FrameBuffer(maxlen=buffer_len)
     _camera = CameraReader(_args, _buffer)
     _processor = LiveProcessor(_args, _buffer)
-    _recorder = ClipRecorder(_args, _buffer, _processor)
+    _recorder = ClipRecorder(_args, _buffer, _processor, _database)
+    try:
+        _recorder.validate_configuration()
+    except Exception as exc:
+        if _database is not None:
+            _database.close()
+            _database = None
+        print(f"ERROR: Vision configuration validation failed: {exc}", file=sys.stderr)
+        return 2
     _plc = PLCMonitor(_args, _recorder)
+    _reconciler = DatabaseReconciler(_args, _database) if _database is not None else None
 
     _camera.start()
     _processor.start()
     _plc.start()
+    if _reconciler is not None:
+        _reconciler.start()
 
     print(f"\n  TX2 Live MVP at http://127.0.0.1:{_args.port}\n")
     print(f"  Source: {_args.source}")
     print(f"  PLC: {'enabled' if _args.plc_enabled else 'disabled'}")
-    app.run(host="127.0.0.1", port=_args.port, debug=False, threaded=True)
+    print(
+        "  Database: "
+        + ("disabled (simulation)" if _args.db_disabled else database_mode())
+    )
+    try:
+        app.run(host="127.0.0.1", port=_args.port, debug=False, threaded=True)
+    finally:
+        if _reconciler is not None:
+            _reconciler.stop()
+        _plc.stop()
+        _processor.stop()
+        _camera.stop()
+        if _database is not None:
+            _database.close()
     return 0
 
 

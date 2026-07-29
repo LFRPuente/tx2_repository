@@ -2,6 +2,12 @@
 
 Tools and MVP applications for TX2 piece-front measurement from video.
 
+The full implementation runbook for moving the calibration tool, red exclusion
+zones, individual-piece measurement, PostgreSQL persistence, and operator
+corrections into the real-time MVP is:
+
+[`LIVE_MVP_INTEGRATION_README.md`](LIVE_MVP_INTEGRATION_README.md)
+
 ## Main Pieces
 
 - `homography_web_app.py`: Flask tool for homography, YOLO annotation, measurement calibration, Sobel front detection, and frame review.
@@ -14,10 +20,116 @@ Tools and MVP applications for TX2 piece-front measurement from video.
 - `tools/axis_camera_viewer.py`: opens the live AXIS camera stream through RTSP.
 - `tools/axis_live_processor.py`: runs the live AXIS stream through the same homography, YOLO, Sobel, and measurement pipeline used by the app.
 - `tools/plc_triggered_video_recorder.py`: records AXIS RTSP clips when the PLC cut/measure tag changes.
-- `dataset/` and `dataset_yolo11/`: curated YOLO annotation datasets.
-- `runs/detect/runs_tx2/yolo11n_tubos_v1/weights/best.pt`: trained model used by the local app.
+- `dataset/` and `dataset_yolo11/`: legacy package-front YOLO datasets.
+- `dataset_pieces/`: source annotations with one box per measurable piece.
+- `training_videos/`: curated native-resolution AXIS clips stored with Git LFS.
+- `prepare_yolo_dataset.py`: creates the piece train/validation split.
+- `train_yolo11_pieces.py`: trains the individual-piece YOLO11 detector.
+- `runs/detect/runs_tx2/yolo11n_pieces_v3/weights/best.pt`: current individual-piece model.
+- `runs/detect/runs_tx2/yolo11n_tubos_v1/weights/best.pt`: legacy fallback model.
 
 Generated videos, local caches, `node_modules`, previews, and redundant checkpoints are intentionally ignored.
+Only reviewed raw clips under `training_videos/` are versioned.
+
+## Individual Piece Detection
+
+The target pipeline detects and measures every visible piece independently:
+
+1. YOLO returns one box per piece.
+2. Boxes are ordered from left to right and assigned `piece_id`.
+3. Sobel Y runs only in the lower front band of each box.
+4. Each detected front is forced to be horizontal and limited to that piece.
+5. Each piece is measured independently against the shared reference line.
+
+YOLO predictions pass through geometric rules learned from the saved annotations:
+
+- Strongly overlapping boxes are treated as duplicate detections; the highest-confidence box is kept.
+- Severe width or height outliers are removed using the median piece profile.
+- A large internal gap is considered a missing piece only when normal spacing exists on both sides (`1, 2 -- gap -- 3, 4`).
+- A box inferred from a gap is accepted automatically only when Sobel confirms a valid horizontal front inside it.
+
+The previous package annotations are not compatible with this detector and must
+not be mixed into `dataset_pieces/`. In the annotation view, draw one box around
+each visible piece whose front edge can be measured. Include the full visible
+piece down to its lower front edge. Do not draw one box around the whole bundle.
+Frames with no measurable pieces remain valid negative examples.
+
+Use **Run model** in the annotation view to test the current checkpoint. Model
+boxes appear as a separate dashed overlay and never replace saved annotations.
+The side panel reports detections, matches, and annotated pieces missed by the
+model.
+
+Legacy frames can be exposed as pending annotation candidates by launching the
+app with `--legacy-candidates-dir dataset`. Their old package boxes are never
+loaded. Do not enable those candidates while annotating a different source
+video, because frame indexes would refer to unrelated images.
+
+Run the annotation app and save the new labels under `dataset_pieces/`:
+
+```powershell
+.\run_homography_web_app.ps1
+```
+
+After annotating a representative set of frames:
+
+```powershell
+python prepare_yolo_dataset.py
+python train_yolo11_pieces.py
+```
+
+Curated RAW clips can be downloaded on a training computer with:
+
+```powershell
+git lfs install
+git lfs pull --include="training_videos/**"
+```
+
+See [`training_videos/README.md`](training_videos/README.md) for clip hashes,
+capture metadata, and commands for opening a clip in the annotation tool.
+
+The v3 training command starts from the v2 individual-piece checkpoint when
+available and never overwrites previous versions. Only reviewed annotations
+are included. The default command uses `imgsz=1280`; the current v3 checkpoint
+was trained explicitly at `imgsz=960` on CUDA.
+
+The trained weights are written to:
+
+```text
+runs/detect/runs_tx2/yolo11n_pieces_v3/weights/best.pt
+```
+
+Current `v3` checkpoint (2026-07-29):
+
+- Source snapshot: 89 frames, 632 piece boxes, and 6 negative frames.
+- The snapshot includes 21 new 4K frames with 189 manually reviewed boxes.
+- Temporal-group split: 71 train / 18 validation, with no source-frame pairs
+  closer than 90 frames divided across the two splits.
+- Base checkpoint: `yolo11n_pieces_v2/weights/best.pt`.
+- Best epoch: 47 (early stopping completed at epoch 77).
+- Independent `best.pt` validation: precision `0.940`, recall `1.000`,
+  mAP50 `0.988`, and mAP50-95 `0.737`.
+- Held-out 4K slice at confidence `0.25`: 63/63 boxes found, one false
+  positive, precision `0.984`, recall `1.000`, and mean matched IoU `0.895`.
+- `best.pt` SHA-256:
+  `4B2F6B6292DED79BDA00043BFA6BE9DE1091513FCB342E4485903BD87EC3BCB2`.
+
+Both MVP launchers select that model automatically when it exists. The
+individual checkpoint is present in the current repository. A launcher only
+falls back to `v2`, then `v1`, and finally the legacy package model if newer
+checkpoints are missing.
+
+Vision API responses now include:
+
+- `pieces`: ordered piece boxes, Sobel result, measurement, confidence, and validity.
+- `measurement_summary`: detected/valid counts plus minimum, maximum, and average measurements.
+
+The singular `sobel` and `measurement` fields remain temporarily available for
+older clients and refer to the first valid piece.
+
+In either supported database backend, one PLC measurement event owns zero or
+more piece measurement rows. `measurement_event.detected_piece_count` stores
+the detected quantity and `valid_piece_count` stores the validated quantity.
+Automatic and operator-entered values remain separate for every piece.
 
 ## Python Setup
 
@@ -30,6 +142,65 @@ py -m pip install -r requirements.txt
 ```powershell
 .\run_homography_web_app.ps1
 ```
+
+The calibration and annotation launcher reads temporary raw clips produced by
+the Live MVP:
+
+```text
+outputs/live_plc_clips/<YYYY-MM-DD>/*_raw.mp4
+```
+
+It searches recursively, ignores processed MP4s when raw clips exist, skips a
+new RAW clip while its MP4 container is still being finalized, and loads only
+complete clips matching the resolution and nominal rounded FPS of the newest
+complete recording. Small container-reported FPS variations are grouped
+together without mixing older Full HD material with the new `2880x2160`
+source. The backend exposes the selected files as one continuous timeline
+while retaining the source video name, source frame index, and source
+timestamp in each annotation.
+
+When the camera resolution, zoom, or position changes, recreate and validate
+these files from a native `2880x2160` raw clip before accepting measurements:
+
+```text
+outputs/homography_selection.json
+outputs/table_measurement_calibration.json
+```
+
+The annotation history creates evenly spaced pending candidates for each
+selected raw clip. A candidate is excluded from the training dataset until it
+is reviewed and saved. Save frames without boxes as negative examples; draw
+one tight box per visible piece on positive frames.
+
+### Spatial scale map
+
+The Measurements view builds a local conversion map from known physical
+references without warping the rectified image:
+
+1. Add vertical known-length segments near the left, center, and right sides of
+   the working ROI. Add references at multiple heights only when scale also
+   changes from top to bottom.
+2. Add horizontal references when the X or free manual ruler must be accurate.
+3. Click `Guardar y crear mapa`.
+4. Inspect the colored overlay, the Y scale range, and the calibrated coverage.
+5. Validate the resulting piece measurements in Player.
+
+Each nearly vertical segment contributes to `scaleY(x,y)` and each nearly
+horizontal segment contributes to `scaleX(x,y)`. Two or more references along
+one direction use clamped linear interpolation. References distributed in both
+image dimensions use inverse-distance interpolation. Diagonal references are
+ignored because they do not identify an individual axis reliably.
+
+Piece measurements integrate `scaleY` from the saved horizontal reference to
+the Sobel front. The X, Y, and free manual rulers integrate the corresponding
+local axis scales along their complete paths. Measurements outside calibrated
+coverage are explicitly marked as extrapolated and use the nearest boundary
+scale.
+
+The map is stored as `scale_map` in
+`outputs/table_measurement_calibration.json`. Homography, rectified images,
+YOLO boxes, exclusion zones, and training images remain unchanged, so updating
+the map does not require retraining YOLO.
 
 Then open:
 
@@ -51,11 +222,32 @@ http://127.0.0.1:5173
 
 ## Run The Live MVP
 
-Configure the AXIS credentials in the terminal that will launch the app:
+Configure the AXIS credentials in the terminal that will launch the app.
+While PostgreSQL is pending, the launcher automatically uses the local SQLite
+database `outputs/tx2_live_mvp.sqlite3`:
 
 ```powershell
 $env:AXIS_USER="your-user"
 $env:AXIS_PASSWORD="your-password"
+.\run_live_mvp_app.ps1
+```
+
+Import existing clip sidecars before the first SQLite launch:
+
+```powershell
+python tools\import_live_sidecars_to_sqlite.py `
+  --output-dir .\outputs `
+  --model .\runs\detect\runs_tx2\yolo11n_pieces_v3\weights\best.pt
+```
+
+The import is idempotent. The background reconciler also registers legacy
+sidecars that have not yet been associated with the selected backend.
+
+When PostgreSQL is available, set the DSN before launching. A configured
+PostgreSQL connection is never allowed to fail over silently to SQLite:
+
+```powershell
+$env:TX2_POSTGRES_DSN="host=127.0.0.1 port=5432 dbname=tx2_vision user=tx2_vision_app connect_timeout=5"
 .\run_live_mvp_app.ps1
 ```
 
@@ -66,10 +258,42 @@ http://127.0.0.1:8767
 ```
 
 The Live MVP provides a light interface with the live camera view and
-measurement diagram. It keeps the AXIS stream at `1920x1080` and targets 10 FPS
-for capture, processing, browser updates, and saved clips. It connects to the
-PLC through OPC UA and records one 8-second clip when `MeasureLength` changes
-from `False` to `True`.
+measurement diagram. It requests the AXIS stream at its configured
+`2880x2160` resolution and targets 10 FPS for capture, processing, browser
+updates, and processed clips. Live inference uses
+the individual-piece model at an initial confidence of `0.10`, applies the same
+geometric rules as the offline tool, filters boxes against configured exclusion
+zones before Sobel, and retains the full `box_rules` diagnostics. Measurements
+are shown in compact sixteenth-inch format such as `40' 9 1/16"`.
+
+It connects to the PLC through OPC UA and records one 8-second clip when
+`MeasureLength` changes from `False` to `True`. The recording is provisional
+until the window closes: if YOLO did not detect any piece during those 8
+seconds, the processed MP4, temporary raw MP4, processing captures, sidecar,
+and pending database event are discarded.
+
+Temporary raw capture is enabled by `--save-raw-clips`. For a camera source,
+the app opens a separate `2880x2160`, 30 FPS RTSP stream and copies its H.264
+packets directly to `<clip>_raw.mp4` without decoding or overlays. YOLO remains
+at 10 FPS. The camera currently uses its 4K capture mode and the raw URL forces
+a fixed frame cadence. Remove the flag and the three `--raw-*` launcher
+arguments when this temporary data collection is complete.
+
+The automatic per-piece measurements for a retained event come from the first
+processed frame at or after `PLC signal + 2.0 seconds`. At that instant, the
+Live camera perimeter turns green and the same green perimeter is embedded in
+the processed MP4 for 0.8 seconds. The sidecar records the configured delay,
+the actual selected-frame offset, and the marked video frame range.
+
+The database reconciler also verifies retained sidecar event IDs against the
+active database. A sidecar marked as synced is imported again if its database
+row is missing, keeping History aligned with the 100 retained clips.
+
+The deployed `outputs/table_measurement_calibration.json` currently contains no
+`exclusion_zones`. The filtering and overlay support are active in code, but
+remain inert until zones are saved from the calibration tool. Do not restore
+coordinates from an older calibration without validating them against the
+deployed homography.
 
 Open the saved clip history at:
 
@@ -80,14 +304,27 @@ http://127.0.0.1:8767/history
 Each history entry contains a browser-compatible H.264 MP4, PLC event metadata,
 processing snapshots, and the overlays produced while the clip was recorded.
 The MP4 itself contains the processed live camera view with the YOLO-derived
-reference and front overlays; it is not the raw camera feed.
-The history shows up to six representative processing captures per clip while
-the full processing data remains in its sidecar JSON. The app retains the 100
-most recent clips and removes older clip artifacts automatically.
+reference and front overlays. While temporary raw capture is active, a
+`Raw clip` action opens the synchronized camera-only MP4.
+The Processing evidence section shows only the canonical `PLC + 2.0 seconds`
+camera frame with a green perimeter. All processing snapshots remain available
+in the sidecar JSON and selected database for audit, but are not rendered as a
+gallery. The app retains the 100 most recent events and removes all processed,
+raw, sidecar, and evidence artifacts belonging to older events automatically.
 
-The live frame buffer is capped to avoid retaining several gigabytes of raw
-images. Clips are streamed directly to disk and resampled to the configured
-output FPS, so their playback duration matches the PLC recording window. If a
+The selected database is the History system of record. Each PLC signal creates an
+idempotent event, snapshots the active model/homography/calibration hashes,
+stores all processing snapshots, selects one canonical snapshot, and persists
+the per-piece automatic measurements from the `PLC + 2.0 seconds` snapshot.
+Operator corrections preserve the
+automatic value and create immutable audit revisions with optimistic
+concurrency checks. SQLite mirrors the PostgreSQL entities so it can be migrated
+later without changing the Live or History API.
+
+The live frame buffer is capped to avoid retaining several gigabytes of images.
+Processed clips are streamed directly to disk and resampled to the configured
+output FPS. Temporary raw clips are copied directly from H.264, so their
+playback duration and native frame rate come from the camera stream. If a
 second PLC event arrives while another clip is active, both recording windows
 are preserved as separate clips.
 
@@ -97,7 +334,62 @@ Live MVP data is stored directly under:
 outputs/live_plc_clips/<date>/
 ```
 
-Storage currently uses MP4, JSON, and JPEG files. SQLite is not used.
+MP4 and JPEG assets remain on disk; SQLite or PostgreSQL stores event, snapshot,
+piece, asset and audit metadata. Sidecars record `db_sync_backend` so the
+reconciler can idempotently register legacy clips and move between backends.
+If the configured database is temporarily unavailable after startup, the MP4
+and sidecar are kept with `db_sync_status: pending` and a background reconciler
+retries them. For an explicit camera/PLC simulation only:
+
+```powershell
+.\run_live_mvp_app.ps1 -DatabaseDisabled
+```
+
+The Live and History pages visibly report simulation mode and operator
+corrections are disabled.
+
+## PostgreSQL Server Setup
+
+PostgreSQL remains the production target. SQLite is the approved temporary
+local backend while the Windows service is pending. Follow the PostgreSQL
+installation, security, credential, verification, and backup instructions in
+[`docs/postgresql_server_setup.md`](docs/postgresql_server_setup.md).
+
+The guide prepares the database service, `tx2_vision` database, and restricted
+`tx2_vision_app` login. After the service, password file, and
+`TX2_POSTGRES_DSN` are ready, apply the versioned schema:
+
+```powershell
+python tools\apply_postgres_migrations.py
+```
+
+Validate all existing sidecars without changing them:
+
+```powershell
+python tools\migrate_live_sidecars_to_postgres.py `
+  --dry-run `
+  --output-dir .\outputs `
+  --model .\runs\detect\runs_tx2\yolo11n_pieces_v3\weights\best.pt
+```
+
+Then run the idempotent import by removing `--dry-run`. The import enriches
+legacy sidecars with event/configuration identifiers, registers disk assets by
+relative path, and can be rerun safely. The schema and lifecycle contract are
+specified in
+[`LIVE_MVP_INTEGRATION_README.md`](LIVE_MVP_INTEGRATION_README.md).
+
+After SQLite has been used, validate and migrate all events and immutable
+operator revisions:
+
+```powershell
+python tools\migrate_sqlite_to_postgres.py --dry-run
+python tools\migrate_sqlite_to_postgres.py
+```
+
+The migration is idempotent. It preserves event IDs, per-piece automatic
+measurements, current operator overrides, revision numbers and audit
+timestamps. Keep the SQLite file until the PostgreSQL event and revision counts
+have been verified.
 
 ## Next Steps On The TX2 Server
 
@@ -109,6 +401,43 @@ python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
 
+### Activate the latest YOLO checkpoint
+
+A GitHub push does not update the running TX2 server by itself. `git pull`
+downloads the checkpoint and launcher changes, but the existing Python process
+keeps its previously loaded YOLO weights in memory until the MVP is restarted.
+
+After pulling, verify that the expected `v3` checkpoint exists and matches the
+trained artifact:
+
+```powershell
+$modelPath = "runs\detect\runs_tx2\yolo11n_pieces_v3\weights\best.pt"
+$expectedHash = "4B2F6B6292DED79BDA00043BFA6BE9DE1091513FCB342E4485903BD87EC3BCB2"
+
+if (-not (Test-Path -LiteralPath $modelPath)) {
+    throw "Missing YOLO checkpoint: $modelPath"
+}
+
+$actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $modelPath).Hash
+if ($actualHash -ne $expectedHash) {
+    throw "Unexpected YOLO checkpoint hash: $actualHash"
+}
+
+Write-Host "YOLO v3 checkpoint verified: $actualHash"
+```
+
+Stop the currently running MVP with `Ctrl+C`, or stop the Windows service or
+scheduled task that owns it, and then start it again:
+
+```powershell
+.\run_live_mvp_app.ps1
+```
+
+At startup, confirm that the console reports
+`yolo11n_pieces_v3\weights\best.pt` and the SHA-256 shown above. Both launchers
+prioritize `v3`; they fall back to `v2`, then `v1`, and finally the legacy
+package model.
+
 Before the live test, confirm that these calibration and model files are the
 ones intended for the production camera:
 
@@ -116,21 +445,29 @@ ones intended for the production camera:
 outputs/homography_selection.json
 outputs/roi_selection.json
 outputs/table_measurement_calibration.json
-runs/detect/runs_tx2/yolo11n_tubos_v1/weights/best.pt
+runs/detect/runs_tx2/yolo11n_pieces_v3/weights/best.pt
 ```
 
 Use this checklist for the on-machine validation:
 
 - [ ] Set `AXIS_USER` and `AXIS_PASSWORD`, then run `run_live_mvp_app.ps1`.
+- [ ] Confirm `TX2_POSTGRES_DSN` and `%APPDATA%\postgresql\pgpass.conf` belong to the Windows account running the MVP.
+- [ ] Run `tools\apply_postgres_migrations.py` and confirm the schema checksum is recorded.
+- [ ] Run the sidecar migrator in `--dry-run`, then import the existing clips.
 - [ ] Open `http://127.0.0.1:8767` and confirm the original camera image remains at its native resolution.
-- [ ] Confirm YOLO detects the package in the rectified image and Sobel Y runs only inside the selected YOLO ROI.
-- [ ] Confirm the detected front is horizontal and its projection spans the full original image.
-- [ ] Confirm the reference line, distance to reference, and total measurement are correct in inches.
+- [ ] Confirm YOLO detects each piece independently in the rectified image and Sobel Y runs only inside each piece ROI.
+- [ ] Confirm boxes with more than 20% overlap in a saved red zone are discarded before Sobel.
+- [ ] Confirm every detected piece front is horizontal and remains associated with its own piece.
+- [ ] Confirm the reference distance is correct and total lengths use the compact `40' 9 1/16"` format.
 - [ ] Confirm OPC UA connects to `opc.tcp://10.14.6.48:49320` and `VisionWD` keeps changing.
 - [ ] Trigger a `MeasureLength` rising edge and verify that exactly one 8-second clip appears in `/history`.
 - [ ] Trigger two events less than eight seconds apart and verify that neither event is lost.
 - [ ] Verify each sidecar JSON contains the PLC source timestamp, watchdog value, frame timestamps, and processing snapshots.
 - [ ] Verify each saved MP4 keeps the camera resolution and reports 80 frames at 10 FPS for an 8-second window.
+- [ ] Verify PostgreSQL stores one event with zero or more per-piece automatic measurements.
+- [ ] Verify History can save and clear an operator measurement without changing the automatic value.
+- [ ] Verify every operator change creates an immutable audit revision.
+- [ ] Stop PostgreSQL during a test event, confirm the sidecar becomes `pending`, restart PostgreSQL, and confirm reconciliation changes it to `synced`.
 - [ ] Leave the app running for at least 30 minutes and confirm the frame buffer stays capped and process memory does not grow continuously.
 
 After the live validation, decide the production host binding, Windows service
