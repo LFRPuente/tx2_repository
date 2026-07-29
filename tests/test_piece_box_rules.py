@@ -35,6 +35,16 @@ class PieceBoxRuleTests(unittest.TestCase):
             "conf": confidence,
         }
 
+    @staticmethod
+    def sized_box(center_x: float, width: float, confidence: float = 0.9) -> dict:
+        return {
+            "x": center_x - width / 2.0,
+            "y": 100.0,
+            "w": width,
+            "h": 60.0,
+            "conf": confidence,
+        }
+
     def test_overlapping_predictions_keep_the_highest_confidence_box(self) -> None:
         boxes = [
             self.box(100.0, confidence=0.95),
@@ -73,6 +83,67 @@ class PieceBoxRuleTests(unittest.TestCase):
         self.assertAlmostEqual(inferred[0]["x"] + inferred[0]["w"] / 2.0, 320.0)
         self.assertEqual(diagnostics["missing_candidate_count"], 1)
         self.assertEqual(diagnostics["inferred_count"], 1)
+
+    def test_coherent_frame_width_overrides_a_different_dataset_profile(self) -> None:
+        boxes = [
+            self.sized_box(100.0, 72.0),
+            self.sized_box(180.0, 72.0),
+            self.sized_box(260.0, 72.0),
+            self.sized_box(340.0, 72.0),
+        ]
+
+        processed, diagnostics = vision.apply_piece_box_rules(
+            self.image,
+            boxes,
+            verify_inferred=False,
+            profile=self.profile,
+        )
+
+        self.assertEqual(len(processed), 4)
+        self.assertTrue(diagnostics["frame_width_reliable"])
+        self.assertEqual(diagnostics["profile_source"], "frame")
+        self.assertAlmostEqual(diagnostics["typical_width_px"], 72.0)
+        self.assertEqual(diagnostics["removed_size_count"], 0)
+
+    def test_coherent_box_widths_are_normalized_without_moving_centers(self) -> None:
+        boxes = [
+            self.sized_box(100.0, 90.0),
+            self.sized_box(210.0, 100.0),
+            self.sized_box(320.0, 110.0),
+            self.sized_box(430.0, 100.0),
+        ]
+
+        processed, diagnostics = vision.apply_piece_box_rules(
+            self.image,
+            boxes,
+            verify_inferred=False,
+            profile=self.profile,
+        )
+
+        self.assertEqual(diagnostics["adjusted_width_count"], 2)
+        self.assertTrue(all(abs(box["w"] - 100.0) < 1e-6 for box in processed))
+        centers = [box["x"] + box["w"] / 2.0 for box in processed]
+        self.assertEqual(centers, [100.0, 210.0, 320.0, 430.0])
+
+    def test_frame_width_outlier_is_removed_from_a_coherent_group(self) -> None:
+        boxes = [
+            self.sized_box(100.0, 100.0),
+            self.sized_box(210.0, 100.0),
+            self.sized_box(320.0, 140.0),
+            self.sized_box(430.0, 100.0),
+            self.sized_box(540.0, 100.0),
+        ]
+
+        processed, diagnostics = vision.apply_piece_box_rules(
+            self.image,
+            boxes,
+            verify_inferred=False,
+            profile=self.profile,
+        )
+
+        self.assertEqual(diagnostics["removed_size_count"], 1)
+        self.assertEqual(len([box for box in processed if not box.get("inferred")]), 4)
+        self.assertTrue(all(box["w"] == 100.0 for box in processed))
 
     def test_isolated_pair_does_not_create_an_unbounded_guess(self) -> None:
         boxes = [self.box(100.0), self.box(430.0)]

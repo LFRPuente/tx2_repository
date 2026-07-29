@@ -1,0 +1,16 @@
+{
+  "frame_idx": 380623,
+  "time_sec": 12687.433333333332,
+  "img_w": 1188,
+  "img_h": 416,
+  "boxes": [],
+  "class_id": 0,
+  "class_name": "piece",
+  "source": {
+    "video": "C:\\Users\\luis_\\Downloads\\tx2_training_playlist_20260724_20260729\\20260728_163130_4FEC.mkv",
+    "video_name": "20260728_163130_4FEC.mkv",
+    "video_stem": "20260728_163130_4FEC",
+    "source_frame_idx": 439,
+    "source_time_sec": 14.633333333333333
+  }
+}

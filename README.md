@@ -25,6 +25,7 @@ corrections into the real-time MVP is:
 - `training_videos/`: curated native-resolution AXIS clips stored with Git LFS.
 - `prepare_yolo_dataset.py`: creates the piece train/validation split.
 - `train_yolo11_pieces.py`: trains the individual-piece YOLO11 detector.
+- `runs/detect/runs_tx2/yolo11n_pieces_v3/weights/best.pt`: current individual-piece model.
 - `runs/detect/runs_tx2/yolo11n_tubos_v1/weights/best.pt`: legacy fallback model.
 
 Generated videos, local caches, `node_modules`, previews, and redundant checkpoints are intentionally ignored.
@@ -86,22 +87,36 @@ git lfs pull --include="training_videos/**"
 See [`training_videos/README.md`](training_videos/README.md) for clip hashes,
 capture metadata, and commands for opening a clip in the annotation tool.
 
-The v2 training command starts from the deployed individual-piece checkpoint
-when available, uses `imgsz=1280`, and never overwrites v1. Only reviewed
-annotations are included. Collect and review representative `2880x2160` frames
-before training; this workstation currently has CPU-only PyTorch, so a useful
-training run should be executed on a CUDA host.
+The v3 training command starts from the v2 individual-piece checkpoint when
+available and never overwrites previous versions. Only reviewed annotations
+are included. The default command uses `imgsz=1280`; the current v3 checkpoint
+was trained explicitly at `imgsz=960` on CUDA.
 
 The trained weights are written to:
 
 ```text
-runs/detect/runs_tx2/yolo11n_pieces_v2/weights/best.pt
+runs/detect/runs_tx2/yolo11n_pieces_v3/weights/best.pt
 ```
 
-Both MVP launchers prefer that model automatically when it exists, then fall
-back to the deployed `yolo11n_pieces_v1` checkpoint. They use the legacy
-package model, with an explicit warning, only if neither individual-piece
-checkpoint exists.
+Current `v3` checkpoint (2026-07-29):
+
+- Source snapshot: 89 frames, 632 piece boxes, and 6 negative frames.
+- The snapshot includes 21 new 4K frames with 189 manually reviewed boxes.
+- Temporal-group split: 71 train / 18 validation, with no source-frame pairs
+  closer than 90 frames divided across the two splits.
+- Base checkpoint: `yolo11n_pieces_v2/weights/best.pt`.
+- Best epoch: 47 (early stopping completed at epoch 77).
+- Independent `best.pt` validation: precision `0.940`, recall `1.000`,
+  mAP50 `0.988`, and mAP50-95 `0.737`.
+- Held-out 4K slice at confidence `0.25`: 63/63 boxes found, one false
+  positive, precision `0.984`, recall `1.000`, and mean matched IoU `0.895`.
+- `best.pt` SHA-256:
+  `4B2F6B6292DED79BDA00043BFA6BE9DE1091513FCB342E4485903BD87EC3BCB2`.
+
+Both MVP launchers select that model automatically when it exists. The
+individual checkpoint is present in the current repository. A launcher only
+falls back to `v2`, then `v1`, and finally the legacy package model if newer
+checkpoints are missing.
 
 Vision API responses now include:
 
@@ -157,6 +172,36 @@ selected raw clip. A candidate is excluded from the training dataset until it
 is reviewed and saved. Save frames without boxes as negative examples; draw
 one tight box per visible piece on positive frames.
 
+### Spatial scale map
+
+The Measurements view builds a local conversion map from known physical
+references without warping the rectified image:
+
+1. Add vertical known-length segments near the left, center, and right sides of
+   the working ROI. Add references at multiple heights only when scale also
+   changes from top to bottom.
+2. Add horizontal references when the X or free manual ruler must be accurate.
+3. Click `Guardar y crear mapa`.
+4. Inspect the colored overlay, the Y scale range, and the calibrated coverage.
+5. Validate the resulting piece measurements in Player.
+
+Each nearly vertical segment contributes to `scaleY(x,y)` and each nearly
+horizontal segment contributes to `scaleX(x,y)`. Two or more references along
+one direction use clamped linear interpolation. References distributed in both
+image dimensions use inverse-distance interpolation. Diagonal references are
+ignored because they do not identify an individual axis reliably.
+
+Piece measurements integrate `scaleY` from the saved horizontal reference to
+the Sobel front. The X, Y, and free manual rulers integrate the corresponding
+local axis scales along their complete paths. Measurements outside calibrated
+coverage are explicitly marked as extrapolated and use the nearest boundary
+scale.
+
+The map is stored as `scale_map` in
+`outputs/table_measurement_calibration.json`. Homography, rectified images,
+YOLO boxes, exclusion zones, and training images remain unchanged, so updating
+the map does not require retraining YOLO.
+
 Then open:
 
 ```text
@@ -192,7 +237,7 @@ Import existing clip sidecars before the first SQLite launch:
 ```powershell
 python tools\import_live_sidecars_to_sqlite.py `
   --output-dir .\outputs `
-  --model .\runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt
+  --model .\runs\detect\runs_tx2\yolo11n_pieces_v3\weights\best.pt
 ```
 
 The import is idempotent. The background reconciler also registers legacy
@@ -324,7 +369,7 @@ Validate all existing sidecars without changing them:
 python tools\migrate_live_sidecars_to_postgres.py `
   --dry-run `
   --output-dir .\outputs `
-  --model .\runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt
+  --model .\runs\detect\runs_tx2\yolo11n_pieces_v3\weights\best.pt
 ```
 
 Then run the idempotent import by removing `--dry-run`. The import enriches
@@ -356,6 +401,43 @@ python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
 
+### Activate the latest YOLO checkpoint
+
+A GitHub push does not update the running TX2 server by itself. `git pull`
+downloads the checkpoint and launcher changes, but the existing Python process
+keeps its previously loaded YOLO weights in memory until the MVP is restarted.
+
+After pulling, verify that the expected `v3` checkpoint exists and matches the
+trained artifact:
+
+```powershell
+$modelPath = "runs\detect\runs_tx2\yolo11n_pieces_v3\weights\best.pt"
+$expectedHash = "4B2F6B6292DED79BDA00043BFA6BE9DE1091513FCB342E4485903BD87EC3BCB2"
+
+if (-not (Test-Path -LiteralPath $modelPath)) {
+    throw "Missing YOLO checkpoint: $modelPath"
+}
+
+$actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $modelPath).Hash
+if ($actualHash -ne $expectedHash) {
+    throw "Unexpected YOLO checkpoint hash: $actualHash"
+}
+
+Write-Host "YOLO v3 checkpoint verified: $actualHash"
+```
+
+Stop the currently running MVP with `Ctrl+C`, or stop the Windows service or
+scheduled task that owns it, and then start it again:
+
+```powershell
+.\run_live_mvp_app.ps1
+```
+
+At startup, confirm that the console reports
+`yolo11n_pieces_v3\weights\best.pt` and the SHA-256 shown above. Both launchers
+prioritize `v3`; they fall back to `v2`, then `v1`, and finally the legacy
+package model.
+
 Before the live test, confirm that these calibration and model files are the
 ones intended for the production camera:
 
@@ -363,7 +445,7 @@ ones intended for the production camera:
 outputs/homography_selection.json
 outputs/roi_selection.json
 outputs/table_measurement_calibration.json
-runs/detect/runs_tx2/yolo11n_pieces_v1/weights/best.pt
+runs/detect/runs_tx2/yolo11n_pieces_v3/weights/best.pt
 ```
 
 Use this checklist for the on-machine validation:
