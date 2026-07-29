@@ -3,7 +3,8 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $scriptPath = Join-Path $root "homography_web_app.py"
 $outputDir = Join-Path $root "outputs"
-$videoDir = Join-Path $outputDir "live_plc_clips"
+$liveVideoDir = Join-Path $outputDir "live_plc_clips"
+$trainingVideoDir = Join-Path $root "training_videos"
 $datasetDir = Join-Path $root "dataset_pieces"
 $pieceModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v3\weights\best.pt"
 $previousPieceModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v2\weights\best.pt"
@@ -56,8 +57,21 @@ if (-not $pythonExe) {
     exit 1
 }
 
-if (-not (Get-ChildItem -LiteralPath $videoDir -Recurse -File -Filter "*_raw.mp4" -ErrorAction SilentlyContinue | Select-Object -First 1)) {
-    Write-Host "No hay clips raw del Live MVP todavia. Espera un evento PLC valido y vuelve a iniciar la herramienta."
+$videoDir = if (
+    Get-ChildItem -LiteralPath $liveVideoDir -Recurse -File -Filter "*_raw.mp4" -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+) {
+    $liveVideoDir
+}
+elseif (
+    Get-ChildItem -LiteralPath $trainingVideoDir -Recurse -File -Filter "*_raw.mp4" -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+) {
+    Write-Warning "No current Live RAW clips were found. The tool is using curated training_videos."
+    $trainingVideoDir
+}
+else {
+    Write-Host "No hay clips raw disponibles en Live MVP ni en training_videos."
     exit 1
 }
 
