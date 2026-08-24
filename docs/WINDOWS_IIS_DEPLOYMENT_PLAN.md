@@ -72,7 +72,7 @@ PLC OPC UA:      opc.tcp://10.14.6.48:49320
 Trigger:         ns=2;s=ControlLogix.AS20.VisionSystem.MeasureLength
 Watchdog:        ns=2;s=ControlLogix.AS20.VisionSystem.VisionWD
 Grabacion:       8 segundos por evento
-Medicion:        frame PLC + 2.0 segundos
+Medicion:        frame inmediatamente anterior/alineado a la senal PLC
 ```
 
 ## 4. Arquitectura recomendada para la primera etapa
