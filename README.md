@@ -8,6 +8,12 @@ corrections into the real-time MVP is:
 
 [`LIVE_MVP_INTEGRATION_README.md`](LIVE_MVP_INTEGRATION_README.md)
 
+The current deployment decision is Windows + IIS, with SQLite during the
+initial internal rollout and a future migration to an external Microsoft SQL
+Server. This supersedes the older PostgreSQL deployment target. See:
+
+[`docs/WINDOWS_IIS_DEPLOYMENT_PLAN.md`](docs/WINDOWS_IIS_DEPLOYMENT_PLAN.md)
+
 ## Main Pieces
 
 - `homography_web_app.py`: Flask tool for homography, YOLO annotation, measurement calibration, Sobel front detection, and frame review.
