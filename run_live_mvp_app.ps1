@@ -6,7 +6,8 @@ param(
     [double]$Confidence = 0.10,
     [ValidateSet("auto", "cpu", "cuda", "cuda:0")]
     [string]$Device = "auto",
-    [string]$CameraIp = "10.14.115.241"
+    [string]$CameraIp = "10.14.115.241",
+    [string]$ListenAddress
 )
 
 $ErrorActionPreference = "Stop"
@@ -115,8 +116,19 @@ else {
 
 $serverArgs = @()
 if ($Production) {
-    $serverArgs += @("--waitress-threads", "8")
-    Write-Host "Server: Waitress on 127.0.0.1:8767"
+    if (-not $ListenAddress) {
+        $ListenAddress = if ($env:TX2_LISTEN_ADDRESS) {
+            $env:TX2_LISTEN_ADDRESS
+        }
+        else {
+            "127.0.0.1"
+        }
+    }
+    $serverArgs += @(
+        "--waitress-host", $ListenAddress,
+        "--waitress-threads", "8"
+    )
+    Write-Host "Server: Waitress on ${ListenAddress}:8767"
 }
 
 # This MVP is live by default: Python reads the AXIS camera directly through RTSP.

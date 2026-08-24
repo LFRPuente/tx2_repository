@@ -56,6 +56,8 @@ class LiveRuntimeTests(unittest.TestCase):
             [
                 "--waitress-threads",
                 "12",
+                "--waitress-host",
+                "10.14.6.84",
                 "--port",
                 "9001",
                 "--live-stream-fps",
@@ -64,6 +66,7 @@ class LiveRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(server.waitress_threads, 12)
+        self.assertEqual(server.waitress_host, "10.14.6.84")
         self.assertEqual(runtime.port, 9001)
         self.assertEqual(runtime.live_stream_fps, 10.0)
 

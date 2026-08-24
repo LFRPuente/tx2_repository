@@ -1908,9 +1908,12 @@ Ejecutar el backend productivo para IIS:
 .\run_live_mvp_production.ps1
 ```
 
-Waitress permanece en `127.0.0.1:8767`. La URL interna objetivo es
-`https://tx2-measurement.barnstxprod.local` una vez que TI publique DNS,
-certificado, IIS/ARR y el servicio Windows.
+Waitress permanece en `127.0.0.1:8767` por defecto para IIS. Mientras DNS,
+certificado e IIS/ARR no esten disponibles, el piloto puede escuchar en la IP
+VPN de esta maquina configurando `TX2_LISTEN_ADDRESS=10.14.6.84` y puede abrirse
+en `http://10.14.6.84:8767`. La regla entrante de TCP `8767` debe limitarse al
+rango VPN aprobado. Este modo directo no incluye TLS ni autenticacion de
+Windows y debe volver a loopback cuando se publique el reverse proxy.
 
 La camara desplegada y validada por el launcher es `10.14.115.241`. No cambiar
 ese endpoint basandose en direcciones historicas sin una prueba fisica.

@@ -14,6 +14,7 @@ def parse_production_args(
     argv: list[str] | None = None,
 ) -> tuple[argparse.Namespace, argparse.Namespace]:
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--waitress-host", default="127.0.0.1")
     parser.add_argument("--waitress-threads", type=int, default=8)
     parser.add_argument("--waitress-channel-timeout", type=int, default=120)
     production, runtime_argv = parser.parse_known_args(argv)
@@ -21,6 +22,9 @@ def parse_production_args(
         parser.error("--waitress-threads must be at least 4")
     if production.waitress_channel_timeout < 30:
         parser.error("--waitress-channel-timeout must be at least 30 seconds")
+    production.waitress_host = production.waitress_host.strip()
+    if not production.waitress_host:
+        parser.error("--waitress-host must not be empty")
     return production, live.parse_args(runtime_argv)
 
 
@@ -34,7 +38,7 @@ def main() -> int:
 
     server = create_server(
         live.app,
-        host="127.0.0.1",
+        host=production.waitress_host,
         port=int(runtime.args.port),
         threads=int(production.waitress_threads),
         channel_timeout=int(production.waitress_channel_timeout),
@@ -49,7 +53,10 @@ def main() -> int:
         if shutdown_signal is not None:
             signal.signal(shutdown_signal, request_shutdown)
 
-    print(f"\n  TX2 Live MVP production at http://127.0.0.1:{runtime.args.port}\n")
+    print(
+        f"\n  TX2 Live MVP production at "
+        f"http://{production.waitress_host}:{runtime.args.port}\n"
+    )
     print("  Server: Waitress")
     print(f"  Threads: {production.waitress_threads}")
     exit_code = 0

@@ -263,10 +263,25 @@ Use the single-process Waitress launcher for the IIS backend:
 .\run_live_mvp_production.ps1 -Device auto
 ```
 
-It binds only to `127.0.0.1:8767`. Verify it locally with
-`http://127.0.0.1:8767/api/health`; do not open port `8767` in Windows
-Firewall. The versioned IIS reverse-proxy configuration is under
-`deployment/`.
+It binds to `127.0.0.1:8767` by default. Verify it locally with
+`http://127.0.0.1:8767/api/health`. The versioned IIS reverse-proxy
+configuration is under `deployment/`.
+
+For the temporary direct-IP deployment on the current VPN host, set the
+machine-specific address outside the repository and restart production:
+
+```powershell
+[Environment]::SetEnvironmentVariable(
+    "TX2_LISTEN_ADDRESS", "10.14.6.84", "User"
+)
+.\run_live_mvp_production.ps1 -Device auto
+```
+
+The Live MVP is then served at `http://10.14.6.84:8767`. An administrator must
+allow inbound TCP `8767` on the Domain firewall profile, restricted to the
+approved VPN address range. This direct mode does not provide IIS Windows
+Authentication or TLS, so it is intended only for the internal pilot. Remove
+`TX2_LISTEN_ADDRESS` to return to the loopback-only IIS backend.
 
 The selected device, GPU name, PyTorch version, and CUDA runtime are exposed
 under `processor` in `/api/live/status`. Use `-Device cpu` only for an explicit
