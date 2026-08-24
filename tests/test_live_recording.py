@@ -410,7 +410,7 @@ class ClipRecorderTests(unittest.TestCase):
                 measurement_delay_seconds=0.0,
                 max_clips=10,
             )
-            buffer = FrameBuffer(maxlen=8)
+            buffer = FrameBuffer(maxlen=20)
             processor = FakeOverlayProcessor(
                 buffer,
                 processing_delay_seconds=0.03,

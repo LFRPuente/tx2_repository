@@ -77,6 +77,7 @@ else {
 
 & $pythonExe $scriptPath `
   --video-dir $videoDir `
+  --fallback-video-dir $trainingVideoDir `
   --latest-video-format-only `
   --second 30.0 `
   --output-dir $outputDir `

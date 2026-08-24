@@ -1905,6 +1905,11 @@ se elimina esa bandera y los argumentos `--raw-camera-resolution` y
 `--raw-record-fps` del launcher; los clips historicos permanecen hasta que la
 retencion normal elimine su evento.
 
+El launcher de homografia prioriza clips RAW completos de Live. Si la carpeta
+solo contiene un MP4 incompleto, usa automaticamente los clips revisados de
+`training_videos/` para que la herramienta pueda iniciar sin alterar la
+homografia ni la calibracion guardadas.
+
 ## 28. Rollback
 
 Cada fase debe poder revertirse:

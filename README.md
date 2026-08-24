@@ -167,6 +167,9 @@ source. The backend exposes the selected files as one continuous timeline
 while retaining the source video name, source frame index, and source
 timestamp in each annotation.
 
+If the Live folder contains only incomplete RAW files, the launcher falls back
+to the reviewed clips in `training_videos/` instead of failing at startup.
+
 When the camera resolution, zoom, or position changes, recreate and validate
 these files from a native `2880x2160` raw clip before accepting measurements:
 

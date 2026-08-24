@@ -58,6 +58,11 @@ def parse_args() -> argparse.Namespace:
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--video", type=Path)
     source.add_argument("--video-dir", type=Path)
+    parser.add_argument(
+        "--fallback-video-dir",
+        type=Path,
+        help="Use this directory when the primary directory has no complete videos.",
+    )
     parser.add_argument("--second", type=float, default=DEFAULT_SECOND)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
@@ -171,6 +176,37 @@ def latest_video_format_paths(video_paths: list[Path]) -> list[Path]:
         for path, meta in readable
         if video_format_signature(meta) == latest_signature
     ]
+
+
+def selected_video_paths(args: argparse.Namespace) -> list[Path]:
+    video_dir = getattr(args, "video_dir", None)
+    fallback_dir = getattr(args, "fallback_video_dir", None)
+    latest_only = bool(getattr(args, "latest_video_format_only", False))
+    if video_dir is None or fallback_dir is None:
+        paths = discover_video_paths(args)
+        return latest_video_format_paths(paths) if latest_only else paths
+
+    directories = [Path(video_dir)]
+    if Path(fallback_dir).resolve() != Path(video_dir).resolve():
+        directories.append(Path(fallback_dir))
+
+    errors = []
+    for position, directory in enumerate(directories):
+        try:
+            paths = discover_video_paths(
+                argparse.Namespace(video_dir=directory, video=None)
+            )
+            selected = latest_video_format_paths(paths) if latest_only else paths
+            if position > 0:
+                print(
+                    "Advertencia: no hay clips Live completos; "
+                    f"se usa el respaldo: {directory}"
+                )
+            return selected
+        except RuntimeError as exc:
+            errors.append(f"{directory}: {exc}")
+
+    raise RuntimeError("; ".join(errors))
 
 
 def build_video_playlist(video_paths: list[Path]) -> dict:
@@ -3188,9 +3224,7 @@ def api_annotate_save():
 def main() -> None:
     global _args, _video_playlist, _image, _source_label
     _args = parse_args()
-    video_paths = discover_video_paths(_args)
-    if _args.latest_video_format_only:
-        video_paths = latest_video_format_paths(video_paths)
+    video_paths = selected_video_paths(_args)
     _video_playlist = build_video_playlist(video_paths)
     _args.video = Path(_video_playlist["segments"][0]["path"])
     _args.output_dir.mkdir(parents=True, exist_ok=True)

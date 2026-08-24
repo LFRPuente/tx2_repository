@@ -171,6 +171,41 @@ class VideoPlaylistTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "No hay videos completos"):
                 vision.latest_video_format_paths([Path("live_0001_raw.mp4")])
 
+    def test_selection_falls_back_when_live_has_only_incomplete_clips(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_dir = root / "live"
+            training_dir = root / "training"
+            live_dir.mkdir()
+            training_dir.mkdir()
+            live_clip = live_dir / "live_0001_raw.mp4"
+            training_clip = training_dir / "live_0002_raw.mp4"
+            live_clip.touch()
+            training_clip.touch()
+            complete_meta = {
+                "width": 2880,
+                "height": 2160,
+                "fps": 30.0,
+                "total_frames": 240,
+                "duration_sec": 8.0,
+            }
+
+            def read_meta(path: Path) -> dict:
+                if path == live_clip:
+                    raise RuntimeError("moov atom not found")
+                return complete_meta
+
+            args = SimpleNamespace(
+                video=None,
+                video_dir=live_dir,
+                fallback_video_dir=training_dir,
+                latest_video_format_only=True,
+            )
+            with patch.object(vision, "video_meta", side_effect=read_meta):
+                selected = vision.selected_video_paths(args)
+
+        self.assertEqual(selected, [training_clip])
+
     def test_frame_read_retains_source_video_traceability(self) -> None:
         playlist = {
             "fps": 30.0,
