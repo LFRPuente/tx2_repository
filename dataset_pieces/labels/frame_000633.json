@@ -1,0 +1,16 @@
+{
+  "frame_idx": 633,
+  "time_sec": 21.82758620689655,
+  "img_w": 2786,
+  "img_h": 1017,
+  "boxes": [],
+  "class_id": 0,
+  "class_name": "piece",
+  "source": {
+    "video": "C:\\Users\\ven.luis.puente\\Documents\\IES-TX2\\tx2_repository\\outputs\\live_plc_clips\\2026-07-28\\live_0016_20260728_232207_275237Z_rising_raw.mp4",
+    "video_name": "live_0016_20260728_232207_275237Z_rising_raw.mp4",
+    "video_stem": "live_0016_20260728_232207_275237Z_rising_raw",
+    "source_frame_idx": 171,
+    "source_time_sec": 5.908934482758621
+  }
+}

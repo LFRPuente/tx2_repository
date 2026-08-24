@@ -8,7 +8,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from live_mvp_app import HISTORY_HTML, HTML, format_inches_compact
+from live_mvp_app import format_inches_compact
+
+LIVE_SCRIPT = (REPO_ROOT / "static" / "js" / "live.js").read_text(encoding="utf-8")
+HISTORY_SCRIPT = (REPO_ROOT / "static" / "js" / "history.js").read_text(
+    encoding="utf-8"
+)
 
 
 class MeasurementFormatTests(unittest.TestCase):
@@ -28,10 +33,13 @@ class MeasurementFormatTests(unittest.TestCase):
         self.assertEqual(format_inches_compact(None), "-")
 
     def test_live_and_history_use_compact_measurement_format(self) -> None:
-        self.assertIn("function compactMeasurement(value)", HTML)
-        self.assertIn("const label = compactMeasurement(measurement);", HTML)
-        self.assertNotIn("return `${feet} ft", HISTORY_HTML)
-        self.assertIn("return `${sign}${feet}' ${inchText}\"`;", HISTORY_HTML)
+        self.assertIn("function compactMeasurement(value)", LIVE_SCRIPT)
+        self.assertIn(
+            "compactMeasurement(piece.measurement?.measurement_in)",
+            LIVE_SCRIPT,
+        )
+        self.assertNotIn("return `${feet} ft", HISTORY_SCRIPT)
+        self.assertIn("return `${sign}${feet}' ${inchText}\"`;", HISTORY_SCRIPT)
 
 
 if __name__ == "__main__":

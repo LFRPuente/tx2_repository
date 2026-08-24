@@ -18,26 +18,43 @@ import cv2
 import numpy as np
 
 from live_mvp_app import (
-    HTML,
-    HISTORY_HTML,
     ClipRecorder,
     DatabaseReconciler,
     FrameBuffer,
     LiveProcessor,
+    app as flask_app,
     build_raw_rtsp_url,
     direct_raw_capture_enabled,
     mark_measurement_evidence_snapshot,
     measurement_evidence_snapshots,
     measurement_marker_active,
-    representative_snapshots,
 )
 from tools.plc_triggered_video_recorder import edge_matches
 
+LIVE_TEMPLATE = (REPO_ROOT / "templates" / "live.html").read_text(encoding="utf-8")
+LIVE_SCRIPT = (REPO_ROOT / "static" / "js" / "live.js").read_text(encoding="utf-8")
+LIVE_STYLE = (REPO_ROOT / "static" / "css" / "live.css").read_text(encoding="utf-8")
+HISTORY_TEMPLATE = (REPO_ROOT / "templates" / "history.html").read_text(
+    encoding="utf-8"
+)
+HISTORY_SCRIPT = (REPO_ROOT / "static" / "js" / "history.js").read_text(
+    encoding="utf-8"
+)
+
 
 class FakeOverlayProcessor:
-    def __init__(self, buffer: FrameBuffer, *, detects_piece: bool = True) -> None:
+    def __init__(
+        self,
+        buffer: FrameBuffer,
+        *,
+        detects_piece: bool = True,
+        processing_delay_seconds: float = 0.0,
+    ) -> None:
         self.buffer = buffer
         self.detects_piece = detects_piece
+        self.processing_delay_seconds = processing_delay_seconds
+        self.processed_indices: list[int] = []
+        self.evidence_indices: list[int] = []
 
     def _overlay_item(self, item: dict | None) -> dict | None:
         if item is None:
@@ -52,24 +69,17 @@ class FakeOverlayProcessor:
         processed["raw_frame"] = item["frame"]
         return processed
 
-    def recording_frame(self) -> dict | None:
-        return self._overlay_item(self.buffer.latest())
-
-    def recording_frames_between(
-        self,
-        start_monotonic: float,
-        end_monotonic: float,
-    ) -> list[dict]:
-        return [
-            processed
-            for item in self.buffer.frames_between(start_monotonic, end_monotonic)
-            if (processed := self._overlay_item(item)) is not None
-        ]
-
-    def process_event_frame(
+    def process_clip_frame(
         self,
         item: dict,
+        *,
+        include_evidence_images: bool = False,
     ) -> tuple[dict, float]:
+        if self.processing_delay_seconds > 0:
+            time.sleep(self.processing_delay_seconds)
+        self.processed_indices.append(int(item["index"]))
+        if include_evidence_images:
+            self.evidence_indices.append(int(item["index"]))
         result = self.snapshot(include_images=True)["result"].copy()
         result["frame_index"] = int(item["index"])
         result["frame_utc"] = item["utc"]
@@ -112,9 +122,6 @@ class FakeOverlayProcessor:
 class FakeSnapshotProcessor:
     def __init__(self) -> None:
         self.result: dict | None = None
-
-    def recording_frame(self) -> dict | None:
-        return None
 
     def snapshot(self, include_images: bool = False) -> dict:
         return {"result": self.result}
@@ -284,7 +291,7 @@ class RawCaptureTests(unittest.TestCase):
 
 
 class LiveProcessorTests(unittest.TestCase):
-    def test_recording_frame_is_available_without_entering_api_payloads(self) -> None:
+    def test_internal_recording_frame_does_not_enter_api_payloads(self) -> None:
         processor = LiveProcessor(SimpleNamespace(process_fps=10.0), FrameBuffer(maxlen=8))
         recording_frame = {
             "index": 7,
@@ -300,8 +307,31 @@ class LiveProcessorTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(processor.recording_frame()["index"], 7)
         self.assertNotIn("_recording_frame", processor.snapshot(include_images=True)["result"])
+
+    def test_historical_clip_frames_do_not_rewind_the_latest_result(self) -> None:
+        processor = LiveProcessor(SimpleNamespace(process_fps=10.0), FrameBuffer(maxlen=8))
+        processor._set_state(
+            last_frame_index=90,
+            result={"frame_index": 90, "pieces": []},
+        )
+        historical_result = {
+            "frame_index": 80,
+            "frame_utc": "frame-80",
+            "_original_jpeg": b"processed-frame-80",
+        }
+
+        with patch.object(processor, "_process", return_value=historical_result):
+            processor.process_clip_frame(
+                {
+                    "index": 80,
+                    "utc": "frame-80",
+                    "monotonic": 80.0,
+                    "frame": np.zeros((8, 8, 3), dtype=np.uint8),
+                }
+            )
+
+        self.assertEqual(processor.snapshot()["result"]["frame_index"], 90)
 
 
 class PlcEdgeTests(unittest.TestCase):
@@ -311,25 +341,50 @@ class PlcEdgeTests(unittest.TestCase):
         self.assertFalse(edge_matches("", "changed"))
 
     def test_live_ui_exposes_plc_signal_state(self) -> None:
-        self.assertIn('id="plc-signal"', HTML)
-        self.assertIn("plc.last_trigger", HTML)
-        self.assertIn("PLC signal received", HTML)
-        self.assertIn("Last PLC Cut Signal", HTML)
-        self.assertNotIn("Last PLC signal", HTML)
-        self.assertIn("measurement-taken", HTML)
-        self.assertIn("data.recorder?.measurement_marker_active", HTML)
-        self.assertNotIn("TX2 Vision", HTML)
-        self.assertNotIn("<h1>Live MVP</h1>", HTML)
+        self.assertIn('id="plc-signal"', LIVE_TEMPLATE)
+        self.assertIn("plc.last_trigger", LIVE_SCRIPT)
+        self.assertIn("PLC signal received", LIVE_SCRIPT)
+        self.assertIn("Last PLC Cut Signal", LIVE_SCRIPT)
+        self.assertNotIn("Last PLC signal", LIVE_SCRIPT)
+        self.assertIn("measurement-taken", LIVE_STYLE)
+        self.assertIn("data.recorder?.measurement_marker_active", LIVE_SCRIPT)
+        self.assertIn("/api/live/frame?metadata=1", LIVE_SCRIPT)
+        self.assertIn('src="/api/live/stream.mp4"', LIVE_TEMPLATE)
+        self.assertNotIn("/api/live/image.jpg?frame=", LIVE_SCRIPT)
+        self.assertIn("analysisRequestInFlight", LIVE_SCRIPT)
+        self.assertNotIn("TX2 Vision", LIVE_TEMPLATE.split("<body>", 1)[-1])
+        self.assertNotIn("<h1>Live MVP</h1>", LIVE_TEMPLATE)
+
+    def test_frontend_assets_are_served_from_templates_and_static_files(self) -> None:
+        with flask_app.test_client() as client:
+            live_response = client.get("/")
+            history_response = client.get("/history")
+            script_response = client.get("/static/js/live.js")
+            style_response = client.get("/static/css/live.css")
+            try:
+                self.assertEqual(live_response.status_code, 200)
+                self.assertEqual(history_response.status_code, 200)
+                self.assertEqual(script_response.status_code, 200)
+                self.assertEqual(style_response.status_code, 200)
+                self.assertIn(b"/static/js/live.js", live_response.data)
+                self.assertIn(b"/static/css/history.css", history_response.data)
+                self.assertNotIn(b"<style>", live_response.data)
+                self.assertNotIn(b"<script>", live_response.data)
+            finally:
+                live_response.close()
+                history_response.close()
+                script_response.close()
+                style_response.close()
 
 
 class HistoryTests(unittest.TestCase):
     def test_history_only_renders_the_green_measurement_evidence(self) -> None:
-        self.assertIn("PLC signal measurement frame", HISTORY_HTML)
-        self.assertIn('class="measurement-evidence"', HISTORY_HTML)
-        self.assertIn("Raw clip", HISTORY_HTML)
-        self.assertNotIn("Up to 6 representative captures", HISTORY_HTML)
-        self.assertNotIn("No diagram evidence", HISTORY_HTML)
-        self.assertNotIn("SQLite temporal is active", HISTORY_HTML)
+        self.assertIn("PLC signal measurement frame", HISTORY_SCRIPT)
+        self.assertIn('class="measurement-evidence"', HISTORY_SCRIPT)
+        self.assertIn("Raw clip", HISTORY_SCRIPT)
+        self.assertNotIn("Up to 6 representative captures", HISTORY_SCRIPT)
+        self.assertNotIn("No diagram evidence", HISTORY_SCRIPT)
+        self.assertNotIn("SQLite temporal is active", HISTORY_TEMPLATE)
 
     def test_measurement_evidence_uses_only_the_canonical_snapshot(self) -> None:
         snapshots = [
@@ -342,18 +397,80 @@ class HistoryTests(unittest.TestCase):
 
         self.assertEqual([item["frame_index"] for item in selected], [2])
 
-    def test_representative_snapshots_include_the_full_clip_range(self) -> None:
-        snapshots = [{"index": index} for index in range(64)]
-
-        selected = representative_snapshots(snapshots, 6)
-
-        self.assertEqual(len(selected), 6)
-        self.assertEqual(selected[0]["index"], 0)
-        self.assertEqual(selected[-1]["index"], 63)
-        self.assertEqual(len({item["index"] for item in selected}), 6)
-
-
 class ClipRecorderTests(unittest.TestCase):
+    def test_frame_collector_preserves_clip_frames_while_processing_lags(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = SimpleNamespace(
+                output_dir=Path(temp_dir),
+                record_seconds=0.4,
+                pre_trigger_seconds=0.0,
+                record_fps=10.0,
+                capture_fps=100.0,
+                save_raw_clips=False,
+                measurement_delay_seconds=0.0,
+                max_clips=10,
+            )
+            buffer = FrameBuffer(maxlen=8)
+            processor = FakeOverlayProcessor(
+                buffer,
+                processing_delay_seconds=0.03,
+            )
+            recorder = ClipRecorder(args, buffer, processor)
+            stop_feeder = threading.Event()
+
+            def feed_frames() -> None:
+                index = 0
+                while not stop_feeder.is_set():
+                    buffer.append(
+                        {
+                            "index": index,
+                            "utc": f"frame-{index}",
+                            "monotonic": time.perf_counter(),
+                            "frame": np.zeros((48, 64, 3), dtype=np.uint8),
+                        }
+                    )
+                    index += 1
+                    time.sleep(0.01)
+
+            feeder = threading.Thread(target=feed_frames, daemon=True)
+            feeder.start()
+            self.addCleanup(stop_feeder.set)
+            self.addCleanup(feeder.join, 1.0)
+
+            deadline = time.perf_counter() + 1.0
+            while buffer.latest() is None and time.perf_counter() < deadline:
+                time.sleep(0.01)
+
+            recorder.start_event_clip(
+                {
+                    "event_edge": "rising",
+                    "event_read_monotonic": time.perf_counter(),
+                }
+            )
+            deadline = time.perf_counter() + 4.0
+            while recorder.snapshot()["recording"] and time.perf_counter() < deadline:
+                time.sleep(0.02)
+            stop_feeder.set()
+            feeder.join(timeout=1.0)
+
+            sidecars = list(Path(temp_dir).rglob("*.json"))
+            self.assertEqual(len(sidecars), 1)
+            data = json.loads(sidecars[0].read_text(encoding="utf-8"))
+            self.assertGreater(data["processed_source_frame_count"], 8)
+            self.assertEqual(
+                data["processed_source_frame_count"],
+                len(processor.processed_indices),
+            )
+            self.assertEqual(
+                processor.processed_indices,
+                list(
+                    range(
+                        processor.processed_indices[0],
+                        processor.processed_indices[-1] + 1,
+                    )
+                ),
+            )
+
     def test_retention_removes_corrupt_sidecar_and_inferred_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir)
@@ -562,14 +679,30 @@ class ClipRecorderTests(unittest.TestCase):
             )
             self.assertEqual(data["measurement_marker_first_video_frame_index"], 2)
             self.assertEqual(data["measurement_marker_frames_written"], 8)
+            self.assertEqual(data["processing_mode"], "plc_triggered_clip")
+            self.assertEqual(
+                data["processed_source_frame_count"],
+                len(processor.processed_indices),
+            )
+            self.assertEqual(
+                len(processor.processed_indices),
+                len(set(processor.processed_indices)),
+            )
+            self.assertGreater(data["processed_source_frame_count"], 3)
+            self.assertEqual(processor.evidence_indices, [2])
+            self.assertEqual(data["processing_snapshot_count"], 1)
             video = cv2.VideoCapture(data["video_path"])
             try:
-                video.set(cv2.CAP_PROP_POS_FRAMES, 2)
-                ok, measurement_frame = video.read()
-                self.assertTrue(ok)
-                center = measurement_frame[12:-12, 12:-12]
-                blue, _green, red = center.mean(axis=(0, 1))
-                self.assertGreater(red, blue + 100)
+                frame_count = 0
+                while True:
+                    ok, processed_frame = video.read()
+                    if not ok:
+                        break
+                    center = processed_frame[12:-12, 12:-12]
+                    blue, _green, red = center.mean(axis=(0, 1))
+                    self.assertGreater(max(blue, red), 100)
+                    frame_count += 1
+                self.assertEqual(frame_count, 30)
             finally:
                 video.release()
 
@@ -644,6 +777,8 @@ class ClipRecorderTests(unittest.TestCase):
                 self.assertEqual(data["frames_written"], 4)
                 self.assertAlmostEqual(data["video_duration_seconds"], 0.4, places=3)
                 self.assertEqual(data["video_content"], "yolo_processed_overlay")
+                self.assertEqual(data["processing_mode"], "plc_triggered_clip")
+                self.assertGreaterEqual(data["processed_source_frame_count"], 1)
                 self.assertEqual(data["raw_video_content"], "axis_camera_raw")
                 self.assertEqual(data["raw_video_capture_mode"], "processed_buffer")
                 self.assertEqual(data["raw_video_fps"], 10.0)

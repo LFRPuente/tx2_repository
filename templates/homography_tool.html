@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TX2 Vision Tool</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/homography_tool.css') }}">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <h1>TX2 Vision Tool</h1>
+      <div class="source" id="source-label">{{ source_label }}</div>
+    </div>
+    <nav class="tabs">
+      <button class="ghost active" id="tab-homography" onclick="showView('homography')">Homografia</button>
+      <button class="ghost" id="tab-measure" onclick="showView('measure')">Mediciones</button>
+      <button class="ghost" id="tab-annotate" onclick="showView('annotate')">Anotar YOLO</button>
+      <button class="ghost" id="tab-player" onclick="showView('player')">Reproductor</button>
+    </nav>
+  </header>
+
+  <section class="toolbar" id="homography-toolbar">
+    <label>Segundo</label>
+    <input type="number" id="h-second" value="{{ second }}" step="0.5" min="0">
+    <button onclick="loadHomographyFrame()">Cargar frame</button>
+    <button onclick="stepHomography(-30)" title="Retroceder 1 segundo">-1s</button>
+    <button onclick="stepHomography(-1)" title="Retroceder 1 frame">-1f</button>
+    <button onclick="stepHomography(1)" title="Avanzar 1 frame">+1f</button>
+    <button onclick="stepHomography(30)" title="Avanzar 1 segundo">+1s</button>
+    <label>Timeline</label>
+    <input type="range" id="h-timeline" class="timeline-range" min="0" max="0" step="1" value="0"
+      title="Arrastra o usa la rueda para navegar por todos los videos"
+      oninput="previewHomographyTimeline(this.value)"
+      onchange="loadHomographyTimeline(this.value)"
+      onwheel="scrollHomographyTimeline(event)">
+    <span class="pill" id="h-timeline-label">00:00:00</span>
+    <button onclick="loadSavedHomography()">Cargar guardada</button>
+    <label>Zoom</label>
+    <input type="range" id="h-zoom" min="1" max="20" step="0.1" value="1">
+    <span class="pill" id="h-zoom-label">1.0x</span>
+    <label>Expandir ROI</label>
+    <input type="range" id="h-expand" min="0" max="40" step="1" value="0">
+    <span class="pill" id="h-expand-label">0%</span>
+    <button onclick="resetWorkRoi()">Reset ROI</button>
+    <span class="spacer"></span>
+    <span class="pill" id="points-badge">0 / 4 puntos</span>
+    <button onclick="undoPoint()">Deshacer</button>
+    <button class="danger" onclick="resetPoints()">Reiniciar</button>
+    <button class="primary" id="save-homography" onclick="saveHomography()" disabled>Guardar homografia</button>
+  </section>
+
+  <section class="toolbar" id="annotate-toolbar" style="display:none">
+    <label>Segundo</label>
+    <input type="number" id="a-second" value="{{ second }}" step="1" min="0">
+    <button onclick="loadAnnotateSecond()">Ir</button>
+    <button onclick="stepAnnotate(-30)" title="Retroceder 1 segundo">-1s</button>
+    <button onclick="stepAnnotate(-1)" title="Retroceder 1 frame">-1f</button>
+    <button onclick="stepAnnotate(1)" title="Avanzar 1 frame">+1f</button>
+    <button onclick="stepAnnotate(30)" title="Avanzar 1 segundo">+1s</button>
+    <button onclick="stepAnnotateSeconds(-30)" title="Retroceder 30 segundos">-30s</button>
+    <button onclick="stepAnnotateSeconds(30)" title="Avanzar 30 segundos">+30s</button>
+    <label>Timeline</label>
+    <input type="range" id="a-timeline" class="timeline-range" min="0" max="0" step="1" value="0"
+      title="Arrastra o usa la rueda para navegar por todos los videos"
+      oninput="previewAnnotateTimeline(this.value)"
+      onchange="loadAnnotateTimeline(this.value)"
+      onwheel="scrollAnnotateTimeline(event)">
+    <span class="pill" id="a-timeline-label">00:00:00</span>
+    <label>Zoom</label>
+    <input type="range" id="a-zoom" min="1" max="20" step="0.1" value="1">
+    <span class="pill" id="a-zoom-label">1.0x</span>
+    <button id="a-run-model" onclick="runModel()">Run model</button>
+    <span class="spacer"></span>
+    <button onclick="undoBox()">Deshacer</button>
+    <button class="danger" onclick="clearBoxes()">Limpiar</button>
+    <button class="primary" id="save-frame" onclick="saveFrame({automatic: false})" disabled>Guardar negativo</button>
+  </section>
+
+  <section class="toolbar" id="measure-toolbar" style="display:none">
+    <label>Segundo</label>
+    <input type="number" id="m-second" value="{{ second }}" step="1" min="0">
+    <button onclick="loadMeasureSecond()">Ir</button>
+    <button onclick="reloadMeasureRoi()" title="Recargar usando la homografia/ROI guardada mas reciente">Recargar ROI</button>
+    <button onclick="stepMeasure(-30)" title="Retroceder 1 segundo">-1s</button>
+    <button onclick="stepMeasure(30)" title="Avanzar 1 segundo">+1s</button>
+    <button id="m-mode-segment" class="ghost active" onclick="setMeasureMode('segment')">Segmento</button>
+    <button id="m-mode-ref" class="ghost" onclick="setMeasureMode('reference')">Linea Y</button>
+    <button id="m-mode-exclusion" class="zone-toggle" onclick="setMeasureMode('exclusion')">Zona roja</button>
+    <button id="m-map-toggle" class="ghost active" onclick="toggleScaleMap()">Mapa escala</button>
+    <label>Zoom</label>
+    <input type="range" id="m-zoom" min="1" max="20" step="0.1" value="1">
+    <span class="pill" id="m-zoom-label">1.0x</span>
+    <span class="spacer"></span>
+    <button onclick="undoMeasureSegment()">Deshacer</button>
+    <button class="danger" onclick="clearMeasureCalibration()">Limpiar</button>
+    <button class="primary" onclick="saveMeasureCalibration()">Guardar y crear mapa</button>
+  </section>
+
+  <section class="toolbar" id="player-toolbar" style="display:none">
+    <label>Segundo</label>
+    <input type="number" id="p-second" value="{{ second }}" step="1" min="0">
+    <button onclick="loadPlayerSecond()">Ir</button>
+    <button id="p-play" onclick="togglePlayerPlay()">Play</button>
+    <button id="p-speed" onclick="togglePlayerSpeed()">x1</button>
+    <button onclick="stepPlayer(-30)" title="Retroceder 1 segundo">-1s</button>
+    <button onclick="stepPlayer(-1)" title="Retroceder 1 frame">-1f</button>
+    <button onclick="stepPlayer(1)" title="Avanzar 1 frame">+1f</button>
+    <button onclick="stepPlayer(30)" title="Avanzar 1 segundo">+1s</button>
+    <label>Timeline</label>
+    <input type="range" id="p-timeline" class="timeline-range" min="0" max="0" step="1" value="0"
+      title="Arrastra o usa la rueda para navegar por todos los videos"
+      oninput="previewPlayerTimeline(this.value)"
+      onchange="loadPlayerTimeline(this.value)"
+      onwheel="scrollPlayerTimeline(event)">
+    <span class="pill" id="p-timeline-label">00:00:00</span>
+    <label>Zoom</label>
+    <input type="range" id="p-zoom" min="1" max="20" step="0.1" value="1">
+    <span class="pill" id="p-zoom-label">1.0x</span>
+    <span class="spacer"></span>
+    <div class="ruler-tool" id="p-ruler-tool">
+      <button class="icon-tool" id="p-ruler-toggle" onclick="togglePlayerRulerTool()" title="Regla manual">
+        <span class="ruler-icon"></span><span>Regla</span>
+      </button>
+      <div class="ruler-menu">
+        <button id="p-ruler-x" onclick="setPlayerRulerMode('x')">X</button>
+        <button id="p-ruler-y" onclick="setPlayerRulerMode('y')">Y</button>
+        <button id="p-ruler-free" onclick="setPlayerRulerMode('free')">Libre</button>
+        <button class="danger" onclick="clearPlayerRuler()">Limpiar</button>
+      </div>
+    </div>
+    <button class="primary" onclick="savePlayerCapture()">Guardar medicion</button>
+    <span class="pill" id="p-yolo-badge">YOLO -</span>
+    <span class="pill" id="p-sobel-badge">Sobel -</span>
+  </section>
+
+  <main class="workspace">
+    <section class="view active" id="homography-view">
+      <div class="pane">
+        <div class="pane-title"><span>Fuente</span><span>click: punto base | arrastra puntos/lados: ajustar | rueda: zoom</span></div>
+        <div class="canvas-wrap" id="h-wrap">
+          <canvas id="h-canvas"></canvas>
+          <div class="hud" id="h-hud">x: - y: -</div>
+        </div>
+        <div class="points" id="points-list">Sin puntos.</div>
+      </div>
+      <div class="pane">
+        <div class="pane-title"><span>Warp preview</span><span id="warp-size">sin homografia</span></div>
+        <div class="canvas-wrap" id="w-wrap" style="cursor:default">
+          <canvas id="w-canvas"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <section class="view" id="annotate-view">
+      <div class="pane">
+        <div class="pane-title"><span>Video rectificado</span><span>arrastra: box | click modelo: editar | rueda: zoom</span></div>
+        <div class="canvas-wrap" id="a-wrap">
+          <canvas id="a-canvas"></canvas>
+          <div class="hud" id="a-hud">x: - y: -</div>
+        </div>
+      </div>
+      <aside class="side">
+        <div class="section">
+          <h2>Frame actual</h2>
+          <div class="kv"><span>Video</span><strong id="info-video">-</strong></div>
+          <div class="kv"><span>Frame origen</span><strong id="info-source-frame">-</strong></div>
+          <div class="kv"><span>Frame</span><strong id="info-frame">-</strong></div>
+          <div class="kv"><span>Tiempo</span><strong id="info-time">-</strong></div>
+          <div class="kv"><span>Tamano</span><strong id="info-size">-</strong></div>
+          <div class="kv"><span>Boxes</span><strong id="info-boxes">0</strong></div>
+        </div>
+        <div class="section">
+          <h2>Dataset</h2>
+          <div class="kv"><span>Frames guardados</span><strong id="info-saved">0</strong></div>
+          <div class="kv"><span>Salida</span><strong id="info-dataset">dataset</strong></div>
+        </div>
+        <div class="section">
+          <h2>Historial</h2>
+          <div class="history-list" id="history-list"></div>
+        </div>
+        <div class="section">
+          <h2>Run model</h2>
+          <div class="kv"><span>Detecciones</span><strong id="info-model-boxes">-</strong></div>
+          <div class="kv"><span>Coincidencias</span><strong id="info-model-matched">-</strong></div>
+          <div class="kv"><span>Omitidas</span><strong id="info-model-missed">-</strong></div>
+          <div class="box-list" id="model-box-list"></div>
+        </div>
+        <div class="section">
+          <h2>Anotaciones</h2>
+          <div class="box-list" id="box-list"></div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="view" id="measure-view">
+      <div class="pane">
+        <div class="pane-title"><span>Mesa rectificada</span><span>2 clicks: crear | arrastra puntos guardados: ajustar | rueda: zoom</span></div>
+        <div class="canvas-wrap" id="m-wrap">
+          <canvas id="m-canvas"></canvas>
+          <div class="hud" id="m-hud">x: - y: -</div>
+        </div>
+      </div>
+      <aside class="side">
+        <div class="section">
+          <h2>Frame</h2>
+          <div class="kv"><span>Video</span><strong id="m-info-video">-</strong></div>
+          <div class="kv"><span>Frame origen</span><strong id="m-info-source-frame">-</strong></div>
+          <div class="kv"><span>Frame</span><strong id="m-info-frame">-</strong></div>
+          <div class="kv"><span>Tiempo</span><strong id="m-info-time">-</strong></div>
+          <div class="kv"><span>Tamano</span><strong id="m-info-size">-</strong></div>
+        </div>
+        <div class="section">
+          <h2>Escala</h2>
+          <div class="kv"><span>inch/px</span><strong id="m-info-inch-px">-</strong></div>
+          <div class="kv"><span>px/in</span><strong id="m-info-px-inch">-</strong></div>
+          <div class="kv"><span>Segmentos</span><strong id="m-info-segments">0</strong></div>
+        </div>
+        <div class="section">
+          <h2>Mapa de escala</h2>
+          <div class="kv"><span>Referencias Y</span><strong id="m-map-y-count">0</strong></div>
+          <div class="kv"><span>Referencias X</span><strong id="m-map-x-count">0</strong></div>
+          <div class="kv"><span>Interpolacion Y</span><strong id="m-map-y-mode">global</strong></div>
+          <div class="kv"><span>Rango Y</span><strong id="m-map-y-range">-</strong></div>
+          <div class="kv"><span>Cobertura</span><strong id="m-map-coverage">-</strong></div>
+          <div class="kv"><span>Diagonales ignoradas</span><strong id="m-map-ignored">0</strong></div>
+        </div>
+        <div class="section">
+          <h2>Referencia Y</h2>
+          <div class="kv"><span>Linea</span><strong id="m-info-ref">-</strong></div>
+        </div>
+        <div class="section">
+          <h2>Zonas sin boxes</h2>
+          <div class="kv"><span>Zonas</span><strong id="m-info-zones">0</strong></div>
+          <div class="kv"><span>Solapamiento permitido</span><strong>20%</strong></div>
+          <div class="box-list" id="m-zone-list"></div>
+        </div>
+        <div class="section">
+          <h2>Segmentos</h2>
+          <div class="box-list" id="m-segment-list"></div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="view" id="player-view">
+      <div class="pane">
+        <div class="pane-title"><span>Reproductor de piezas YOLO + Sobel</span><span>Sobel Y en el frente inferior de cada pieza</span></div>
+        <div class="canvas-wrap" id="p-wrap" style="cursor:default">
+          <canvas id="p-canvas"></canvas>
+          <div class="hud" id="p-hud">x: - y: -</div>
+        </div>
+      </div>
+      <aside class="side">
+        <div class="section">
+          <h2>Frame actual</h2>
+          <div class="kv"><span>Video</span><strong id="p-info-video">-</strong></div>
+          <div class="kv"><span>Frame origen</span><strong id="p-info-source-frame">-</strong></div>
+          <div class="kv"><span>Frame</span><strong id="p-info-frame">-</strong></div>
+          <div class="kv"><span>Tiempo</span><strong id="p-info-time">-</strong></div>
+          <div class="kv"><span>Tamano</span><strong id="p-info-size">-</strong></div>
+          <div class="kv"><span>Velocidad</span><strong id="p-info-speed">x1</strong></div>
+        </div>
+        <div class="section">
+          <h2>YOLO</h2>
+          <div class="kv"><span>Piezas</span><strong id="p-info-boxes">0</strong></div>
+          <div class="kv"><span>Conf</span><strong id="p-info-yolo-conf">-</strong></div>
+          <div class="kv"><span>Descartadas por zona</span><strong id="p-info-excluded">0</strong></div>
+        </div>
+        <div class="section">
+          <h2>Mediciones por pieza</h2>
+          <div class="kv"><span>Estado</span><strong id="p-info-sobel-state">sin correr</strong></div>
+          <div class="kv"><span>Conf edge</span><strong id="p-info-sobel-conf">-</strong></div>
+          <div class="kv"><span>CRM</span><strong id="p-info-sobel-crm">-</strong></div>
+          <div class="kv"><span>Validas</span><strong id="p-info-measure">-</strong></div>
+          <div class="box-list" id="p-piece-list"></div>
+        </div>
+        <div class="section">
+          <h2>Regla manual</h2>
+          <div class="kv"><span>Modo</span><strong id="p-ruler-info-mode">off</strong></div>
+          <div class="kv"><span>Escala</span><strong id="p-ruler-info-scale">-</strong></div>
+          <div class="kv"><span>Distancia</span><strong id="p-ruler-info-distance">-</strong></div>
+          <div class="kv"><span>Delta</span><strong id="p-ruler-info-delta">-</strong></div>
+        </div>
+        <div class="section">
+          <h2>Capturas</h2>
+          <div class="history-list" id="p-capture-list"></div>
+        </div>
+      </aside>
+    </section>
+  </main>
+  <footer class="status" id="status">Listo.</footer>
+</div>
+
+<script src="{{ url_for('static', filename='js/homography_tool.js') }}" defer></script>
+</body>
+</html>

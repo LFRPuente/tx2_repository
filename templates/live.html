@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TX2 Live MVP</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/live.css') }}">
+  <script src="{{ url_for('static', filename='js/live.js') }}" defer></script>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="nav">
+        <a href="/history">History</a>
+        <div id="plc-signal" class="plc-signal offline" role="status" aria-live="polite">
+          <span class="dot" aria-hidden="true"></span>
+          <span id="plc-signal-text">Connecting to PLC...</span>
+        </div>
+        <div id="top-state" class="pill warn">connecting...</div>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="panel">
+        <div class="stage" id="original-stage">
+          <video
+            id="live-video"
+            autoplay
+            muted
+            playsinline
+            preload="auto"
+            src="/api/live/stream.mp4"
+            aria-label="Live camera"
+          ></video>
+          <div id="live-video-state" class="empty stream-state">Connecting to camera...</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <svg class="diagram" viewBox="0 0 760 310" role="img" aria-label="Measurement diagram">
+          <defs>
+            <linearGradient id="live-steel" x1="0" x2="1">
+              <stop offset="0%" stop-color="#69777c"></stop>
+              <stop offset="42%" stop-color="#d6dcde"></stop>
+              <stop offset="72%" stop-color="#929da1"></stop>
+              <stop offset="100%" stop-color="#5a666b"></stop>
+            </linearGradient>
+          </defs>
+          <rect x="38" y="34" width="684" height="232" rx="8" fill="#f7faf8" stroke="#cbd6cf" stroke-width="2"></rect>
+          <rect x="86" y="58" width="588" height="182" rx="6" fill="#edf2ef" stroke="#c0cbc6"></rect>
+          <line id="diagram-reference" x1="92" x2="668" y1="156" y2="156" stroke="#d28230" stroke-width="4" stroke-linecap="round" stroke-dasharray="10 8"></line>
+          <text id="diagram-reference-label" x="100" y="180" fill="#a66324" font-size="16" font-weight="900">REFERENCE</text>
+          <g id="diagram-pieces"></g>
+          <text id="diagram-summary" x="380" y="286" text-anchor="middle" fill="#243c48" font-size="17" font-weight="900">Waiting for pieces</text>
+        </svg>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

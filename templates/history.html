@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TX2 Measurement History</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/history.css') }}">
+  <script src="{{ url_for('static', filename='js/history.js') }}" defer></script>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <h1>Measurement history</h1>
+      <nav class="nav"><a href="/">Live</a></nav>
+    </header>
+
+    <main class="grid">
+      <section class="panel">
+        <div class="panel-head">
+          <h2 id="event-count">Loading...</h2>
+        </div>
+        <div class="list" id="event-list">
+          <div class="empty">Loading events...</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2 id="detail-title">Select an event</h2>
+          <span class="muted" id="detail-state"></span>
+        </div>
+        <div class="viewer" id="viewer">
+          <div class="empty">Select a saved PLC event.</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="correction-dialog">
+    <form id="correction-form">
+      <div class="dialog-body">
+        <h2 id="correction-title">Operator measurement</h2>
+        <div class="measure-inputs">
+          <label>Feet<input id="feet" type="number" min="0" step="1" required></label>
+          <label>Inches<input id="inches" type="number" min="0" max="11" step="1" required></label>
+          <label>Sixteenths<input id="sixteenths" type="number" min="0" max="15" step="1" required></label>
+        </div>
+        <label>Operator ID<input id="operator-id" autocomplete="username" required></label>
+        <label>Display name<input id="operator-name"></label>
+        <label>Reason<textarea id="reason" required></textarea></label>
+        <div id="form-error" class="muted"></div>
+      </div>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="cancel-correction">Cancel</button>
+        <button type="submit" class="btn primary">Save correction</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

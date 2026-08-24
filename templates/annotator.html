@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>YOLO Annotator</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/annotator.css') }}">
+</head>
+<body>
+
+<header>
+  <h1>YOLO Annotator - Piezas</h1>
+  <span class="badge" id="badge-frame">frame —</span>
+  <span class="badge" id="badge-boxes">0 boxes</span>
+  <span class="badge" id="badge-saved">0 frames anotados</span>
+  <span class="badge yellow" id="badge-mode">modo: piezas</span>
+</header>
+
+<div class="toolbar">
+  <!-- Frame navigation -->
+  <label>Segundo:</label>
+  <input type="number" id="inp-second" value="10" step="1" min="0" max="301" style="width:64px">
+  <button class="btn-primary" onclick="loadSecond()">Ir</button>
+  <button class="btn-primary" onclick="stepFrame(-30)" title="−1s">◀◀</button>
+  <button class="btn-primary" onclick="stepFrame(-1)"  title="−1 frame">◀</button>
+  <button class="btn-primary" onclick="stepFrame(1)"   title="+1 frame">▶</button>
+  <button class="btn-primary" onclick="stepFrame(30)"  title="+1s">▶▶</button>
+  <div class="sep"></div>
+  <!-- Zoom -->
+  <label>Zoom:</label>
+  <input type="range" id="zoom-range" min="1" max="16" step="0.1" value="1" style="width:100px">
+  <span id="zoom-lbl" style="font-size:.75rem;min-width:32px">1.0x</span>
+  <div class="sep"></div>
+  <button class="btn-warn"    onclick="clearBoxes()">Limpiar boxes</button>
+  <button class="btn-success" id="btn-save" onclick="saveFrame()" disabled>💾 Guardar frame</button>
+  <div class="sep"></div>
+  <label style="color:#88ccff;font-size:.75rem">Z=deshacer · R=limpiar · S=guardar · flechas=navegar</label>
+</div>
+
+<div class="main">
+  <div class="canvas-col">
+    <div class="panel-title" id="canvas-hint">
+      1er click → esquina A de la box &nbsp;|&nbsp; 2do click → esquina B &nbsp;|&nbsp; Rueda: zoom &nbsp;|&nbsp; Botón derecho + arrastrar: pan
+    </div>
+    <div class="canvas-wrap" id="wrap">
+      <canvas id="canvas"></canvas>
+      <div class="coords-hud" id="coords-hud">x: — &nbsp; y: —</div>
+    </div>
+  </div>
+
+  <div class="side-panel">
+    <div class="side-section">
+      <h3>Frame actual</h3>
+      <div class="kv"><span class="k">Frame</span>   <span class="v" id="inf-frame">—</span></div>
+      <div class="kv"><span class="k">Tiempo</span>  <span class="v" id="inf-time">—</span></div>
+      <div class="kv"><span class="k">Tamaño</span>  <span class="v" id="inf-size">—</span></div>
+    </div>
+    <div class="side-section">
+      <h3>Boxes en este frame</h3>
+      <div class="box-list" id="box-list"><span style="color:#555;font-size:.72rem;padding:6px 10px;display:block">Sin boxes.</span></div>
+    </div>
+    <div class="side-section">
+      <h3>Atajos</h3>
+      <div class="kv"><span class="k">Click ×2</span>   <span class="v">Dibujar box</span></div>
+      <div class="kv"><span class="k">Z</span>           <span class="v">Deshacer última</span></div>
+      <div class="kv"><span class="k">R</span>           <span class="v">Limpiar todas</span></div>
+      <div class="kv"><span class="k">S</span>           <span class="v">Guardar frame</span></div>
+      <div class="kv"><span class="k">← →</span>         <span class="v">±1 frame</span></div>
+      <div class="kv"><span class="k">A / D</span>       <span class="v">±1 s</span></div>
+    </div>
+    <div class="side-section" style="margin-top:auto">
+      <h3>Dataset</h3>
+      <div class="kv"><span class="k">Frames guardados</span> <span class="v" id="inf-saved">0</span></div>
+      <div class="kv"><span class="k">Total boxes</span>      <span class="v" id="inf-total-boxes">0</span></div>
+    </div>
+  </div>
+</div>
+
+<div id="status-bar" class="info">Cargando frame…</div>
+
+<script src="{{ url_for('static', filename='js/annotator.js') }}" defer></script>
+</body>
+</html>

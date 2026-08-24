@@ -1,5 +1,11 @@
 # TX2 Live MVP: guia completa de integracion
 
+> Decision vigente desde 2026-08-24: la primera publicacion usa Windows + IIS
+> con SQLite local. La base futura sera Microsoft SQL Server en otro servidor.
+> PostgreSQL ya no es el destino acordado; las secciones PostgreSQL de esta guia
+> se conservan como referencia historica y quedan subordinadas a
+> `docs/WINDOWS_IIS_DEPLOYMENT_PLAN.md`.
+
 Esta es la guia de trabajo para llevar al MVP en tiempo real todo lo que ya
 funciona en `homography_web_app.py`:
 
@@ -13,7 +19,7 @@ funciona en `homography_web_app.py`:
 - medicion independiente de cada pieza;
 - formato compacto como `40' 9 1/16"`;
 - grabacion activada por el PLC;
-- historial persistente en PostgreSQL;
+- historial persistente en SQLite durante el piloto;
 - correccion de medidas por un operador sin perder la medida automatica.
 
 El documento describe el estado real del repositorio al 27 de julio de 2026,
@@ -25,18 +31,17 @@ de datos y una secuencia de implementacion verificable.
 > entrenar y depurar. El proceso de produccion sigue siendo
 > `live_mvp_app.py`.
 >
-> Excepcion operativa temporal aprobada: mientras TI instala PostgreSQL, el
-> Live MVP usa `outputs/tx2_live_mvp.sqlite3`. SQLite refleja las mismas
-> entidades y restricciones funcionales, no guarda los MP4 dentro de la base y
-> se migra con `tools/migrate_sqlite_to_postgres.py`. Si
-> `TX2_POSTGRES_DSN` esta definido y falla, la aplicacion se detiene; nunca cae
-> silenciosamente a SQLite.
+> El Live MVP usa `outputs/tx2_live_mvp.sqlite3`. SQLite no guarda MP4 dentro de
+> la base. La migracion a SQL Server se implementara cuando TI entregue el
+> servidor, metodo de autenticacion y reglas de red.
 
 ## 1. Documentos relacionados
 
 - [`README.md`](README.md): entrada general al repositorio y comandos basicos.
+- [`docs/WINDOWS_IIS_DEPLOYMENT_PLAN.md`](docs/WINDOWS_IIS_DEPLOYMENT_PLAN.md):
+  decision vigente, fases IIS/servicio Windows y migracion futura a SQL Server.
 - [`docs/postgresql_server_setup.md`](docs/postgresql_server_setup.md):
-  instalacion y seguridad de PostgreSQL en el servidor Windows de TX2.
+  referencia heredada; no usar para el despliegue acordado.
 - [`AS20_VISION_SYSTEM_DOCS.md`](AS20_VISION_SYSTEM_DOCS.md): contexto OPC UA
   de `MeasureLength` y `VisionWD`.
 - [`bundles/as20_vision_opc_probe/README.md`](bundles/as20_vision_opc_probe/README.md):
@@ -49,33 +54,40 @@ Cuando esta integracion termine, un ciclo de produccion debe verse asi:
 1. La camara AXIS entrega frames originales a resolucion nativa.
 2. El `CameraReader` conserva un buffer acotado y asigna a cada frame un indice,
    una hora UTC y un tiempo monotonico local.
-3. El `LiveProcessor` rectifica el frame con la homografia guardada.
-4. YOLO detecta una caja por pieza visible.
-5. Las reglas geometricas eliminan duplicados y outliers, y pueden recuperar
+3. Mientras no hay un evento PLC, el navegador recibe H.264 a 20 FPS mediante
+   copia directa y el `LiveProcessor` no ejecuta YOLO, Sobel ni homografia.
+4. Cuando llega la señal PLC, cada frame fuente de la ventana completa de
+   8 segundos se rectifica con la homografia guardada.
+5. YOLO detecta una caja por pieza visible.
+6. Las reglas geometricas eliminan duplicados y outliers, y pueden recuperar
    una pieza faltante cuando el patron espacial y Sobel la respaldan.
-6. Las zonas rojas eliminan boxes cuyo solapamiento con una zona excede 20%.
-7. Sobel Y busca el frente inferior de cada pieza solamente dentro de su ROI.
-8. Cada frente se fuerza a una linea horizontal.
-9. Cada pieza se mide contra la linea de referencia usando la escala vigente.
-10. El frontend muestra la imagen original, el esquema y la tabla de piezas.
-11. Una señal rising del PLC crea un evento de medicion y conserva una
+7. Las zonas rojas eliminan boxes cuyo solapamiento con una zona excede 20%.
+8. Sobel Y busca el frente inferior de cada pieza solamente dentro de su ROI.
+9. Cada frente se fuerza a una linea horizontal.
+10. Cada pieza se mide contra la linea de referencia usando la escala vigente.
+11. El frontend muestra el stream original y actualiza el esquema con los
+    resultados del evento; el perimetro de la vista se marca en verde en el
+    instante de medicion.
+12. Una señal rising del PLC crea un evento de medicion y conserva una
     grabacion independiente de 8 segundos: 2 segundos anteriores a la señal y
     6 segundos posteriores.
-12. La medida automatica usa el frame de camara mas cercano inmediatamente
+13. La medida automatica usa el frame de camara mas cercano inmediatamente
     anterior a la señal PLC y lo procesa de forma dedicada. El perimetro se
     muestra verde en Live y queda grabado en verde durante 0.8 segundos,
     aproximadamente en el segundo 2 del MP4 procesado.
-13. Una nueva señal crea otra ventana fija de 8 segundos. Si ambas ventanas
+14. Una nueva señal crea otra ventana fija de 8 segundos. Si ambas ventanas
     coinciden en el tiempo, se conservan como clips separados sin truncarlas.
-14. La ventana solo se conserva si YOLO detecta al menos una pieza. Si no
+15. La ventana solo se conserva si YOLO detecta al menos una pieza en cualquiera
+    de sus frames procesados. Si no
     detecta ninguna, se eliminan ambos MP4, los snapshots temporales y el evento.
-15. El evento, sus piezas, snapshots y rutas de assets se guardan en PostgreSQL.
-16. En `History`, el operador puede capturar una medida real para cada pieza.
-17. Temporalmente, cada evento valido tambien copia el H.264 crudo desde un
+16. El evento, sus piezas, evidencia canonica y rutas de assets se guardan en
+    la base seleccionada.
+17. En `History`, el operador puede capturar una medida real para cada pieza.
+18. Temporalmente, cada evento valido tambien copia el H.264 crudo desde un
     stream AXIS separado a `2880x2160`, 30 FPS y sin overlays. Esta copia
     directa comienza con la señal; el prebuffer de 2 segundos pertenece al MP4
     procesado mostrado en History.
-18. La medida automatica nunca se sobrescribe. Cada cambio del operador queda
+19. La medida automatica nunca se sobrescribe. Cada cambio del operador queda
     auditado con usuario, hora, valor anterior, valor nuevo y motivo.
 
 ## 3. Aplicaciones del repositorio y responsabilidad de cada una
@@ -111,13 +123,39 @@ Responsabilidades:
 Este tool puede detenerse, pedir entradas manuales y navegar videos. No debe
 estar en el camino critico del procesamiento en vivo.
 
+Su frontend tambien esta separado del backend:
+
+```text
+templates/homography_tool.html
+static/css/homography_tool.css
+static/js/homography_tool.js
+```
+
+El selector ROI y el anotador siguen la misma estructura con
+`roi_selector.*` y `annotator.*`.
+
 ### 3.2 MVP en tiempo real
 
-Archivo:
+Backend:
 
 ```text
 live_mvp_app.py
 ```
+
+Frontend servido por Flask:
+
+```text
+templates/live.html
+templates/history.html
+static/css/live.css
+static/css/history.css
+static/js/live.js
+static/js/history.js
+```
+
+El backend no contiene HTML, CSS ni JavaScript embebido. Las plantillas solo
+definen la estructura; los estilos y el comportamiento del navegador viven en
+sus archivos estaticos correspondientes.
 
 URL local:
 
@@ -134,7 +172,12 @@ http://127.0.0.1:8767/history
 Responsabilidades actuales:
 
 - leer RTSP de la camara AXIS;
-- procesar el frame mas reciente en un thread separado;
+- servir al navegador H.264 `2880x2160` a 20 FPS mediante fragmented MP4 y
+  `codec copy`, sin JPEG ni inferencia mientras no hay una ventana PLC activa;
+- ejecutar homografia, YOLO, reglas, Sobel y medicion sobre todos los frames
+  fuente de cada clip disparado por PLC;
+- colectar los frames de la ventana PLC en paralelo con la inferencia para que
+  un modelo frio o temporalmente lento no pierda frames al rotar el buffer;
 - detectar y medir cada pieza de forma independiente;
 - aplicar reglas geometricas y zonas rojas configuradas antes de Sobel;
 - conservar diagnosticos `box_rules` por snapshot;
@@ -164,8 +207,8 @@ diseno e interaccion, pero no es actualmente el frontend servido por
 
 No se deben mezclar los dos MVP sin una decision explicita:
 
-- opcion A, recomendada para el primer entregable: mejorar el HTML embebido de
-  `live_mvp_app.py`;
+- opcion A, actual: mantener las plantillas Flask y sus assets en
+  `templates/` y `static/`;
 - opcion B, posterior: compilar React y servirlo desde el backend live, usando
   las APIs `/api/live/*`.
 
@@ -412,10 +455,14 @@ no una aprobacion final de produccion.
 
 ```mermaid
 flowchart LR
-    Camera["AXIS camera<br/>RTSP 2880x2160 @ 10 FPS"] --> Reader["CameraReader"]
+    Camera["AXIS camera"] --> BrowserCopy["H.264 copy<br/>2880x2160 @ 20 FPS"]
+    BrowserCopy --> LiveMP4["Fragmented MP4<br/>/api/live/stream.mp4"]
+    LiveMP4 --> LiveUI["Live UI"]
+    Camera --> Reader["CameraReader<br/>NVIDIA NVDEC @ 10 FPS"]
     Camera --> RawCopy["Temporary H.264 copy<br/>2880x2160 @ 30 FPS"]
-    Reader --> Buffer["Bounded FrameBuffer"]
-    Buffer --> Processor["LiveProcessor"]
+    Reader --> RecordingBuffer["PLC buffer<br/>10 FPS"]
+    Event --> Processor["LiveProcessor<br/>all frames in PLC clip"]
+    RecordingBuffer --> Processor
     Processor --> Warp["Homography<br/>recalibrated for native input"]
     Warp --> Yolo["YOLO11 individual pieces"]
     Config["Configuration files<br/>homography + calibration + red zones"] --> Warp
@@ -423,13 +470,12 @@ flowchart LR
     Yolo --> Rules
     Rules --> Sobel["Sobel Y per piece<br/>horizontal front"]
     Sobel --> Measure["Measurement per piece"]
-    Measure --> LiveAPI["/api/live/frame"]
-    LiveAPI --> LiveUI["Live UI"]
+    Measure --> LiveMetadata["Compact metadata<br/>/api/live/frame?metadata=1"]
+    LiveMetadata --> LiveUI["Live UI"]
 
     PLC["Kepware OPC UA<br/>VisionWD + MeasureLength"] --> Monitor["PLCMonitor"]
     Monitor --> Event["Measurement event"]
     Event --> Recorder["ClipRecorder"]
-    Buffer --> Recorder
     Processor --> Recorder
     RawCopy --> Recorder
     Recorder --> Assets["Processed MP4 + raw MP4 + JPEG assets"]
@@ -445,10 +491,14 @@ flowchart LR
 `live_mvp_app.py` separa:
 
 - thread de lectura de camara;
-- thread de procesamiento de vision;
 - thread de monitoreo PLC;
-- un thread de grabacion por evento activo;
+- un thread de grabacion y procesamiento por evento activo;
+- un proceso FFmpeg con `codec copy` por cliente Live conectado;
 - threads de Flask para peticiones HTTP.
+
+La interfaz tambien queda separada por responsabilidad: HTML en `templates/`,
+CSS en `static/css/` y JavaScript en `static/js/`. No se deben volver a
+introducir strings de pagina en el backend.
 
 PostgreSQL no debe obligar a compartir una sola conexion entre threads. Se debe
 usar un pool de conexiones y una transaccion corta por operacion.
@@ -682,8 +732,13 @@ El resultado del procesador debe conservar los numeros sin formatear:
 }
 ```
 
-Las imagenes base64 pueden seguir en `/api/live/frame`, pero no deben guardarse
-como base64 en PostgreSQL.
+El endpoint completo `/api/live/frame` conserva compatibilidad con clientes
+anteriores. La UI usa `/api/live/frame?metadata=1` para recibir solo geometria y
+mediciones, y `/api/live/stream.mp4` para recibir H.264 a 20 FPS dentro de
+fragmented MP4. FFmpeg usa `codec copy`: el navegador decodifica el video y el
+backend no genera un JPEG por frame. `/api/live/image.jpg` queda disponible
+solo bajo demanda para compatibilidad. Ninguna imagen debe guardarse como
+base64 en PostgreSQL.
 
 ## 9. Configuracion y reproducibilidad
 
@@ -1034,8 +1089,8 @@ nueva fila por cada reconexion.
 1. Cerrar correctamente `VideoWriter`.
 2. Finalizar la copia H.264 raw temporal y verificar resolucion, FPS y duracion
    desde el contenedor MP4.
-3. Verificar si YOLO detecto al menos una pieza en cualquier snapshot de los
-   8 segundos.
+3. Verificar si YOLO detecto al menos una pieza en cualquiera de los frames
+   procesados de los 8 segundos.
 4. Si no hubo piezas, eliminar ambos MP4, snapshots temporales y evento pendiente;
    no mostrar esa ventana en `History`.
 5. Procesar de forma dedicada el frame de camara mas cercano inmediatamente
@@ -1062,12 +1117,11 @@ La regla aplicada en el Live MVP es:
 2. capturar del buffer el frame de camara mas cercano cuyo tiempo sea igual o
    anterior a `event_read_monotonic`;
 3. procesar ese frame de forma dedicada y alinearlo al instante del evento;
-4. si el procesamiento dedicado falla, usar como fallback el primer snapshot
-   procesado a partir de la señal;
-5. guardar todos los snapshots como evidencia;
+4. procesar tambien todos los frames restantes del clip para construir el MP4
+   con overlays y decidir si existe al menos una pieza;
+5. persistir como evidencia JPEG solamente el snapshot canonico de la señal;
 6. crear `piece_measurement` solamente desde ese snapshot canonico;
-7. guardar en el sidecar el retraso configurado, el offset canonico y el offset
-   real del frame fuente respecto a la señal.
+7. guardar en el sidecar los offsets y `processed_source_frame_count`.
 
 La seleccion es temporal y deliberadamente no cambia a otro frame por tener
 mayor confianza o mas piezas. Asi, la medida corresponde al instante definido
@@ -1181,8 +1235,8 @@ Debe devolver:
 - diagnosticos YOLO/Sobel.
 
 La UI muestra una sola imagen en `Processing evidence`: el overlay original
-del snapshot canonico con perimetro verde. Los demas snapshots permanecen
-persistidos para auditoria, pero no se renderizan como galeria.
+del snapshot canonico con perimetro verde. Los demas frames se procesan para
+generar el MP4, pero no se persisten como una galeria de JPEG.
 
 ### 16.3 Edicion de medida por pieza
 
@@ -1455,7 +1509,10 @@ temporal explicito, no una cola activada por errores de PostgreSQL.
 - [x] Hacer visible/configurable la IP de camara.
 - [x] Conservar credenciales AXIS fuera del repo.
 - [x] Pedir `2880x2160` para Live y para el RAW temporal.
-- [x] Mantener YOLO a 10 FPS y copiar H.264 raw a 30 FPS sin decodificar.
+- [x] Ejecutar YOLO/Sobel solo en clips PLC, procesando todos sus frames fuente,
+  y copiar H.264 raw a 30 FPS sin decodificar.
+- [x] Servir el Live a 20 FPS con H.264 copy, fragmented MP4 y metadata compacta.
+- [x] Decodificar H.264 del Live con NVIDIA NVDEC y fallback automatico a OpenCV.
 
 ### `requirements.txt`
 
@@ -1597,6 +1654,11 @@ continua pendiente.
 - el MP4 procesado reporta 80 frames a 10 FPS y 8 segundos;
 - el MP4 procesado comienza 2 segundos antes de la señal y termina 6 segundos
   despues;
+- todos los frames fuente usados por el MP4 pasan por homografia, YOLO y Sobel;
+- el colector por evento conserva la secuencia aunque la inferencia sea mas
+  lenta que la captura durante parte de la ventana;
+- sin una ventana PLC activa, `processed_count` no aumenta y el navegador
+  reproduce el H.264 original sin procesamiento;
 - el MP4 raw reporta aproximadamente 240 frames a 30 FPS y 8 segundos;
 - el raw no contiene overlays ni perimetro verde;
 - la medicion canonica usa el frame de camara mas cercano inmediatamente
@@ -1641,13 +1703,44 @@ Para 15 FPS:
 presupuesto promedio por frame <= 66.7 ms
 ```
 
+La vista Live de 20 FPS copia H.264 sin presupuesto de JPEG en Python. La
+decodificacion NVDEC del buffer, la inferencia PLC y el MP4 procesado permanecen
+en 10 FPS.
+
+Baseline validado el 2026-08-24 con un clip retenido a `2880x2160`, YOLO v3
+`imgsz=960` y NVIDIA L40S:
+
+| Medida | Antes | Optimizado |
+|---|---:|---:|
+| Pipeline de vision, mediana | 110.32 ms | 68.88 ms |
+| Pipeline de vision, p95 | 137.26 ms | 89.40 ms |
+| Analisis + envio al encoder, mediana | secuencial | 69.08 ms |
+| Throughput de procesamiento | menor a 10 FPS | 13.28 FPS |
+| Throughput total con flush MP4 | menor a 10 FPS | 11.12 FPS |
+
+Cuellos corregidos:
+
+- el navegador usa H.264 copy a 20 FPS y no dispara YOLO/JPEG;
+- el buffer PLC decodifica solamente 10 FPS con NVDEC;
+- no se genera JPEG en cada frame, solo en la evidencia canonica;
+- clips solapados reutilizan resultados por indice de frame y fingerprint de
+  modelo/configuracion;
+- NVIDIA NVENC escribe en una cola de fondo mientras se analiza el frame
+  siguiente;
+- `stage_durations_ms`, cache hits/misses y encoder aparecen en status/sidecar.
+
+Se probo homografia con PyTorch CUDA y fue descartada: el viaje completo
+CPU -> GPU -> CPU costo una mediana de 53.86 ms, frente a 27.04 ms con
+`cv2.warpPerspective`. La distribucion eficiente en este host es NVDEC, YOLO y
+NVENC en GPU, con homografia, reglas, Sobel y overlays en CPU.
+
 Para 30 FPS:
 
 ```text
 presupuesto promedio por frame <= 33.3 ms
 ```
 
-Medir por separado:
+El sidecar y `/api/live/status` permiten medir por separado:
 
 - captura;
 - warp;
@@ -1655,7 +1748,8 @@ Medir por separado:
 - reglas;
 - Sobel total;
 - overlays;
-- JPEG;
+- evidencia JPEG;
+- envio y escritura NVENC;
 - DB.
 
 No bajar la resolucion original guardada para compensar inferencia. Si hace
@@ -1768,19 +1862,23 @@ Test-Path outputs\table_measurement_calibration.json
 Test-Path runs\detect\runs_tx2\yolo11n_pieces_v3\weights\best.pt
 ```
 
-Validar PostgreSQL:
+Validar el backend vigente:
 
 ```powershell
-Test-NetConnection 127.0.0.1 -Port 5432
+Test-Path outputs\tx2_live_mvp.sqlite3
 ```
 
-Configurar:
+Configurar camara:
 
 ```powershell
-$env:TX2_POSTGRES_DSN = "host=127.0.0.1 port=5432 dbname=tx2_vision user=tx2_vision_app connect_timeout=5"
 $env:AXIS_USER = "..."
 $env:AXIS_PASSWORD = "..."
 ```
+
+No definir `TX2_POSTGRES_DSN` para el despliegue acordado. La publicacion IIS,
+el servicio Windows y la futura migracion SQL Server se detallan en
+`docs/WINDOWS_IIS_DEPLOYMENT_PLAN.md`. La Fase 1 de ese documento sigue
+pendiente: runtime con ciclo de vida explicito, Waitress y launcher productivo.
 
 Ejecutar primero con video:
 
@@ -1864,6 +1962,8 @@ La integracion esta terminada cuando:
 - [x] Dos señales cercanas conservan dos clips independientes de 8 segundos.
 - [x] El evento tiene un snapshot canonico explicable.
 - [x] La medicion canonica se toma en la señal PLC.
+- [x] YOLO y Sobel quedan inactivos fuera de una ventana PLC.
+- [x] Todos los frames fuente del clip PLC se procesan antes de escribir el MP4.
 - [x] El perimetro verde queda visible en Live y grabado en el MP4.
 - [x] History lista eventos desde la base seleccionada.
 - [x] El operador puede corregir una pieza.

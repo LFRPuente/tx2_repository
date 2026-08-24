@@ -16,6 +16,77 @@ import live_mvp_app as live
 
 
 class LiveVisionPipelineTests(unittest.TestCase):
+    def test_nvdec_camera_command_uses_nvidia_decoder_and_bgr_output(self) -> None:
+        command = live.build_nvdec_camera_command(
+            Path("ffmpeg.exe"),
+            "rtsp://camera.example/stream",
+            10.0,
+        )
+
+        self.assertIn("h264_cuvid", command)
+        self.assertIn("fps=10,hwdownload,format=nv12,format=bgr24", command)
+        self.assertIn("bgr24", command)
+        self.assertEqual(command[-1], "pipe:1")
+
+    def test_resolution_dimensions_parses_native_axis_resolution(self) -> None:
+        self.assertEqual(live.resolution_dimensions("2880x2160"), (2880, 2160))
+
+    def test_live_stream_command_copies_h264_into_fragmented_mp4(self) -> None:
+        command = live.build_live_stream_command(
+            Path("ffmpeg.exe"),
+            "rtsp://camera.example/stream",
+            rtsp_source=True,
+        )
+
+        self.assertIn("-rtsp_transport", command)
+        self.assertEqual(command[command.index("-c:v") + 1], "copy")
+        self.assertIn(
+            "frag_keyframe+empty_moov+default_base_moof",
+            command,
+        )
+        self.assertEqual(command[-2:], ["mp4", "pipe:1"])
+        self.assertNotIn("h264_nvenc", command)
+
+    def test_clip_writer_command_uses_nvidia_encoder(self) -> None:
+        command = live.build_nvenc_writer_command(
+            Path("ffmpeg.exe"),
+            Path("clip.mp4"),
+            10.0,
+            (2880, 2160),
+            16.0,
+        )
+
+        self.assertEqual(command[command.index("-c:v") + 1], "h264_nvenc")
+        self.assertEqual(command[command.index("-pix_fmt") + 1], "bgr24")
+        self.assertIn("2880x2160", command)
+        self.assertNotIn("libx264", command)
+
+    def test_nvenc_probe_uses_a_supported_frame_size(self) -> None:
+        completed = SimpleNamespace(returncode=0, stderr="")
+        with patch.object(live.subprocess, "run", return_value=completed) as run:
+            available, error = live.validate_nvenc(Path("ffmpeg.exe"))
+
+        command = run.call_args.args[0]
+        self.assertTrue(available)
+        self.assertEqual(error, "")
+        self.assertIn("color=size=256x256:rate=1", command)
+
+    def test_live_rtsp_url_requests_twenty_fps(self) -> None:
+        url = live.build_live_rtsp_url(
+            SimpleNamespace(
+                camera_user="",
+                camera_password="",
+                camera_ip="camera.example",
+                codec="h264",
+                camera_resolution="2880x2160",
+                live_stream_fps=20.0,
+                live_rtsp_url="",
+            )
+        )
+
+        self.assertIn("resolution=2880x2160", url)
+        self.assertIn("fps=20", url)
+
     def test_live_processor_reports_resolved_inference_device(self) -> None:
         device_info = {
             "requested": "auto",
@@ -40,6 +111,30 @@ class LiveVisionPipelineTests(unittest.TestCase):
         self.assertEqual(status["inference_device"], "cuda:0")
         self.assertEqual(status["inference_device_name"], "NVIDIA L40S")
         self.assertTrue(status["cuda_available"])
+        self.assertEqual(status["homography_backend"], "opencv_cpu")
+
+    def test_idle_live_processor_does_not_process_or_encode_frames(self) -> None:
+        buffer = live.FrameBuffer(maxlen=8)
+        buffer.append(
+            {
+                "index": 3,
+                "utc": "frame-3",
+                "monotonic": 10.0,
+                "frame": np.zeros((24, 32, 3), dtype=np.uint8),
+            }
+        )
+        processor = live.LiveProcessor(
+            SimpleNamespace(device="cpu"),
+            buffer,
+        )
+
+        with patch.object(processor, "_process") as process:
+            status = processor.snapshot()
+
+        process.assert_not_called()
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["processing_mode"], "plc_triggered_clip")
+        self.assertEqual(status["processed_count"], 0)
 
     def test_live_processor_applies_calibrated_zones_and_keeps_box_rules(self) -> None:
         processor = live.LiveProcessor(
@@ -121,6 +216,52 @@ class LiveVisionPipelineTests(unittest.TestCase):
         self.assertEqual(result["box_rules"], diagnostics)
         self.assertEqual(result["pieces"], pieces)
         self.assertEqual(result["measurement_summary"], summary)
+        self.assertNotIn("_original_jpeg", result)
+        self.assertIn("_recording_frame", result)
+        self.assertIn("stage_durations_ms", result)
+        self.assertNotIn("original_image", result)
+        self.assertNotIn("rectified_image", result)
+
+        processor._set_state(result=result)
+        snapshot = processor.snapshot(include_images=True)
+        self.assertNotIn("_original_jpeg", snapshot["result"])
+        self.assertNotIn("_original_overlay", snapshot["result"])
+
+    def test_overlapping_clips_reuse_frame_analysis(self) -> None:
+        processor = live.LiveProcessor(
+            SimpleNamespace(device="cpu", processing_cache_frames=4),
+            live.FrameBuffer(maxlen=8),
+        )
+        item = {
+            "index": 23,
+            "utc": "frame-23",
+            "monotonic": 23.0,
+            "frame": np.zeros((8, 8, 3), dtype=np.uint8),
+        }
+        analyzed = {
+            "frame_index": 23,
+            "frame_utc": "frame-23",
+            "frame_monotonic": 23.0,
+            "pieces": [],
+            "calibration": {},
+            "_original_overlay": {},
+            "_recording_frame": {
+                "index": 23,
+                "utc": "frame-23",
+                "monotonic": 23.0,
+                "frame": item["frame"],
+                "raw_frame": item["frame"],
+            },
+        }
+
+        with patch.object(processor, "_process", return_value=analyzed) as process:
+            first, _ = processor.process_clip_frame(item)
+            second, _ = processor.process_clip_frame(item)
+
+        process.assert_called_once()
+        self.assertFalse(first["processing_cache_hit"])
+        self.assertTrue(second["processing_cache_hit"])
+        self.assertEqual(processor.snapshot()["processing_cache_hits"], 1)
 
 
 if __name__ == "__main__":

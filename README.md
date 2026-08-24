@@ -3,7 +3,7 @@
 Tools and MVP applications for TX2 piece-front measurement from video.
 
 The full implementation runbook for moving the calibration tool, red exclusion
-zones, individual-piece measurement, PostgreSQL persistence, and operator
+zones, individual-piece measurement, SQLite persistence, and operator
 corrections into the real-time MVP is:
 
 [`LIVE_MVP_INTEGRATION_README.md`](LIVE_MVP_INTEGRATION_README.md)
@@ -11,7 +11,9 @@ corrections into the real-time MVP is:
 ## Main Pieces
 
 - `homography_web_app.py`: Flask tool for homography, YOLO annotation, measurement calibration, Sobel front detection, and frame review.
-- `live_mvp_app.py`: live Flask MVP with AXIS video, PLC-triggered recording, measurement processing, and clip history.
+- `live_mvp_app.py`: Live MVP backend with AXIS video, PLC-triggered recording, measurement processing, APIs, and clip history.
+- `templates/`: Flask HTML views for Live, History, homography, ROI selection, and annotation.
+- `static/css/` and `static/js/`: presentation and browser behavior for every Flask app, kept outside the Python backends.
 - `mvp_react_app/`: React/Vite MVP showing the simplified measurement view with the real video overlay and a diagram.
 - `yolo_roi_sobel_projection.py`: YOLO ROI plus Sobel Y projection analysis.
 - `tools/plc_timestamp_probe.ipynb`: notebook to probe PLC/OPC UA timestamp tags from the VPN.
@@ -222,9 +224,9 @@ http://127.0.0.1:5173
 
 ## Run The Live MVP
 
-Configure the AXIS credentials in the terminal that will launch the app.
-While PostgreSQL is pending, the launcher automatically uses the local SQLite
-database `outputs/tx2_live_mvp.sqlite3`:
+Configure the AXIS credentials in the terminal that will launch the app. The
+current internal rollout uses the local SQLite database
+`outputs/tx2_live_mvp.sqlite3`:
 
 ```powershell
 $env:AXIS_USER="your-user"
@@ -255,13 +257,9 @@ python tools\import_live_sidecars_to_sqlite.py `
 The import is idempotent. The background reconciler also registers legacy
 sidecars that have not yet been associated with the selected backend.
 
-When PostgreSQL is available, set the DSN before launching. A configured
-PostgreSQL connection is never allowed to fail over silently to SQLite:
-
-```powershell
-$env:TX2_POSTGRES_DSN="host=127.0.0.1 port=5432 dbname=tx2_vision user=tx2_vision_app connect_timeout=5"
-.\run_live_mvp_app.ps1
-```
+Do not configure `TX2_POSTGRES_DSN` for the agreed Windows deployment. The
+legacy PostgreSQL repository remains in the codebase for compatibility and
+tests, but the next database target is an external Microsoft SQL Server.
 
 Then open:
 
@@ -271,12 +269,37 @@ http://127.0.0.1:8767
 
 The Live MVP provides a light interface with the live camera view and
 measurement diagram. It requests the AXIS stream at its configured
-`2880x2160` resolution and targets 10 FPS for capture, processing, browser
-updates, and processed clips. Live inference uses
+`2880x2160` resolution. The browser receives a separate 20 FPS fragmented MP4
+whose H.264 packets are copied without decoding or re-encoding. A 10 FPS NVDEC
+camera buffer feeds PLC inference and processed clips, so the smoother browser
+stream does not double YOLO/Sobel work or JPEG encoding. YOLO runs on CUDA and
+processed clips are written through an asynchronous NVIDIA NVENC queue. The
+homography intentionally stays in OpenCV CPU: on the deployed L40S host it is
+faster than transferring the full 2880x2160 frame to CUDA and back before YOLO.
+Live inference uses
 the individual-piece model at an initial confidence of `0.10`, applies the same
 geometric rules as the offline tool, filters boxes against configured exclusion
 zones before Sobel, and retains the full `box_rules` diagnostics. Measurements
 are shown in compact sixteenth-inch format such as `40' 9 1/16"`.
+
+### Live performance baseline
+
+Benchmark from 2026-08-24 using a retained `2880x2160` clip, YOLO v3 at
+`imgsz=960`, and the installed NVIDIA L40S:
+
+| Path | Before | Current |
+|---|---:|---:|
+| Vision frame, median | 110.32 ms | 68.88 ms |
+| Vision frame, p95 | 137.26 ms | 89.40 ms |
+| Analysis + video submission, median | sequential | 69.08 ms |
+| Processing throughput | below 10 FPS | 13.28 FPS |
+| End-to-end throughput including MP4 flush | below 10 FPS | 11.12 FPS |
+
+The previous path encoded a full JPEG for every processed frame and wrote H.264
+synchronously. The current path creates JPEG evidence only for the canonical
+PLC measurement frame, caches frame metadata for overlapping clips, and
+overlaps NVENC with the next frame's analysis. `/api/live/status` exposes the
+selected encoder, cache hit/miss counts, and the latest per-stage durations.
 
 It connects to the PLC through OPC UA and records one 8-second clip when
 `MeasureLength` changes from `False` to `True`. The recording is provisional
@@ -291,8 +314,8 @@ at 10 FPS. The camera currently uses its 4K capture mode and the raw URL forces
 a fixed frame cadence. Remove the flag and the three `--raw-*` launcher
 arguments when this temporary data collection is complete.
 
-The automatic per-piece measurements for a retained event come from the first
-processed frame at or after `PLC signal + 2.0 seconds`. At that instant, the
+The automatic per-piece measurements for a retained event come from the camera
+frame immediately preceding the PLC signal. At that instant, the
 Live camera perimeter turns green and the same green perimeter is embedded in
 the processed MP4 for 0.8 seconds. The sidecar records the configured delay,
 the actual selected-frame offset, and the marked video frame range.
@@ -330,8 +353,9 @@ stores all processing snapshots, selects one canonical snapshot, and persists
 the per-piece automatic measurements from the `PLC + 2.0 seconds` snapshot.
 Operator corrections preserve the
 automatic value and create immutable audit revisions with optimistic
-concurrency checks. SQLite mirrors the PostgreSQL entities so it can be migrated
-later without changing the Live or History API.
+concurrency checks. The SQLite schema keeps the event, piece, asset and revision
+boundaries needed for a later SQL Server adapter without changing the Live or
+History API.
 
 The live frame buffer is capped to avoid retaining several gigabytes of images.
 Processed clips are streamed directly to disk and resampled to the configured
@@ -346,8 +370,8 @@ Live MVP data is stored directly under:
 outputs/live_plc_clips/<date>/
 ```
 
-MP4 and JPEG assets remain on disk; SQLite or PostgreSQL stores event, snapshot,
-piece, asset and audit metadata. Sidecars record `db_sync_backend` so the
+MP4 and JPEG assets remain on disk; SQLite stores event, snapshot, piece, asset
+and audit metadata. Sidecars record `db_sync_backend` so the
 reconciler can idempotently register legacy clips and move between backends.
 If the configured database is temporarily unavailable after startup, the MP4
 and sidecar are kept with `db_sync_status: pending` and a background reconciler
@@ -360,48 +384,14 @@ retries them. For an explicit camera/PLC simulation only:
 The Live and History pages visibly report simulation mode and operator
 corrections are disabled.
 
-## PostgreSQL Server Setup
+## Database And Deployment Direction
 
-PostgreSQL remains the production target. SQLite is the approved temporary
-local backend while the Windows service is pending. Follow the PostgreSQL
-installation, security, credential, verification, and backup instructions in
-[`docs/postgresql_server_setup.md`](docs/postgresql_server_setup.md).
-
-The guide prepares the database service, `tx2_vision` database, and restricted
-`tx2_vision_app` login. After the service, password file, and
-`TX2_POSTGRES_DSN` are ready, apply the versioned schema:
-
-```powershell
-python tools\apply_postgres_migrations.py
-```
-
-Validate all existing sidecars without changing them:
-
-```powershell
-python tools\migrate_live_sidecars_to_postgres.py `
-  --dry-run `
-  --output-dir .\outputs `
-  --model .\runs\detect\runs_tx2\yolo11n_pieces_v3\weights\best.pt
-```
-
-Then run the idempotent import by removing `--dry-run`. The import enriches
-legacy sidecars with event/configuration identifiers, registers disk assets by
-relative path, and can be rerun safely. The schema and lifecycle contract are
-specified in
-[`LIVE_MVP_INTEGRATION_README.md`](LIVE_MVP_INTEGRATION_README.md).
-
-After SQLite has been used, validate and migrate all events and immutable
-operator revisions:
-
-```powershell
-python tools\migrate_sqlite_to_postgres.py --dry-run
-python tools\migrate_sqlite_to_postgres.py
-```
-
-The migration is idempotent. It preserves event IDs, per-piece automatic
-measurements, current operator overrides, revision numbers and audit
-timestamps. Keep the SQLite file until the PostgreSQL event and revision counts
-have been verified.
+SQLite is the active backend for the initial internal rollout. PostgreSQL is no
+longer the agreed production destination; its repository and migration tools
+remain available only as legacy code. The planned production path is Windows,
+IIS as the internal HTTPS reverse proxy, one application process, and a future
+external Microsoft SQL Server. Keep MP4/JPEG assets on disk and migrate only
+event, piece, measurement, asset-path and audit metadata.
 
 ## Next Steps On The TX2 Server
 
@@ -463,9 +453,9 @@ runs/detect/runs_tx2/yolo11n_pieces_v3/weights/best.pt
 Use this checklist for the on-machine validation:
 
 - [ ] Set `AXIS_USER` and `AXIS_PASSWORD`, then run `run_live_mvp_app.ps1`.
-- [ ] Confirm `TX2_POSTGRES_DSN` and `%APPDATA%\postgresql\pgpass.conf` belong to the Windows account running the MVP.
-- [ ] Run `tools\apply_postgres_migrations.py` and confirm the schema checksum is recorded.
-- [ ] Run the sidecar migrator in `--dry-run`, then import the existing clips.
+- [ ] Confirm `outputs\tx2_live_mvp.sqlite3` is writable by the Windows account running the MVP.
+- [ ] Confirm `/api/live/status` reports `nvidia_nvenc`, CUDA YOLO and a healthy SQLite backend.
+- [ ] Back up SQLite with the service stopped or through the SQLite backup API; include retained video assets.
 - [ ] Open `http://127.0.0.1:8767` and confirm the original camera image remains at its native resolution.
 - [ ] Confirm YOLO detects each piece independently in the rectified image and Sobel Y runs only inside each piece ROI.
 - [ ] Confirm boxes with more than 20% overlap in a saved red zone are discarded before Sobel.
@@ -476,10 +466,10 @@ Use this checklist for the on-machine validation:
 - [ ] Trigger two events less than eight seconds apart and verify that neither event is lost.
 - [ ] Verify each sidecar JSON contains the PLC source timestamp, watchdog value, frame timestamps, and processing snapshots.
 - [ ] Verify each saved MP4 keeps the camera resolution and reports 80 frames at 10 FPS for an 8-second window.
-- [ ] Verify PostgreSQL stores one event with zero or more per-piece automatic measurements.
+- [ ] Verify SQLite stores one event with zero or more per-piece automatic measurements.
 - [ ] Verify History can save and clear an operator measurement without changing the automatic value.
 - [ ] Verify every operator change creates an immutable audit revision.
-- [ ] Stop PostgreSQL during a test event, confirm the sidecar becomes `pending`, restart PostgreSQL, and confirm reconciliation changes it to `synced`.
+- [ ] Confirm the reconciler restores a retained sidecar event missing from SQLite.
 - [ ] Leave the app running for at least 30 minutes and confirm the frame buffer stays capped and process memory does not grow continuously.
 
 After the live validation, decide the production host binding, Windows service

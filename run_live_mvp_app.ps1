@@ -118,17 +118,21 @@ else {
   --camera-ip $CameraIp `
   --codec h264 `
   --camera-resolution 2880x2160 `
+  --camera-decoder nvdec `
   --output-dir $outputDir `
   --dataset-dir $datasetDir `
   --model $modelPath `
   --device $Device `
   --conf $Confidence `
   --capture-fps 10 `
-  --process-fps 10 `
+  --live-stream-fps 20 `
   --buffer-seconds 3 `
   --buffer-max-frames 60 `
   --record-seconds 8 `
   --record-fps 10 `
+  --video-encoder nvenc `
+  --video-bitrate-mbps 16 `
+  --processing-cache-frames 160 `
   --pre-trigger-seconds 2 `
   --save-raw-clips `
   --raw-camera-resolution 2880x2160 `
