@@ -1,4 +1,5 @@
 param(
+    [switch]$Production,
     [switch]$DatabaseDisabled,
     [string]$SqlitePath,
     [ValidateRange(0.01, 1.0)]
@@ -11,7 +12,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$scriptPath = Join-Path $root "live_mvp_app.py"
+$scriptPath = Join-Path $root $(
+    if ($Production) { "run_live_mvp_production.py" } else { "live_mvp_app.py" }
+)
 $outputDir = Join-Path $root "outputs"
 $defaultSqlitePath = Join-Path $outputDir "tx2_live_mvp.sqlite3"
 $datasetDir = Join-Path $root "dataset_pieces"
@@ -110,6 +113,12 @@ else {
     Write-Host "Database: SQLite temporal ($SqlitePath)"
 }
 
+$serverArgs = @()
+if ($Production) {
+    $serverArgs += @("--waitress-threads", "8")
+    Write-Host "Server: Waitress on 127.0.0.1:8767"
+}
+
 # This MVP is live by default: Python reads the AXIS camera directly through RTSP.
 # If the camera requires auth, set AXIS_USER and AXIS_PASSWORD before running.
 # To test with a file temporarily, change --source rtsp to --source video and pass --video.
@@ -125,7 +134,7 @@ else {
   --device $Device `
   --conf $Confidence `
   --capture-fps 10 `
-  --live-stream-fps 20 `
+  --live-stream-fps 10 `
   --buffer-seconds 3 `
   --buffer-max-frames 60 `
   --record-seconds 8 `
@@ -136,10 +145,11 @@ else {
   --pre-trigger-seconds 2 `
   --save-raw-clips `
   --raw-camera-resolution 2880x2160 `
-  --raw-record-fps 30 `
+  --raw-record-fps 10 `
   --measurement-delay-seconds 0 `
   --max-clips 100 `
   --plc-enabled `
   --plc-edge rising `
   --port 8767 `
-  @databaseArgs
+  @databaseArgs `
+  @serverArgs

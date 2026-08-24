@@ -398,6 +398,21 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual([item["frame_index"] for item in selected], [2])
 
 class ClipRecorderTests(unittest.TestCase):
+    def test_shutdown_rejects_new_plc_recordings(self) -> None:
+        args = SimpleNamespace(record_seconds=8.0)
+        recorder = ClipRecorder(args, FrameBuffer(maxlen=8))
+
+        recorder.stop(timeout_seconds=0.1)
+        recorder.start_event_clip(
+            {
+                "event_edge": "rising",
+                "event_read_monotonic": time.perf_counter(),
+            }
+        )
+
+        self.assertEqual(recorder.snapshot()["clip_index"], 0)
+        self.assertTrue(recorder.snapshot()["shutting_down"])
+
     def test_frame_collector_preserves_clip_frames_while_processing_lags(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             args = SimpleNamespace(

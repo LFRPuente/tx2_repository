@@ -54,7 +54,7 @@ Cuando esta integracion termine, un ciclo de produccion debe verse asi:
 1. La camara AXIS entrega frames originales a resolucion nativa.
 2. El `CameraReader` conserva un buffer acotado y asigna a cada frame un indice,
    una hora UTC y un tiempo monotonico local.
-3. Mientras no hay un evento PLC, el navegador recibe H.264 a 20 FPS mediante
+3. Mientras no hay un evento PLC, el navegador recibe H.264 a 10 FPS mediante
    copia directa y el `LiveProcessor` no ejecuta YOLO, Sobel ni homografia.
 4. Cuando llega la señal PLC, cada frame fuente de la ventana completa de
    8 segundos se rectifica con la homografia guardada.
@@ -84,7 +84,7 @@ Cuando esta integracion termine, un ciclo de produccion debe verse asi:
     la base seleccionada.
 17. En `History`, el operador puede capturar una medida real para cada pieza.
 18. Temporalmente, cada evento valido tambien copia el H.264 crudo desde un
-    stream AXIS separado a `2880x2160`, 30 FPS y sin overlays. Esta copia
+    stream AXIS separado a `2880x2160`, 10 FPS y sin overlays. Esta copia
     directa comienza con la señal; el prebuffer de 2 segundos pertenece al MP4
     procesado mostrado en History.
 19. La medida automatica nunca se sobrescribe. Cada cambio del operador queda
@@ -172,7 +172,7 @@ http://127.0.0.1:8767/history
 Responsabilidades actuales:
 
 - leer RTSP de la camara AXIS;
-- servir al navegador H.264 `2880x2160` a 20 FPS mediante fragmented MP4 y
+- servir al navegador H.264 `2880x2160` a 10 FPS mediante fragmented MP4 y
   `codec copy`, sin JPEG ni inferencia mientras no hay una ventana PLC activa;
 - ejecutar homografia, YOLO, reglas, Sobel y medicion sobre todos los frames
   fuente de cada clip disparado por PLC;
@@ -455,11 +455,11 @@ no una aprobacion final de produccion.
 
 ```mermaid
 flowchart LR
-    Camera["AXIS camera"] --> BrowserCopy["H.264 copy<br/>2880x2160 @ 20 FPS"]
+    Camera["AXIS camera"] --> BrowserCopy["H.264 copy<br/>2880x2160 @ 10 FPS"]
     BrowserCopy --> LiveMP4["Fragmented MP4<br/>/api/live/stream.mp4"]
     LiveMP4 --> LiveUI["Live UI"]
     Camera --> Reader["CameraReader<br/>NVIDIA NVDEC @ 10 FPS"]
-    Camera --> RawCopy["Temporary H.264 copy<br/>2880x2160 @ 30 FPS"]
+    Camera --> RawCopy["Temporary H.264 copy<br/>2880x2160 @ 10 FPS"]
     Reader --> RecordingBuffer["PLC buffer<br/>10 FPS"]
     Event --> Processor["LiveProcessor<br/>all frames in PLC clip"]
     RecordingBuffer --> Processor
@@ -734,7 +734,7 @@ El resultado del procesador debe conservar los numeros sin formatear:
 
 El endpoint completo `/api/live/frame` conserva compatibilidad con clientes
 anteriores. La UI usa `/api/live/frame?metadata=1` para recibir solo geometria y
-mediciones, y `/api/live/stream.mp4` para recibir H.264 a 20 FPS dentro de
+mediciones, y `/api/live/stream.mp4` para recibir H.264 a 10 FPS dentro de
 fragmented MP4. FFmpeg usa `codec copy`: el navegador decodifica el video y el
 backend no genera un JPEG por frame. `/api/live/image.jpg` queda disponible
 solo bajo demanda para compatibilidad. Ninguna imagen debe guardarse como
@@ -1510,8 +1510,8 @@ temporal explicito, no una cola activada por errores de PostgreSQL.
 - [x] Conservar credenciales AXIS fuera del repo.
 - [x] Pedir `2880x2160` para Live y para el RAW temporal.
 - [x] Ejecutar YOLO/Sobel solo en clips PLC, procesando todos sus frames fuente,
-  y copiar H.264 raw a 30 FPS sin decodificar.
-- [x] Servir el Live a 20 FPS con H.264 copy, fragmented MP4 y metadata compacta.
+  y copiar H.264 raw a 10 FPS sin decodificar.
+- [x] Servir el Live a 10 FPS con H.264 copy, fragmented MP4 y metadata compacta.
 - [x] Decodificar H.264 del Live con NVIDIA NVDEC y fallback automatico a OpenCV.
 
 ### `requirements.txt`
@@ -1659,7 +1659,7 @@ continua pendiente.
   lenta que la captura durante parte de la ventana;
 - sin una ventana PLC activa, `processed_count` no aumenta y el navegador
   reproduce el H.264 original sin procesamiento;
-- el MP4 raw reporta aproximadamente 240 frames a 30 FPS y 8 segundos;
+- el MP4 raw reporta aproximadamente 80 frames a 10 FPS y 8 segundos;
 - el raw no contiene overlays ni perimetro verde;
 - la medicion canonica usa el frame de camara mas cercano inmediatamente
   anterior a la señal PLC y conserva su offset fuente;
@@ -1703,7 +1703,7 @@ Para 15 FPS:
 presupuesto promedio por frame <= 66.7 ms
 ```
 
-La vista Live de 20 FPS copia H.264 sin presupuesto de JPEG en Python. La
+La vista Live de 10 FPS copia H.264 sin presupuesto de JPEG en Python. La
 decodificacion NVDEC del buffer, la inferencia PLC y el MP4 procesado permanecen
 en 10 FPS.
 
@@ -1720,7 +1720,7 @@ Baseline validado el 2026-08-24 con un clip retenido a `2880x2160`, YOLO v3
 
 Cuellos corregidos:
 
-- el navegador usa H.264 copy a 20 FPS y no dispara YOLO/JPEG;
+- el navegador usa H.264 copy a 10 FPS y no dispara YOLO/JPEG;
 - el buffer PLC decodifica solamente 10 FPS con NVDEC;
 - no se genera JPEG en cada frame, solo en la evidencia canonica;
 - clips solapados reutilizan resultados por indice de frame y fingerprint de
@@ -1755,6 +1755,11 @@ El sidecar y `/api/live/status` permiten medir por separado:
 No bajar la resolucion original guardada para compensar inferencia. Si hace
 falta, procesar una frecuencia menor que la captura o usar optimizacion
 TensorRT, manteniendo el frame original para evidencia.
+
+La consulta VAPIX y la prueba RTSP realizadas el 2026-08-24 confirmaron que el
+modo de captura desplegado acepta `2880x2160 @ 10 FPS` y devuelve HTTP 400 al
+solicitar 11 FPS o mas. No se debe cambiar el capture mode para ganar cadencia
+sin volver a validar encuadre, homografia y calibracion.
 
 ## 24. Health y observabilidad
 
@@ -1877,8 +1882,9 @@ $env:AXIS_PASSWORD = "..."
 
 No definir `TX2_POSTGRES_DSN` para el despliegue acordado. La publicacion IIS,
 el servicio Windows y la futura migracion SQL Server se detallan en
-`docs/WINDOWS_IIS_DEPLOYMENT_PLAN.md`. La Fase 1 de ese documento sigue
-pendiente: runtime con ciclo de vida explicito, Waitress y launcher productivo.
+`docs/WINDOWS_IIS_DEPLOYMENT_PLAN.md`. La Fase 1 esta implementada: runtime con
+ciclo de vida explicito, endpoint `/api/health`, Waitress y launcher productivo
+de un solo proceso.
 
 Ejecutar primero con video:
 
@@ -1896,9 +1902,18 @@ Ejecutar live:
 .\run_live_mvp_app.ps1
 ```
 
-Antes de produccion confirmar la IP real de camara. El codigo/launcher actual
-usa `10.14.115.241`, mientras documentacion previa tambien menciona
-`10.14.115.74` y `10.14.115.75`. No se debe adivinar el endpoint final.
+Ejecutar el backend productivo para IIS:
+
+```powershell
+.\run_live_mvp_production.ps1
+```
+
+Waitress permanece en `127.0.0.1:8767`. La URL interna objetivo es
+`https://tx2-measurement.barnstxprod.local` una vez que TI publique DNS,
+certificado, IIS/ARR y el servicio Windows.
+
+La camara desplegada y validada por el launcher es `10.14.115.241`. No cambiar
+ese endpoint basandose en direcciones historicas sin una prueba fisica.
 
 La captura raw se habilita temporalmente con `--save-raw-clips`. Para retirarla,
 se elimina esa bandera y los argumentos `--raw-camera-resolution` y

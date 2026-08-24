@@ -1,8 +1,8 @@
 # TX2 Live MVP: plan de despliegue en Windows con IIS
 
-Estado: decision de arquitectura y trabajo pendiente  
+Estado: backend productivo listo; infraestructura IIS/DNS pendiente de TI
 Fecha: 2026-08-24  
-Rama revisada: `codex/live-mvp-integration`
+Rama revisada: `main`
 
 ## 1. Objetivo
 
@@ -42,15 +42,17 @@ en el servidor TX2 siguiendo esas instrucciones.
 Actualmente el Live MVP:
 
 - usa Flask;
-- arranca con `run_live_mvp_app.ps1`;
+- conserva `run_live_mvp_app.ps1` para desarrollo y diagnostico;
+- arranca en produccion con `run_live_mvp_production.ps1` y Waitress;
 - escucha solamente en `127.0.0.1:8767`;
-- usa el servidor de desarrollo incluido en Flask (`app.run`);
-- abre la camara, el procesador, el PLC y el reconciliador como threads del
-  mismo proceso;
+- posee un runtime explicito que inicia y detiene camara, procesador, recorder,
+  PLC, reconciliador y base de datos dentro de un solo proceso;
 - guarda el historial temporal en SQLite;
 - conserva videos e imagenes en disco y solo guarda sus rutas y metadatos en
   la base de datos;
-- no tiene configuracion IIS;
+- incluye `deployment/iis/web.config` y `deployment/configure_iis.ps1` para el
+  reverse proxy IIS;
+- expone `/api/health` sin rutas, secretos ni datos sensibles;
 - no tiene `Dockerfile` ni archivo de Docker Compose;
 - no tiene autenticacion corporativa implementada en Flask;
 - no tiene un adaptador para SQL Server.
@@ -64,16 +66,22 @@ Configuracion live importante en el launcher actual:
 
 ```text
 Web local:       http://127.0.0.1:8767
+URL objetivo:    https://tx2-measurement.barnstxprod.local
 Camara default:  10.14.115.241
 Resolucion:      2880x2160
 YOLO/Sobel:      10 FPS objetivo
-Raw temporal:    30 FPS
+Live/Raw:        10 FPS (maximo del capture mode actual)
 PLC OPC UA:      opc.tcp://10.14.6.48:49320
 Trigger:         ns=2;s=ControlLogix.AS20.VisionSystem.MeasureLength
 Watchdog:        ns=2;s=ControlLogix.AS20.VisionSystem.VisionWD
 Grabacion:       8 segundos por evento
 Medicion:        frame inmediatamente anterior/alineado a la senal PLC
 ```
+
+La camara fue consultada por VAPIX y probada por RTSP el 2026-08-24. El capture
+mode vigente admite `2880x2160 @ 10 FPS`; solicitudes de 11, 12, 15, 20, 25 o
+30 FPS devuelven `400 Bad Request`. No se cambia el capture mode porque puede
+alterar el encuadre y obligaria a recalibrar homografia y mediciones.
 
 ## 4. Arquitectura recomendada para la primera etapa
 
@@ -121,27 +129,26 @@ IIS y Flask no cumplen la misma funcion:
 IIS debe ser el unico servicio visible desde la red. El puerto `8767` debe
 seguir enlazado a `127.0.0.1` y no debe abrirse en Windows Firewall.
 
-## 5. Cambios de codigo requeridos antes de conectar IIS
+## 5. Backend productivo implementado
 
-No se debe publicar `app.run` como servidor de produccion. Para usar Waitress
-u otro servidor WSGI primero hay que separar la inicializacion del runtime del
-metodo `main()` actual.
+No se publica `app.run` como servidor de produccion. La Fase 1 quedo
+implementada con:
 
-Trabajo requerido:
+1. `LiveMvpRuntime` como propietario del ciclo de vida de camara, procesador,
+   recorder, PLC, reconciliador y base de datos.
+2. Inicio unico y apagado ordenado, incluyendo espera de grabaciones activas.
+3. `run_live_mvp_production.py` como punto de entrada WSGI Waitress.
+4. `run_live_mvp_production.ps1` como launcher productivo.
+5. Waitress fijado en `requirements.txt`.
+6. Binding exclusivo en `127.0.0.1:8767` con ocho threads.
+7. Endpoint `/api/health` que solo informa checks booleanos.
+8. `run_live_mvp_app.ps1` conservado para desarrollo y diagnostico.
 
-1. Extraer una clase o componente que posea el ciclo de vida de camara,
-   procesador, recorder, PLC, reconciliador y base de datos.
-2. Implementar inicio y apagado explicitos de ese runtime.
-3. Crear una fabrica de aplicacion Flask o un punto de entrada WSGI que
-   inicialice el runtime exactamente una vez.
-4. Reemplazar `app.run` por Waitress para el despliegue Windows.
-5. Agregar `waitress` a `requirements.txt`.
-6. Implementar apagado ordenado para cerrar RTSP, OPC UA, SQLite y grabaciones.
-7. Mantener un solo proceso de aplicacion mientras posea la camara y el PLC.
-8. Agregar una comprobacion de salud apta para IIS que no exponga secretos.
-9. Conservar `run_live_mvp_app.ps1` como modo de desarrollo y diagnostico.
-10. Agregar un launcher de produccion separado para evitar confundir ambos
-    modos.
+Comando productivo:
+
+```powershell
+.\run_live_mvp_production.ps1 -Device auto
+```
 
 No se deben configurar varios workers o replicas del Live MVP actual. Dos
 procesos abririan dos conexiones a la camara y al PLC, cargarian YOLO dos veces
@@ -186,13 +193,43 @@ Documentacion de referencia de Microsoft:
 Configuracion objetivo:
 
 ```text
-URL publica interna: https://<nombre-interno-aprobado>/
+URL publica interna: https://tx2-measurement.barnstxprod.local/
+DNS interno:         tx2-measurement.barnstxprod.local -> 10.14.6.84
 Binding IIS:         443 con certificado de la CA interna
 Backend local:       http://127.0.0.1:8767/
 Anonymous auth:      deshabilitada
 Windows auth:        habilitada
 Firewall:            443 solo desde redes aprobadas de Nucor
 ```
+
+Configuracion versionada:
+
+```text
+deployment/iis/web.config
+deployment/configure_iis.ps1
+```
+
+Cuando TI haya instalado los componentes y entregado el certificado y las
+redes VPN autorizadas, ejecutar en PowerShell elevado:
+
+```powershell
+.\deployment\configure_iis.ps1 `
+  -CertificateThumbprint "<thumbprint-CA-interna>" `
+  -AllowedRemoteAddress "<subred-VPN-aprobada>"
+```
+
+Auditoria del host del 2026-08-24:
+
+- IP del servidor: `10.14.6.84`;
+- el nombre objetivo aun no resuelve en DNS;
+- IIS, WAS, URL Rewrite y ARR no estan instalados;
+- no hay certificado de maquina para el nombre objetivo;
+- la sesion actual no tiene elevacion administrativa.
+
+Por esos cuatro bloqueos de infraestructura, el script queda listo e
+idempotente pero no se puede activar el HTTPS corporativo desde esta sesion.
+No se debe sustituir esta configuracion con un hosts file ni exponer Waitress
+en `0.0.0.0`.
 
 Antes de activar Windows Authentication se debe obtener el grupo de Active
 Directory autorizado. La aplicacion tambien debe dejar de confiar en el nombre
@@ -357,11 +394,11 @@ una prueba separada de GPU.
 
 ### Fase 1: servidor Flask productivo
 
-- [ ] Separar el ciclo de vida del runtime de vision.
-- [ ] Agregar punto de entrada WSGI productivo.
-- [ ] Agregar Waitress y launcher de produccion.
-- [ ] Garantizar una sola instancia de vision.
-- [ ] Probar inicio, error y apagado ordenado.
+- [x] Separar el ciclo de vida del runtime de vision.
+- [x] Agregar punto de entrada WSGI productivo.
+- [x] Agregar Waitress y launcher de produccion.
+- [x] Garantizar una sola instancia de vision.
+- [x] Probar inicio, error y apagado ordenado.
 
 ### Fase 2: servicio Windows
 
@@ -373,6 +410,8 @@ una prueba separada de GPU.
 
 ### Fase 3: IIS interno
 
+- [x] Versionar `web.config` y script idempotente de configuracion IIS.
+- [x] Reservar `tx2-measurement.barnstxprod.local` como nombre objetivo.
 - [ ] Instalar IIS, URL Rewrite, ARR y Windows Authentication.
 - [ ] Crear DNS interno y certificado aprobado.
 - [ ] Configurar reverse proxy hacia `127.0.0.1:8767`.
@@ -443,9 +482,11 @@ una prueba separada de GPU.
 - No combinar en una sola entrega la publicacion IIS, Django, Docker y SQL
   Server.
 
-## 16. Proximo cambio de codigo
+## 16. Proximo paso operativo
 
-El siguiente trabajo recomendado es la Fase 1: convertir el arranque acoplado
-de `live_mvp_app.py` en un runtime con ciclo de vida explicito y servir Flask
-con Waitress en `127.0.0.1:8767`. Despues se puede instalar IIS sin cambiar el
-algoritmo de vision, la resolucion de la camara ni el modelo YOLO.
+TI debe crear el registro DNS, emitir el certificado, instalar IIS/ARR/URL
+Rewrite/Windows Authentication y entregar la cuenta de servicio y subred VPN
+autorizada. Con esos datos se ejecuta `deployment/configure_iis.ps1`, se
+registra el launcher Waitress como servicio Windows y se valida HTTPS desde una
+segunda computadora conectada a la VPN. Ninguno de esos pasos requiere cambiar
+el algoritmo de vision, la resolucion, la homografia ni el modelo YOLO.

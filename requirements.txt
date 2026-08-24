@@ -7,3 +7,4 @@ opencv-python
 pillow
 psycopg[binary,pool]>=3.2,<4
 ultralytics
+waitress>=3.0,<4

@@ -14,6 +14,12 @@ Server. This supersedes the older PostgreSQL deployment target. See:
 
 [`docs/WINDOWS_IIS_DEPLOYMENT_PLAN.md`](docs/WINDOWS_IIS_DEPLOYMENT_PLAN.md)
 
+The production backend is served by Waitress on loopback. The internal URL
+reserved for the IIS publication is
+`https://tx2-measurement.barnstxprod.local`; corporate DNS, an internal-CA
+certificate, IIS/ARR, and the Windows service account must be supplied by IT
+before that hostname is reachable from VPN clients.
+
 ## Main Pieces
 
 - `homography_web_app.py`: Flask tool for homography, YOLO annotation, measurement calibration, Sobel front detection, and frame review.
@@ -251,6 +257,17 @@ launcher prefers `.venv-gpu\Scripts\python.exe` automatically and resolves
 .\run_live_mvp_app.ps1 -Device auto
 ```
 
+Use the single-process Waitress launcher for the IIS backend:
+
+```powershell
+.\run_live_mvp_production.ps1 -Device auto
+```
+
+It binds only to `127.0.0.1:8767`. Verify it locally with
+`http://127.0.0.1:8767/api/health`; do not open port `8767` in Windows
+Firewall. The versioned IIS reverse-proxy configuration is under
+`deployment/`.
+
 The selected device, GPU name, PyTorch version, and CUDA runtime are exposed
 under `processor` in `/api/live/status`. Use `-Device cpu` only for an explicit
 CPU fallback.
@@ -278,10 +295,10 @@ http://127.0.0.1:8767
 
 The Live MVP provides a light interface with the live camera view and
 measurement diagram. It requests the AXIS stream at its configured
-`2880x2160` resolution. The browser receives a separate 20 FPS fragmented MP4
+`2880x2160` resolution. The browser receives a separate 10 FPS fragmented MP4
 whose H.264 packets are copied without decoding or re-encoding. A 10 FPS NVDEC
-camera buffer feeds PLC inference and processed clips, so the smoother browser
-stream does not double YOLO/Sobel work or JPEG encoding. YOLO runs on CUDA and
+camera buffer feeds PLC inference and processed clips, so the browser stream
+does not double YOLO/Sobel work or JPEG encoding. YOLO runs on CUDA and
 processed clips are written through an asynchronous NVIDIA NVENC queue. The
 homography intentionally stays in OpenCV CPU: on the deployed L40S host it is
 faster than transferring the full 2880x2160 frame to CUDA and back before YOLO.
@@ -317,11 +334,13 @@ seconds, the processed MP4, temporary raw MP4, processing captures, sidecar,
 and pending database event are discarded.
 
 Temporary raw capture is enabled by `--save-raw-clips`. For a camera source,
-the app opens a separate `2880x2160`, 30 FPS RTSP stream and copies its H.264
+the app opens a separate `2880x2160`, 10 FPS RTSP stream and copies its H.264
 packets directly to `<clip>_raw.mp4` without decoding or overlays. YOLO remains
-at 10 FPS. The camera currently uses its 4K capture mode and the raw URL forces
-a fixed frame cadence. Remove the flag and the three `--raw-*` launcher
-arguments when this temporary data collection is complete.
+at 10 FPS. A camera capability probe on 2026-08-24 confirmed that the deployed
+capture mode rejects requested rates above 10 FPS at this resolution. Changing
+the sensor capture mode can alter framing and requires homography/calibration
+validation first. Remove the flag and the three `--raw-*` launcher arguments
+when this temporary data collection is complete.
 
 The automatic per-piece measurements for a retained event come from the camera
 frame immediately preceding the PLC signal. At that instant, the

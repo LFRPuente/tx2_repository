@@ -626,7 +626,7 @@ class NvencVideoWriter:
                 pass
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Live TX2 MVP with camera, PLC, YOLO and recording.")
     parser.add_argument("--port", type=int, default=8767)
     parser.add_argument("--source", choices=("video", "rtsp", "auto"), default="rtsp")
@@ -653,7 +653,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.10)
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--capture-fps", type=float, default=10.0)
-    parser.add_argument("--live-stream-fps", type=float, default=20.0)
+    parser.add_argument("--live-stream-fps", type=float, default=10.0)
     parser.add_argument(
         "--live-rtsp-url",
         default=os.environ.get("AXIS_LIVE_RTSP_URL", ""),
@@ -687,7 +687,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional RTSP URL used only for temporary raw recordings.",
     )
     parser.add_argument("--raw-camera-resolution", default="2880x2160")
-    parser.add_argument("--raw-record-fps", type=float, default=30.0)
+    parser.add_argument("--raw-record-fps", type=float, default=10.0)
     parser.add_argument(
         "--measurement-delay-seconds",
         type=float,
@@ -714,7 +714,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--db-disabled", action="store_true")
     parser.add_argument("--db-retry-seconds", type=float, default=15.0)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.pre_trigger_seconds < 0:
         parser.error("--pre-trigger-seconds must be zero or greater")
     if args.pre_trigger_seconds >= args.record_seconds:
@@ -1172,7 +1172,8 @@ class CameraReader:
             capture_process = self.capture_process
         if capture_process is not None and capture_process.poll() is None:
             capture_process.terminate()
-        self.thread.join(timeout=5.0)
+        if self.thread.is_alive():
+            self.thread.join(timeout=5.0)
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -1739,6 +1740,8 @@ class ClipRecorder:
         self.video_encoder_error = ""
         self.video_ffmpeg_executable: Path | None = None
         self.video_encoder_configured = False
+        self.stop_event = threading.Event()
+        self.recording_threads: set[threading.Thread] = set()
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -1780,6 +1783,7 @@ class ClipRecorder:
                 "measurement_delay_seconds": measurement_delay_seconds,
                 "measurement_marker_active": measurement_marker_active_now,
                 "database_enabled": self.database is not None,
+                "shutting_down": self.stop_event.is_set(),
             }
 
     def start_event_clip(self, event: dict[str, Any]) -> None:
@@ -1787,11 +1791,57 @@ class ClipRecorder:
         event_monotonic = float(event.get("event_read_monotonic") or time.perf_counter())
         event["event_read_monotonic"] = event_monotonic
         with self.lock:
+            if self.stop_event.is_set():
+                return
             self.clip_index += 1
             clip_index = self.clip_index
             self.active_recordings[clip_index] = event_monotonic
-        thread = threading.Thread(target=self._record_clip, args=(clip_index, event), daemon=True)
-        thread.start()
+            thread = threading.Thread(
+                target=self._run_recording_thread,
+                args=(clip_index, event),
+                name=f"plc-clip-recorder-{clip_index}",
+                daemon=True,
+            )
+            self.recording_threads.add(thread)
+        try:
+            thread.start()
+        except Exception:
+            with self.lock:
+                self.recording_threads.discard(thread)
+                self.active_recordings.pop(clip_index, None)
+            raise
+
+    def _run_recording_thread(self, clip_index: int, event: dict[str, Any]) -> None:
+        try:
+            self._record_clip(clip_index, event)
+        finally:
+            with self.lock:
+                self.recording_threads.discard(threading.current_thread())
+
+    def stop(self, timeout_seconds: float | None = None) -> None:
+        self.stop_event.set()
+        timeout = (
+            float(timeout_seconds)
+            if timeout_seconds is not None
+            else max(15.0, float(self.args.record_seconds) + 10.0)
+        )
+        deadline = time.perf_counter() + timeout
+        while True:
+            with self.lock:
+                threads = [
+                    thread
+                    for thread in self.recording_threads
+                    if thread.is_alive()
+                ]
+            if not threads:
+                return
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"Timed out waiting for {len(threads)} active recording(s)"
+                )
+            for thread in threads:
+                thread.join(timeout=min(remaining, 0.5))
 
     def _measurement_delay_seconds(self) -> float:
         return max(
@@ -2884,6 +2934,116 @@ class PLCMonitor:
                 await asyncio.sleep(float(self.args.plc_poll_interval))
 
 
+class LiveMvpRuntime:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.buffer: FrameBuffer | None = None
+        self.camera: CameraReader | None = None
+        self.processor: LiveProcessor | None = None
+        self.recorder: ClipRecorder | None = None
+        self.plc: PLCMonitor | None = None
+        self.database: DatabaseRepository | SQLiteDatabaseRepository | None = None
+        self.reconciler: DatabaseReconciler | None = None
+        self.started = False
+        self._lifecycle_lock = threading.Lock()
+
+    def _initialize(self) -> None:
+        configure_vision_module(self.args)
+        if not self.args.db_disabled:
+            self.database = (
+                DatabaseRepository(self.args.postgres_dsn)
+                if self.args.postgres_dsn.strip()
+                else SQLiteDatabaseRepository(self.args.sqlite_path)
+            )
+            try:
+                self.database.open(timeout=float(self.args.plc_timeout))
+                self.database.validate_schema()
+                self.database.recover_stale_measurement_events(
+                    older_than_seconds=max(
+                        60,
+                        int(float(self.args.record_seconds) * 3),
+                    )
+                )
+            except Exception:
+                self.database.close()
+                self.database = None
+                raise
+
+        buffer_limit = max(8, int(self.args.buffer_max_frames))
+        buffer_len = min(
+            int(
+                max(
+                    8,
+                    float(self.args.buffer_seconds)
+                    * max(1.0, float(self.args.record_fps)),
+                )
+            ),
+            buffer_limit,
+        )
+        self.buffer = FrameBuffer(maxlen=buffer_len)
+        self.camera = CameraReader(self.args, self.buffer)
+        self.processor = LiveProcessor(self.args, self.buffer)
+        self.recorder = ClipRecorder(
+            self.args,
+            self.buffer,
+            self.processor,
+            self.database,
+        )
+        self.recorder.validate_configuration()
+        self.plc = PLCMonitor(self.args, self.recorder)
+        self.reconciler = (
+            DatabaseReconciler(self.args, self.database)
+            if self.database is not None
+            else None
+        )
+
+    def start(self) -> None:
+        with self._lifecycle_lock:
+            if self.started:
+                return
+            if self.camera is not None:
+                raise RuntimeError("A stopped Live MVP runtime cannot be restarted")
+            try:
+                self._initialize()
+                self.camera.start()
+                self.plc.start()
+                if self.reconciler is not None:
+                    self.reconciler.start()
+                self.started = True
+            except Exception:
+                self._stop_components()
+                raise
+
+    def _stop_components(self) -> list[str]:
+        errors = []
+        components = (
+            ("reconciler", self.reconciler),
+            ("PLC", self.plc),
+            ("recorder", self.recorder),
+            ("camera", self.camera),
+        )
+        for name, component in components:
+            if component is None:
+                continue
+            try:
+                component.stop()
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+        if self.database is not None:
+            try:
+                self.database.close()
+            except Exception as exc:
+                errors.append(f"database: {exc}")
+        self.started = False
+        return errors
+
+    def stop(self) -> None:
+        with self._lifecycle_lock:
+            errors = self._stop_components()
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+
 app = Flask(__name__)
 _args: argparse.Namespace
 _buffer: FrameBuffer
@@ -2893,6 +3053,50 @@ _recorder: ClipRecorder
 _plc: PLCMonitor
 _database: DatabaseRepository | SQLiteDatabaseRepository | None = None
 _reconciler: DatabaseReconciler | None = None
+_runtime: LiveMvpRuntime | None = None
+_runtime_lock = threading.Lock()
+
+
+def _publish_runtime(runtime: LiveMvpRuntime) -> None:
+    global _args, _buffer
+    global _camera, _processor, _recorder, _plc, _database, _reconciler
+    if (
+        runtime.buffer is None
+        or runtime.camera is None
+        or runtime.processor is None
+        or runtime.recorder is None
+        or runtime.plc is None
+    ):
+        raise RuntimeError("The Live MVP runtime is not initialized")
+    _args = runtime.args
+    _buffer = runtime.buffer
+    _camera = runtime.camera
+    _processor = runtime.processor
+    _recorder = runtime.recorder
+    _plc = runtime.plc
+    _database = runtime.database
+    _reconciler = runtime.reconciler
+
+
+def start_runtime(args: argparse.Namespace) -> LiveMvpRuntime:
+    global _runtime
+    with _runtime_lock:
+        if _runtime is not None and _runtime.started:
+            raise RuntimeError("The Live MVP runtime is already running")
+        runtime = LiveMvpRuntime(args)
+        runtime.start()
+        _publish_runtime(runtime)
+        _runtime = runtime
+        return runtime
+
+
+def stop_runtime() -> None:
+    global _runtime
+    with _runtime_lock:
+        runtime = _runtime
+        _runtime = None
+    if runtime is not None:
+        runtime.stop()
 
 
 def database_mode() -> str:
@@ -3160,6 +3364,34 @@ def api_live_status():
         database=database_status,
         reconciler=_reconciler.snapshot() if _reconciler is not None else None,
     )
+
+
+@app.route("/api/health")
+def api_health():
+    runtime = _runtime
+    if runtime is None or not runtime.started:
+        return jsonify(status="unavailable", checks={"runtime": False}), 503
+
+    camera = _camera.snapshot()
+    processor = _processor.snapshot(include_images=False)
+    plc = _plc.snapshot()
+    recorder = _recorder.snapshot()
+    database = _database.health().as_dict() if _database is not None else None
+    checks = {
+        "runtime": True,
+        "camera": bool(camera.get("connected")),
+        "processor": bool(processor.get("ok")) and not processor.get("error"),
+        "plc": not bool(plc.get("enabled")) or bool(plc.get("connected")),
+        "recorder": not recorder.get("error")
+        and not recorder.get("video_encoder_error"),
+        "database": bool(database and database.get("ok")),
+    }
+    healthy = all(checks.values())
+    return jsonify(
+        status="ok" if healthy else "degraded",
+        checks=checks,
+        checked_at=utc_now(),
+    ), (200 if healthy else 503)
 
 
 @app.route("/api/live/stream.mp4")
@@ -3542,81 +3774,38 @@ def api_live_clip_asset(clip_id: str, asset_name: str):
 
 
 def main() -> int:
-    global _args, _buffer
-    global _camera, _processor, _recorder, _plc, _database, _reconciler
-    _args = parse_args()
-    configure_vision_module(_args)
-    if not _args.db_disabled:
-        try:
-            if _args.postgres_dsn.strip():
-                _database = DatabaseRepository(_args.postgres_dsn)
-            else:
-                _database = SQLiteDatabaseRepository(_args.sqlite_path)
-            _database.open(timeout=float(_args.plc_timeout))
-            _database.validate_schema()
-            _database.recover_stale_measurement_events(
-                older_than_seconds=max(60, int(float(_args.record_seconds) * 3))
-            )
-        except Exception as exc:
-            if _database is not None:
-                _database.close()
-                _database = None
-            print(f"ERROR: Database startup validation failed: {exc}", file=sys.stderr)
-            return 2
-
-    buffer_limit = max(8, int(_args.buffer_max_frames))
-    buffer_len = min(
-        int(
-            max(
-                8,
-                float(_args.buffer_seconds)
-                * max(1.0, float(_args.record_fps)),
-            )
-        ),
-        buffer_limit,
-    )
-    _buffer = FrameBuffer(maxlen=buffer_len)
-    _camera = CameraReader(_args, _buffer)
-    _processor = LiveProcessor(_args, _buffer)
-    _recorder = ClipRecorder(
-        _args,
-        _buffer,
-        _processor,
-        _database,
-    )
     try:
-        _recorder.validate_configuration()
+        runtime = start_runtime(parse_args())
     except Exception as exc:
-        if _database is not None:
-            _database.close()
-            _database = None
-        print(f"ERROR: Vision configuration validation failed: {exc}", file=sys.stderr)
+        print(f"ERROR: Live MVP startup failed: {exc}", file=sys.stderr)
         return 2
-    _plc = PLCMonitor(_args, _recorder)
-    _reconciler = DatabaseReconciler(_args, _database) if _database is not None else None
 
-    _camera.start()
-    _plc.start()
-    if _reconciler is not None:
-        _reconciler.start()
-
-    print(f"\n  TX2 Live MVP at http://127.0.0.1:{_args.port}\n")
-    print(f"  Source: {_args.source}")
-    print(f"  PLC: {'enabled' if _args.plc_enabled else 'disabled'}")
+    print(f"\n  TX2 Live MVP at http://127.0.0.1:{runtime.args.port}\n")
+    print(f"  Source: {runtime.args.source}")
+    print(f"  PLC: {'enabled' if runtime.args.plc_enabled else 'disabled'}")
     print(
         "  Database: "
-        + ("disabled (simulation)" if _args.db_disabled else database_mode())
+        + (
+            "disabled (simulation)"
+            if runtime.args.db_disabled
+            else database_mode()
+        )
     )
+    exit_code = 0
     try:
-        app.run(host="127.0.0.1", port=_args.port, debug=False, threaded=True)
+        app.run(
+            host="127.0.0.1",
+            port=runtime.args.port,
+            debug=False,
+            threaded=True,
+        )
     finally:
-        if _reconciler is not None:
-            _reconciler.stop()
-        _plc.stop()
-        _camera.stop()
-        if _database is not None:
-            _database.close()
-    return 0
+        try:
+            stop_runtime()
+        except Exception as exc:
+            print(f"ERROR: Live MVP shutdown failed: {exc}", file=sys.stderr)
+            exit_code = 3
+    return exit_code
 
 
 if __name__ == "__main__":

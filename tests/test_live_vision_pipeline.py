@@ -71,7 +71,7 @@ class LiveVisionPipelineTests(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertIn("color=size=256x256:rate=1", command)
 
-    def test_live_rtsp_url_requests_twenty_fps(self) -> None:
+    def test_live_rtsp_url_requests_deployed_camera_maximum_fps(self) -> None:
         url = live.build_live_rtsp_url(
             SimpleNamespace(
                 camera_user="",
@@ -79,13 +79,13 @@ class LiveVisionPipelineTests(unittest.TestCase):
                 camera_ip="camera.example",
                 codec="h264",
                 camera_resolution="2880x2160",
-                live_stream_fps=20.0,
+                live_stream_fps=10.0,
                 live_rtsp_url="",
             )
         )
 
         self.assertIn("resolution=2880x2160", url)
-        self.assertIn("fps=20", url)
+        self.assertIn("fps=10", url)
 
     def test_live_processor_reports_resolved_inference_device(self) -> None:
         device_info = {
