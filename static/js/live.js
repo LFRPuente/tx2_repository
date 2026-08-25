@@ -6,6 +6,10 @@ let analysisRequestInFlight = false;
 let statusRequestInFlight = false;
 let lastDiagramFrameIndex = null;
 let streamRetryTimer = null;
+let streamRetryDelayMs = 1000;
+let consecutiveStatusFailures = 0;
+
+const STATUS_FAILURE_THRESHOLD = 3;
 
 function setPill(element, text, tone) {
   element.textContent = text;
@@ -168,7 +172,7 @@ async function refreshAnalysis() {
       updateDiagram(result);
     }
   } catch {
-    setPill(byId("top-state"), "frame error", "err");
+    // Preserve the last valid UI state during a transient metadata failure.
   } finally {
     analysisRequestInFlight = false;
   }
@@ -189,6 +193,7 @@ async function refreshStatus() {
     const camera = data.camera || {};
     const processor = data.processor || {};
     const database = data.database || {};
+    consecutiveStatusFailures = 0;
     updatePlcSignal(data.plc || {});
     const healthy = (
       camera.connected
@@ -204,7 +209,10 @@ async function refreshStatus() {
       healthy && database.enabled ? "ok" : "warn",
     );
   } catch {
-    setPill(byId("top-state"), "error", "err");
+    consecutiveStatusFailures += 1;
+    if (consecutiveStatusFailures >= STATUS_FAILURE_THRESHOLD) {
+      setPill(byId("top-state"), "disconnected", "err");
+    }
   } finally {
     statusRequestInFlight = false;
   }
@@ -213,7 +221,6 @@ async function refreshStatus() {
 const liveVideo = byId("live-video");
 const liveStage = byId("original-stage");
 const liveVideoState = byId("live-video-state");
-const LIVE_EDGE_TARGET_SECONDS = 0.25;
 const MAX_LIVE_LATENCY_SECONDS = 1.25;
 
 function keepLiveVideoNearEdge() {
@@ -221,11 +228,10 @@ function keepLiveVideoNearEdge() {
   const liveEdge = liveVideo.buffered.end(liveVideo.buffered.length - 1);
   const latency = liveEdge - liveVideo.currentTime;
 
-  if (latency > MAX_LIVE_LATENCY_SECONDS && !liveVideo.seeking) {
-    liveVideo.currentTime = Math.max(0, liveEdge - LIVE_EDGE_TARGET_SECONDS);
-    liveVideo.playbackRate = 1;
+  if (latency > MAX_LIVE_LATENCY_SECONDS) {
+    liveVideo.playbackRate = 1.25;
   } else if (latency > 0.6) {
-    liveVideo.playbackRate = 1.05;
+    liveVideo.playbackRate = 1.08;
   } else if (liveVideo.playbackRate !== 1) {
     liveVideo.playbackRate = 1;
   }
@@ -234,16 +240,20 @@ function keepLiveVideoNearEdge() {
 function reconnectLiveVideo() {
   clearTimeout(streamRetryTimer);
   streamRetryTimer = setTimeout(() => {
+    streamRetryTimer = null;
     liveStage.classList.remove("stream-ready");
     liveVideoState.textContent = "Reconnecting...";
     liveVideo.src = `/api/live/stream.mp4?retry=${Date.now()}`;
     liveVideo.load();
     liveVideo.play().catch(() => {});
-  }, 1000);
+    streamRetryDelayMs = Math.min(streamRetryDelayMs * 2, 8000);
+  }, streamRetryDelayMs);
 }
 
 liveVideo.addEventListener("playing", () => {
   clearTimeout(streamRetryTimer);
+  streamRetryTimer = null;
+  streamRetryDelayMs = 1000;
   liveStage.classList.add("stream-ready");
   keepLiveVideoNearEdge();
 });

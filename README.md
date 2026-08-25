@@ -314,9 +314,10 @@ measurement diagram. It requests the AXIS stream at its configured
 whose H.264 packets are copied without decoding or re-encoding. A 10 FPS NVDEC
 camera buffer feeds PLC inference and processed clips, so the browser stream
 does not double YOLO/Sobel work or JPEG encoding. A short FFmpeg startup probe,
-per-frame MP4 fragmentation, and browser live-edge correction keep the operator
-view close to real time without inventing frames above the camera's 10 FPS
-limit. YOLO runs on CUDA and
+per-frame MP4 fragmentation, playback-rate catch-up without MP4 seeks, and
+three-sample status hysteresis keep the operator view close to real time without
+false disconnect flashes or invented frames above the camera's 10 FPS limit.
+YOLO runs on CUDA and
 processed clips are written through an asynchronous NVIDIA NVENC queue. The
 homography intentionally stays in OpenCV CPU: on the deployed L40S host it is
 faster than transferring the full 2880x2160 frame to CUDA and back before YOLO.
