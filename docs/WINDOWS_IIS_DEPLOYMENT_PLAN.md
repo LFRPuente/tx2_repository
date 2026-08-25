@@ -70,7 +70,7 @@ URL objetivo:    https://tx2-measurement.barnstxprod.local
 Camara default:  10.14.115.241
 Resolucion:      2880x2160
 YOLO/Sobel:      10 FPS objetivo
-Live/Raw:        10 FPS (maximo del capture mode actual)
+Live/Raw:        10 FPS (maximo a 2880x2160 aceptado por la camara)
 PLC OPC UA:      opc.tcp://10.14.6.48:49320
 Trigger:         ns=2;s=ControlLogix.AS20.VisionSystem.MeasureLength
 Watchdog:        ns=2;s=ControlLogix.AS20.VisionSystem.VisionWD

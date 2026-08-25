@@ -39,9 +39,14 @@ class LiveVisionPipelineTests(unittest.TestCase):
         )
 
         self.assertIn("-rtsp_transport", command)
+        self.assertNotIn("nobuffer", command)
+        self.assertNotIn("low_delay", command)
+        self.assertEqual(command[command.index("-analyzeduration") + 1], "0")
+        self.assertEqual(command[command.index("-probesize") + 1], "32768")
+        self.assertEqual(command[command.index("-flush_packets") + 1], "1")
         self.assertEqual(command[command.index("-c:v") + 1], "copy")
         self.assertIn(
-            "frag_keyframe+empty_moov+default_base_moof",
+            "frag_every_frame+empty_moov+default_base_moof",
             command,
         )
         self.assertEqual(command[-2:], ["mp4", "pipe:1"])
@@ -86,6 +91,8 @@ class LiveVisionPipelineTests(unittest.TestCase):
 
         self.assertIn("resolution=2880x2160", url)
         self.assertIn("fps=10", url)
+        self.assertIn("videozfpsmode=fixed", url)
+        self.assertNotIn("videokeyframeinterval", url)
 
     def test_live_processor_reports_resolved_inference_device(self) -> None:
         device_info = {

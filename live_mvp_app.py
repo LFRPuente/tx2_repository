@@ -284,6 +284,28 @@ def compact_recorder_status(status: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def plc_status_with_signal_state(status: dict[str, Any]) -> dict[str, Any]:
+    payload = status.copy()
+    trigger = payload.get("last_trigger")
+    event_monotonic = (
+        trigger.get("event_read_monotonic")
+        if isinstance(trigger, dict)
+        else None
+    )
+    try:
+        trigger_age_seconds = max(
+            0.0,
+            time.perf_counter() - float(event_monotonic),
+        )
+    except (TypeError, ValueError):
+        trigger_age_seconds = None
+    payload["last_trigger_age_seconds"] = clean_value(trigger_age_seconds)
+    payload["signal_recent"] = bool(
+        trigger_age_seconds is not None and trigger_age_seconds < 4.0
+    )
+    return payload
+
+
 def resolution_dimensions(value: str) -> tuple[int, int]:
     parts = str(value).lower().split("x", 1)
     if len(parts) != 2:
@@ -355,7 +377,16 @@ def build_live_stream_command(
         "error",
     ]
     if rtsp_source:
-        command.extend(("-rtsp_transport", "tcp"))
+        command.extend(
+            (
+                "-rtsp_transport",
+                "tcp",
+                "-analyzeduration",
+                "0",
+                "-probesize",
+                "32768",
+            )
+        )
     else:
         command.extend(("-stream_loop", "-1", "-re"))
     command.extend(
@@ -370,9 +401,11 @@ def build_live_stream_command(
             "-c:v",
             "copy",
             "-movflags",
-            "frag_keyframe+empty_moov+default_base_moof",
+            "frag_every_frame+empty_moov+default_base_moof",
             "-avoid_negative_ts",
             "make_zero",
+            "-flush_packets",
+            "1",
             "-f",
             "mp4",
             "pipe:1",
@@ -775,12 +808,14 @@ def build_rtsp_url(args: argparse.Namespace) -> str:
 
 
 def build_live_rtsp_url(args: argparse.Namespace) -> str:
-    return _axis_rtsp_url(
+    url = _axis_rtsp_url(
         args,
         str(args.camera_resolution),
         float(args.live_stream_fps),
         str(args.live_rtsp_url),
     )
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}videozfpsmode=fixed"
 
 
 def resolve_live_stream_source(args: argparse.Namespace) -> tuple[str, bool]:
@@ -3355,7 +3390,7 @@ def api_live_status():
             "fps": float(_args.live_stream_fps),
             "resolution": str(_args.camera_resolution),
         },
-        plc=_plc.snapshot(),
+        plc=plc_status_with_signal_state(_plc.snapshot()),
         recorder=(
             compact_recorder_status(recorder_status)
             if summary
@@ -3466,6 +3501,7 @@ def api_live_frame():
             int(latest_item["index"]) if latest_item is not None else None
         )
         data["recorder"] = compact_recorder_status(_recorder.snapshot())
+        data["plc"] = plc_status_with_signal_state(_plc.snapshot())
     else:
         if latest_item is None:
             return jsonify(

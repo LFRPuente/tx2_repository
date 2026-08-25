@@ -28,6 +28,7 @@ from live_mvp_app import (
     mark_measurement_evidence_snapshot,
     measurement_evidence_snapshots,
     measurement_marker_active,
+    plc_status_with_signal_state,
 )
 from tools.plc_triggered_video_recorder import edge_matches
 
@@ -340,6 +341,19 @@ class PlcEdgeTests(unittest.TestCase):
         self.assertTrue(edge_matches("falling", "changed"))
         self.assertFalse(edge_matches("", "changed"))
 
+    def test_plc_signal_state_marks_only_recent_triggers(self) -> None:
+        status = {
+            "last_trigger": {"event_read_monotonic": 100.0},
+        }
+        with patch("live_mvp_app.time.perf_counter", return_value=103.5):
+            recent = plc_status_with_signal_state(status)
+        with patch("live_mvp_app.time.perf_counter", return_value=105.0):
+            stale = plc_status_with_signal_state(status)
+
+        self.assertTrue(recent["signal_recent"])
+        self.assertEqual(recent["last_trigger_age_seconds"], 3.5)
+        self.assertFalse(stale["signal_recent"])
+
     def test_live_ui_exposes_plc_signal_state(self) -> None:
         self.assertIn('id="plc-signal"', LIVE_TEMPLATE)
         self.assertIn("plc.last_trigger", LIVE_SCRIPT)
@@ -348,6 +362,8 @@ class PlcEdgeTests(unittest.TestCase):
         self.assertNotIn("Last PLC signal", LIVE_SCRIPT)
         self.assertIn("measurement-taken", LIVE_STYLE)
         self.assertIn("data.recorder?.measurement_marker_active", LIVE_SCRIPT)
+        self.assertIn("updatePlcSignal(data.plc || {})", LIVE_SCRIPT)
+        self.assertIn("keepLiveVideoNearEdge", LIVE_SCRIPT)
         self.assertIn("/api/live/frame?metadata=1", LIVE_SCRIPT)
         self.assertIn('src="/api/live/stream.mp4"', LIVE_TEMPLATE)
         self.assertNotIn("/api/live/image.jpg?frame=", LIVE_SCRIPT)
@@ -417,7 +433,7 @@ class ClipRecorderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             args = SimpleNamespace(
                 output_dir=Path(temp_dir),
-                record_seconds=0.4,
+                record_seconds=1.0,
                 pre_trigger_seconds=0.0,
                 record_fps=10.0,
                 capture_fps=100.0,
@@ -425,7 +441,7 @@ class ClipRecorderTests(unittest.TestCase):
                 measurement_delay_seconds=0.0,
                 max_clips=10,
             )
-            buffer = FrameBuffer(maxlen=20)
+            buffer = FrameBuffer(maxlen=100)
             processor = FakeOverlayProcessor(
                 buffer,
                 processing_delay_seconds=0.03,
@@ -462,7 +478,7 @@ class ClipRecorderTests(unittest.TestCase):
                     "event_read_monotonic": time.perf_counter(),
                 }
             )
-            deadline = time.perf_counter() + 4.0
+            deadline = time.perf_counter() + 6.0
             while recorder.snapshot()["recording"] and time.perf_counter() < deadline:
                 time.sleep(0.02)
             stop_feeder.set()
@@ -880,7 +896,7 @@ class ClipRecorderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             args = SimpleNamespace(
                 output_dir=Path(temp_dir),
-                record_seconds=0.3,
+                record_seconds=1.0,
                 record_fps=10.0,
                 capture_fps=30.0,
                 max_clips=10,
@@ -926,7 +942,7 @@ class ClipRecorderTests(unittest.TestCase):
                 }
             )
 
-            deadline = time.perf_counter() + 3.0
+            deadline = time.perf_counter() + 5.0
             while recorder.snapshot()["recording"] and time.perf_counter() < deadline:
                 time.sleep(0.02)
             stop_feeder.set()

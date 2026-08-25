@@ -1,6 +1,6 @@
 const byId = (id) => document.getElementById(id);
 
-let lastPlcEventCount = null;
+let lastPlcTriggerKey = null;
 let plcSignalHighlightUntil = 0;
 let analysisRequestInFlight = false;
 let statusRequestInFlight = false;
@@ -100,10 +100,18 @@ function signalTime(trigger) {
     );
 }
 
+function plcTriggerKey(plc, trigger) {
+  if (!trigger) return "";
+  return [
+    trigger.event_source_timestamp || "",
+    trigger.read_utc || "",
+    Number(plc.events_found || 0),
+  ].join("|");
+}
+
 function updatePlcSignal(plc) {
   const signal = byId("plc-signal");
   const text = byId("plc-signal-text");
-  const count = Number(plc.events_found || 0);
   const trigger = plc.last_trigger;
 
   if (!plc.connected) {
@@ -117,8 +125,10 @@ function updatePlcSignal(plc) {
     text.textContent = "Waiting for PLC signal";
     signal.title = "";
   } else {
+    const triggerKey = plcTriggerKey(plc, trigger);
     const receivedNow = (
-      lastPlcEventCount !== null && count > lastPlcEventCount
+      triggerKey !== lastPlcTriggerKey
+      && (lastPlcTriggerKey !== null || Boolean(plc.signal_recent))
     );
     if (receivedNow) plcSignalHighlightUntil = Date.now() + 4000;
 
@@ -131,9 +141,8 @@ function updatePlcSignal(plc) {
     signal.title = (
       trigger.event_source_timestamp || trigger.read_utc || ""
     );
+    lastPlcTriggerKey = triggerKey;
   }
-
-  lastPlcEventCount = count;
 }
 
 async function refreshAnalysis() {
@@ -153,6 +162,7 @@ async function refreshAnalysis() {
       "measurement-taken",
       Boolean(data.recorder?.measurement_marker_active),
     );
+    updatePlcSignal(data.plc || {});
     if (result && result.frame_index !== lastDiagramFrameIndex) {
       lastDiagramFrameIndex = result.frame_index;
       updateDiagram(result);
@@ -203,6 +213,23 @@ async function refreshStatus() {
 const liveVideo = byId("live-video");
 const liveStage = byId("original-stage");
 const liveVideoState = byId("live-video-state");
+const LIVE_EDGE_TARGET_SECONDS = 0.25;
+const MAX_LIVE_LATENCY_SECONDS = 1.25;
+
+function keepLiveVideoNearEdge() {
+  if (!liveVideo.buffered.length || liveVideo.readyState < 2) return;
+  const liveEdge = liveVideo.buffered.end(liveVideo.buffered.length - 1);
+  const latency = liveEdge - liveVideo.currentTime;
+
+  if (latency > MAX_LIVE_LATENCY_SECONDS && !liveVideo.seeking) {
+    liveVideo.currentTime = Math.max(0, liveEdge - LIVE_EDGE_TARGET_SECONDS);
+    liveVideo.playbackRate = 1;
+  } else if (latency > 0.6) {
+    liveVideo.playbackRate = 1.05;
+  } else if (liveVideo.playbackRate !== 1) {
+    liveVideo.playbackRate = 1;
+  }
+}
 
 function reconnectLiveVideo() {
   clearTimeout(streamRetryTimer);
@@ -218,9 +245,11 @@ function reconnectLiveVideo() {
 liveVideo.addEventListener("playing", () => {
   clearTimeout(streamRetryTimer);
   liveStage.classList.add("stream-ready");
+  keepLiveVideoNearEdge();
 });
 liveVideo.addEventListener("error", reconnectLiveVideo);
 
+setInterval(keepLiveVideoNearEdge, 500);
 setInterval(refreshAnalysis, 100);
 setInterval(refreshStatus, 1000);
 refreshAnalysis();

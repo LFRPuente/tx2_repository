@@ -126,7 +126,7 @@ if ($Production) {
     }
     $serverArgs += @(
         "--waitress-host", $ListenAddress,
-        "--waitress-threads", "8"
+        "--waitress-threads", "16"
     )
     Write-Host "Server: Waitress on ${ListenAddress}:8767"
 }
