@@ -24,6 +24,7 @@ from live_mvp_app import (
     LiveProcessor,
     app as flask_app,
     build_raw_rtsp_url,
+    compact_processor_status,
     direct_raw_capture_enabled,
     mark_measurement_evidence_snapshot,
     measurement_evidence_snapshots,
@@ -336,6 +337,22 @@ class LiveProcessorTests(unittest.TestCase):
 
 
 class PlcEdgeTests(unittest.TestCase):
+    def test_summary_processor_status_excludes_heavy_result_payload(self) -> None:
+        status = {
+            "ok": True,
+            "processing_mode": "plc_triggered_clip",
+            "processed_count": 7,
+            "result": {"pieces": [{"sobel": {"points": list(range(1000))}}]},
+            "last_stage_durations_ms": {"total": 48.0},
+        }
+
+        compact = compact_processor_status(status)
+
+        self.assertTrue(compact["ok"])
+        self.assertEqual(compact["processed_count"], 7)
+        self.assertNotIn("result", compact)
+        self.assertNotIn("last_stage_durations_ms", compact)
+
     def test_changed_mode_accepts_boolean_edges(self) -> None:
         self.assertTrue(edge_matches("rising", "changed"))
         self.assertTrue(edge_matches("falling", "changed"))

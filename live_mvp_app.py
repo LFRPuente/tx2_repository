@@ -284,6 +284,28 @@ def compact_recorder_status(status: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def compact_processor_status(status: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "ok",
+        "error",
+        "processing",
+        "processing_mode",
+        "processed_count",
+        "last_frame_index",
+        "last_processed_utc",
+        "last_duration_ms",
+        "inference_device",
+        "inference_device_name",
+        "cuda_available",
+        "homography_backend",
+    )
+    return {
+        key: clean_value(status.get(key))
+        for key in keys
+        if key in status
+    }
+
+
 def plc_status_with_signal_state(status: dict[str, Any]) -> dict[str, Any]:
     payload = status.copy()
     trigger = payload.get("last_trigger")
@@ -3380,9 +3402,14 @@ def api_live_status():
         }
     )
     recorder_status = _recorder.snapshot()
+    processor_status = _processor.snapshot(include_images=False)
     return jsonify(
         camera=_camera.snapshot(),
-        processor=_processor.snapshot(include_images=False),
+        processor=(
+            compact_processor_status(processor_status)
+            if summary
+            else processor_status
+        ),
         live_stream={
             "codec": "h264",
             "transport": "fragmented_mp4",

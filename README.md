@@ -317,6 +317,8 @@ does not double YOLO/Sobel work or JPEG encoding. A short FFmpeg startup probe,
 per-frame MP4 fragmentation, playback-rate catch-up without MP4 seeks, and
 three-sample status hysteresis keep the operator view close to real time without
 false disconnect flashes or invented frames above the camera's 10 FPS limit.
+The one-second health poll also uses a compact processor summary instead of
+resending piece and Sobel evidence already supplied by the analysis endpoint.
 YOLO runs on CUDA and
 processed clips are written through an asynchronous NVIDIA NVENC queue. The
 homography intentionally stays in OpenCV CPU: on the deployed L40S host it is
