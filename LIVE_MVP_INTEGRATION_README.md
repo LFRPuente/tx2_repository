@@ -35,6 +35,14 @@ de datos y una secuencia de implementacion verificable.
 > la base. La migracion a SQL Server se implementara cuando TI entregue el
 > servidor, metodo de autenticacion y reglas de red.
 
+> Modo temporal vigente desde 2026-08-27: `run_live_mvp_app.ps1` activa
+> `--snapshot-only`. Cada señal PLC procesa solamente el frame de camara
+> inmediatamente anterior a la señal y conserva un JPEG con perimetro verde,
+> el sidecar y las mediciones por pieza en SQLite. No se crean MP4 procesados ni
+> RAW y no se inicializa NVENC. Si el frame no contiene piezas, el evento se
+> descarta. Las secciones que describen clips de 8 segundos documentan la
+> capacidad disponible para reactivarla, no el modo desplegado actualmente.
+
 ## 1. Documentos relacionados
 
 - [`README.md`](README.md): entrada general al repositorio y comandos basicos.

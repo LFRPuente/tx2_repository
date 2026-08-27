@@ -23,7 +23,7 @@ before that hostname is reachable from VPN clients.
 ## Main Pieces
 
 - `homography_web_app.py`: Flask tool for homography, YOLO annotation, measurement calibration, Sobel front detection, and frame review.
-- `live_mvp_app.py`: Live MVP backend with AXIS video, PLC-triggered recording, measurement processing, APIs, and clip history.
+- `live_mvp_app.py`: Live MVP backend with AXIS video, PLC-triggered snapshots, measurement processing, APIs, and event history. The 8-second clip path remains available but is currently disabled.
 - `templates/`: Flask HTML views for Live, History, homography, ROI selection, and annotation.
 - `static/css/` and `static/js/`: presentation and browser behavior for every Flask app, kept outside the Python backends.
 - `mvp_react_app/`: React/Vite MVP showing the simplified measurement view with the real video overlay and a diagram.
@@ -287,6 +287,24 @@ The selected device, GPU name, PyTorch version, and CUDA runtime are exposed
 under `processor` in `/api/live/status`. Use `-Device cpu` only for an explicit
 CPU fallback.
 
+### Current PLC capture mode
+
+The deployed launcher currently passes `--snapshot-only`. At every rising PLC
+signal, the app selects the closest camera frame at or immediately before the
+signal, runs homography, YOLO, geometric rules, Sobel, and per-piece
+measurement once, then stores:
+
+- one JPEG evidence image with the green measurement perimeter;
+- one JSON sidecar with the PLC timing and complete automatic result;
+- the event, canonical snapshot, and per-piece measurements in SQLite.
+
+It does not open an MP4 writer, create a processed clip, or create a RAW clip.
+An event with no detected pieces is still discarded and does not enter
+History. Retention remains limited to the 100 newest saved events. To restore
+the existing 8-second clip implementation later, remove `--snapshot-only` from
+`run_live_mvp_app.ps1` and restore `--save-raw-clips` only if RAW collection is
+needed again.
+
 Import existing clip sidecars before the first SQLite launch:
 
 ```powershell
@@ -358,26 +376,18 @@ NVENC uses its low-latency `p1/ll` preset at the configured 16 Mbps.
 `/api/live/status` exposes the selected encoder, cache hit/miss counts, and the
 latest per-stage durations.
 
-It connects to the PLC through OPC UA and records one 8-second clip when
-`MeasureLength` changes from `False` to `True`. The recording is provisional
-until the window closes: if YOLO did not detect any piece during those 8
-seconds, the processed MP4, temporary raw MP4, processing captures, sidecar,
-and pending database event are discarded.
-
-Temporary raw capture is enabled by `--save-raw-clips`. For a camera source,
-the app reuses the native `2880x2160` frames already decoded into the PLC
-buffer and writes `<clip>_raw.mp4` through NVENC without overlays. It does not
-open an RTSP stream per event. YOLO, raw clips, and processed clips remain at
-10 FPS. The AXIS P1388-LE stream profile was changed to 30 FPS and validated on
-2026-08-27 at `2880x2160`: an isolated five-second RTSP probe received 138
-frames (27.6 effective FPS). Remove the flag and the three `--raw-*` launcher
-arguments when this temporary data collection is complete.
+It connects to the PLC through OPC UA and creates one measurement snapshot when
+`MeasureLength` changes from `False` to `True`. If YOLO does not detect a piece
+in that frame, no JPEG, sidecar, or database event is retained. The AXIS
+P1388-LE stream profile was changed to 30 FPS and validated on 2026-08-27 at
+`2880x2160`: an isolated five-second RTSP probe received 138 frames (27.6
+effective FPS).
 
 The automatic per-piece measurements for a retained event come from the camera
 frame immediately preceding the PLC signal. At that instant, the
 Live camera perimeter turns green and the same green perimeter is embedded in
-the processed MP4 for 0.8 seconds. The sidecar records the configured delay,
-the actual selected-frame offset, and the marked video frame range. This
+the saved evidence JPEG. The sidecar records the configured delay and the
+actual selected-frame offset. This
 canonical frame bypasses queued clip frames, so the diagram updates from the
 PLC-aligned result instead of following the last frame completed by a clip.
 
@@ -397,16 +407,11 @@ Open the saved clip history at:
 http://127.0.0.1:8767/history
 ```
 
-Each history entry contains a browser-compatible H.264 MP4, PLC event metadata,
-processing snapshots, and the overlays produced while the clip was recorded.
-The MP4 itself contains the processed live camera view with the YOLO-derived
-reference and front overlays. While temporary raw capture is active, a
-`Raw clip` action opens the synchronized camera-only MP4.
-The Processing evidence section shows only the canonical PLC-signal
-camera frame with a green perimeter. All processing snapshots remain available
-in the sidecar JSON and selected database for audit, but are not rendered as a
-gallery. The app retains the 100 most recent events and removes all processed,
-raw, sidecar, and evidence artifacts belonging to older events automatically.
+Each new history entry contains PLC event metadata, the per-piece measurements,
+and only the canonical PLC-signal evidence image with a green perimeter. New
+snapshot-only events have no video player or `Raw clip` action. Historical MP4
+events remain readable. The app retains the 100 most recent events and removes
+their sidecar and evidence assets automatically when they expire.
 
 The selected database is the History system of record. Each PLC signal creates an
 idempotent event, snapshots the active model/homography/calibration hashes,
@@ -419,11 +424,9 @@ boundaries needed for a later SQL Server adapter without changing the Live or
 History API.
 
 The live frame buffer is capped to avoid retaining several gigabytes of images.
-Processed clips are streamed directly to disk and resampled to the configured
-output FPS. Temporary raw clips reuse the same bounded decoded frame buffer and
-are encoded with NVENC, avoiding another camera connection. If a second PLC
-event arrives while another clip is active, both recording windows are
-preserved as separate clips and shared frame analyses are reused.
+In the current snapshot-only mode, a PLC event consumes one buffered frame and
+does not start an encoder. If another signal arrives, it creates another short,
+independent snapshot task.
 
 Live MVP data is stored directly under:
 
@@ -431,10 +434,10 @@ Live MVP data is stored directly under:
 outputs/live_plc_clips/<date>/
 ```
 
-MP4 and JPEG assets remain on disk; SQLite stores event, snapshot, piece, asset
+JPEG assets remain on disk for new events; SQLite stores event, snapshot, piece, asset
 and audit metadata. Sidecars record `db_sync_backend` so the
 reconciler can idempotently register legacy clips and move between backends.
-If the configured database is temporarily unavailable after startup, the MP4
+If the configured database is temporarily unavailable after startup, the JPEG
 and sidecar are kept with `db_sync_status: pending` and a background reconciler
 retries them. For an explicit camera/PLC simulation only:
 
@@ -515,18 +518,18 @@ Use this checklist for the on-machine validation:
 
 - [ ] Set `AXIS_USER` and `AXIS_PASSWORD`, then run `run_live_mvp_app.ps1`.
 - [ ] Confirm `outputs\tx2_live_mvp.sqlite3` is writable by the Windows account running the MVP.
-- [ ] Confirm `/api/live/status` reports `nvidia_nvenc`, CUDA YOLO and a healthy SQLite backend.
-- [ ] Back up SQLite with the service stopped or through the SQLite backup API; include retained video assets.
+- [ ] Confirm `/api/live/status` reports snapshot-only mode, CUDA YOLO and a healthy SQLite backend.
+- [ ] Back up SQLite with the service stopped or through the SQLite backup API; include retained JPEG assets.
 - [ ] Open `http://127.0.0.1:8767` and confirm the original camera image remains at its native resolution.
 - [ ] Confirm YOLO detects each piece independently in the rectified image and Sobel Y runs only inside each piece ROI.
 - [ ] Confirm boxes with more than 20% overlap in a saved red zone are discarded before Sobel.
 - [ ] Confirm every detected piece front is horizontal and remains associated with its own piece.
 - [ ] Confirm the reference distance is correct and total lengths use the compact `40' 9 1/16"` format.
 - [ ] Confirm OPC UA connects to `opc.tcp://10.14.6.48:49320` and `VisionWD` keeps changing.
-- [ ] Trigger a `MeasureLength` rising edge and verify that exactly one 8-second clip appears in `/history`.
-- [ ] Trigger two events less than eight seconds apart and verify that neither event is lost.
-- [ ] Verify each sidecar JSON contains the PLC source timestamp, watchdog value, frame timestamps, and processing snapshots.
-- [ ] Verify each saved MP4 keeps the camera resolution and reports 80 frames at 10 FPS for an 8-second window.
+- [ ] Trigger a `MeasureLength` rising edge and verify that exactly one JPEG event appears in `/history` with no video player.
+- [ ] Trigger two nearby events and verify that neither event is lost.
+- [ ] Verify each sidecar JSON contains the PLC source timestamp, watchdog value, selected frame timestamp, and one canonical processing snapshot.
+- [ ] Verify no new processed or RAW MP4 is created while `--snapshot-only` is active.
 - [ ] Verify SQLite stores one event with zero or more per-piece automatic measurements.
 - [ ] Verify History can save and clear an operator measurement without changing the automatic value.
 - [ ] Verify every operator change creates an immutable audit revision.

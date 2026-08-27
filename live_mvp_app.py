@@ -285,6 +285,7 @@ def compact_recorder_status(status: dict[str, Any]) -> dict[str, Any]:
         "error",
         "record_seconds",
         "pre_trigger_seconds",
+        "snapshot_only",
         "measurement_delay_seconds",
         "measurement_marker_active",
         "save_raw_clips",
@@ -768,6 +769,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--save-raw-clips",
         action="store_true",
         help="Temporarily save a camera-only MP4 beside each processed clip.",
+    )
+    parser.add_argument(
+        "--snapshot-only",
+        action="store_true",
+        help="Save only the PLC measurement image and measurements; do not create MP4 clips.",
     )
     parser.add_argument(
         "--raw-rtsp-url",
@@ -1544,7 +1550,11 @@ class LiveProcessor:
         self.state: dict[str, Any] = {
             "ok": True,
             "processing": False,
-            "processing_mode": "plc_triggered_clip",
+            "processing_mode": (
+                "plc_triggered_snapshot"
+                if bool(getattr(args, "snapshot_only", False))
+                else "plc_triggered_clip"
+            ),
             "error": "",
             "processed_count": 0,
             "last_frame_index": None,
@@ -1946,7 +1956,11 @@ class ClipRecorder:
         self.video_encoder_requested = str(
             getattr(args, "video_encoder", "opencv")
         )
-        self.video_encoder = "opencv"
+        self.video_encoder = (
+            "disabled"
+            if bool(getattr(args, "snapshot_only", False))
+            else "opencv"
+        )
         self.video_encoder_error = ""
         self.video_ffmpeg_executable: Path | None = None
         self.video_encoder_configured = False
@@ -1978,8 +1992,12 @@ class ClipRecorder:
                 "error": self.error,
                 "record_seconds": self.args.record_seconds,
                 "pre_trigger_seconds": pre_trigger_seconds,
+                "snapshot_only": bool(
+                    getattr(self.args, "snapshot_only", False)
+                ),
                 "save_raw_clips": bool(
                     getattr(self.args, "save_raw_clips", False)
+                    and not getattr(self.args, "snapshot_only", False)
                 ),
                 "raw_camera_resolution": str(
                     getattr(self.args, "raw_camera_resolution", "2880x2160")
@@ -2004,31 +2022,32 @@ class ClipRecorder:
             if self.stop_event.is_set():
                 return
 
-        measurement_source = self.buffer.latest_at_or_before(event_monotonic)
-        process_measurement = getattr(
-            self.processor,
-            "process_measurement_frame",
-            None,
-        )
-        publish_measurement = getattr(
-            self.processor,
-            "publish_measurement_result",
-            None,
-        )
-        if (
-            measurement_source is not None
-            and callable(process_measurement)
-            and callable(publish_measurement)
-            and event_monotonic - float(measurement_source["monotonic"])
-            <= CAMERA_FRAME_STALE_SECONDS
-        ):
-            try:
-                measurement_result, _duration_ms = process_measurement(
-                    measurement_source
-                )
-                publish_measurement(measurement_result)
-            except Exception:
-                pass
+        if not bool(getattr(self.args, "snapshot_only", False)):
+            measurement_source = self.buffer.latest_at_or_before(event_monotonic)
+            process_measurement = getattr(
+                self.processor,
+                "process_measurement_frame",
+                None,
+            )
+            publish_measurement = getattr(
+                self.processor,
+                "publish_measurement_result",
+                None,
+            )
+            if (
+                measurement_source is not None
+                and callable(process_measurement)
+                and callable(publish_measurement)
+                and event_monotonic - float(measurement_source["monotonic"])
+                <= CAMERA_FRAME_STALE_SECONDS
+            ):
+                try:
+                    measurement_result, _duration_ms = process_measurement(
+                        measurement_source
+                    )
+                    publish_measurement(measurement_result)
+                except Exception:
+                    pass
 
         with self.lock:
             if self.stop_event.is_set():
@@ -2053,7 +2072,10 @@ class ClipRecorder:
 
     def _run_recording_thread(self, clip_index: int, event: dict[str, Any]) -> None:
         try:
-            self._record_clip(clip_index, event)
+            if bool(getattr(self.args, "snapshot_only", False)):
+                self._record_snapshot(clip_index, event)
+            else:
+                self._record_clip(clip_index, event)
         finally:
             with self.lock:
                 self.recording_threads.discard(threading.current_thread())
@@ -2142,7 +2164,8 @@ class ClipRecorder:
         configuration = self._configuration_snapshot()
         if configuration is None:
             raise RuntimeError("The vision configuration could not be snapshotted")
-        self._configure_video_encoder()
+        if not bool(getattr(self.args, "snapshot_only", False)):
+            self._configure_video_encoder()
         return configuration
 
     def _configure_video_encoder(self) -> None:
@@ -2172,6 +2195,222 @@ class ClipRecorder:
         if source == "video":
             return str(getattr(self.args, "video", "video"))
         return source
+
+    def _record_snapshot(self, clip_index: int, event: dict[str, Any]) -> None:
+        event_mono = float(event.get("event_read_monotonic") or time.perf_counter())
+        event_key = build_event_key(
+            event,
+            str(getattr(self.args, "plc_endpoint", "")),
+            str(getattr(self.args, "event_node", "")),
+        )
+        measurement_event_id = event_uuid(event_key)
+        analysis_dir: Path | None = None
+        json_path: Path | None = None
+        try:
+            source = self.buffer.latest_at_or_before(event_mono)
+            source_mono = float(source["monotonic"]) if source is not None else None
+            if source_mono is None or (
+                event_mono - source_mono > CAMERA_FRAME_STALE_SECONDS
+            ):
+                discarded = {
+                    "clip_index": clip_index,
+                    "discarded_at": utc_now(),
+                    "event_id": measurement_event_id,
+                    "event": clean_value(event),
+                    "reason": "camera_frame_unavailable",
+                    "processing_mode": "plc_triggered_snapshot",
+                    "processed_source_frame_count": 0,
+                    "processing_snapshot_count": 0,
+                }
+                with self.lock:
+                    self.discarded_clip_count += 1
+                    self.last_discarded_clip = discarded
+                return
+            if self.processor is None:
+                raise RuntimeError("Vision processing is unavailable.")
+
+            process_measurement = getattr(
+                self.processor,
+                "process_measurement_frame",
+                None,
+            )
+            if callable(process_measurement):
+                result, duration_ms = process_measurement(source)
+            else:
+                process_clip_frame = getattr(
+                    self.processor,
+                    "process_clip_frame",
+                    None,
+                )
+                if not callable(process_clip_frame):
+                    raise RuntimeError("Vision measurement processing is unavailable.")
+                result, duration_ms = process_clip_frame(
+                    source,
+                    include_evidence_images=False,
+                )
+            publish_measurement = getattr(
+                self.processor,
+                "publish_measurement_result",
+                None,
+            )
+            if callable(publish_measurement):
+                publish_measurement(result)
+
+            if not snapshots_contain_piece([result]):
+                discarded = {
+                    "clip_index": clip_index,
+                    "discarded_at": utc_now(),
+                    "event_id": measurement_event_id,
+                    "event": clean_value(event),
+                    "reason": "no_piece_detected",
+                    "processing_mode": "plc_triggered_snapshot",
+                    "processed_source_frame_count": 1,
+                    "processing_snapshot_count": 0,
+                }
+                with self.lock:
+                    self.discarded_clip_count += 1
+                    self.last_discarded_clip = discarded
+                return
+
+            recording_frame = result.get("_recording_frame")
+            if not isinstance(recording_frame, dict) or not isinstance(
+                recording_frame.get("frame"),
+                np.ndarray,
+            ):
+                raise RuntimeError("Vision processing did not return an evidence image.")
+
+            day_dir = (
+                self.args.output_dir
+                / "live_plc_clips"
+                / datetime.now().strftime("%Y-%m-%d")
+            )
+            day_dir.mkdir(parents=True, exist_ok=True)
+            edge = event.get("event_edge") or "event"
+            base = f"live_{clip_index:04d}_{file_stamp()}_{edge}"
+            analysis_dir = day_dir / f"{base}_analysis"
+            analysis_dir.mkdir(parents=True, exist_ok=True)
+            json_path = day_dir / f"{base}.json"
+            image_name = "analysis_000_original_overlay.jpg"
+            image_path = analysis_dir / image_name
+            evidence_frame = draw_measurement_perimeter(recording_frame["frame"])
+            if not cv2.imwrite(
+                str(image_path),
+                evidence_frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 85],
+            ):
+                raise RuntimeError(f"Could not save measurement evidence: {image_path}")
+
+            snapshot = {
+                key: clean_value(value)
+                for key, value in result.items()
+                if key
+                not in (
+                    "original_image",
+                    "rectified_image",
+                    "_recording_frame",
+                    "_original_jpeg",
+                    "_original_overlay",
+                )
+            }
+            snapshot.update(
+                snapshot_index=0,
+                processing_duration_ms=clean_value(duration_ms),
+                measurement_event_frame=True,
+                measurement_source_frame_monotonic=source_mono,
+                measurement_source_frame_offset_seconds=source_mono - event_mono,
+                frame_monotonic=event_mono,
+                original_overlay_path=str(image_path),
+                original_overlay_file=image_name,
+                measurement_evidence=True,
+                is_canonical=True,
+            )
+            saved_at = utc_now()
+            vision_configuration = self._configuration_snapshot()
+            sidecar = {
+                "clip_index": clip_index,
+                "saved_at": saved_at,
+                "event_id": measurement_event_id,
+                "event_key": event_key,
+                "event": event,
+                "plc_endpoint": str(getattr(self.args, "plc_endpoint", "")),
+                "plc_event_node": str(getattr(self.args, "event_node", "")),
+                "plc_watchdog_node": str(getattr(self.args, "watchdog_node", "")),
+                "camera_source": self._camera_source(),
+                "vision_configuration": vision_configuration,
+                "processing_mode": "plc_triggered_snapshot",
+                "snapshot_only": True,
+                "stop_reason": "snapshot_only",
+                "record_seconds": 0.0,
+                "pre_trigger_seconds": 0.0,
+                "post_trigger_seconds": 0.0,
+                "measurement_delay_seconds": 0.0,
+                "measurement_target_monotonic": event_mono,
+                "measurement_actual_offset_seconds": 0.0,
+                "measurement_source_frame_offset_seconds": source_mono - event_mono,
+                "measurement_event_frame_processed": True,
+                "event_frame_processing_error": "",
+                "measurement_snapshot_utc": source.get("utc"),
+                "measurement_snapshot_frame_index": int(source["index"]),
+                "measurement_evidence_marked": True,
+                "frames_captured": 1,
+                "frames_written": 0,
+                "source_frames_seen": 1,
+                "processed_source_frame_count": 1,
+                "first_frame_utc": source.get("utc"),
+                "last_frame_utc": source.get("utc"),
+                "first_frame_index": int(source["index"]),
+                "last_frame_index": int(source["index"]),
+                "analysis_dir": str(analysis_dir),
+                "processing_snapshots": [snapshot],
+                "processing_snapshot_count": 1,
+                "canonical_snapshot_frame_index": int(source["index"]),
+                "db_sync_status": "disabled" if self.database is None else "pending",
+                "db_sync_backend": None,
+                "db_sync_error": "",
+                "db_sync_attempts": 0,
+                "db_sync_last_attempt_at": None,
+            }
+            write_json_atomic(json_path, sidecar)
+            if self.database is not None:
+                sidecar["db_sync_attempts"] = 1
+                sidecar["db_sync_last_attempt_at"] = utc_now()
+                write_json_atomic(json_path, sidecar)
+                try:
+                    actual_event_id = self.database.sync_sidecar(
+                        json_path,
+                        self.args.output_dir,
+                    )
+                    if actual_event_id != sidecar["event_id"]:
+                        sidecar["event_id"] = actual_event_id
+                        write_json_atomic(json_path, sidecar)
+                        self.database.sync_sidecar(json_path, self.args.output_dir)
+                    sidecar["db_sync_status"] = "synced"
+                    sidecar["db_sync_backend"] = self.database.backend_name
+                except Exception as exc:
+                    sidecar["db_sync_status"] = "pending"
+                    sidecar["db_sync_error"] = str(exc)
+                write_json_atomic(json_path, sidecar)
+            self._enforce_retention()
+            with self.lock:
+                self.last_clip = sidecar
+                self.error = ""
+        except Exception as exc:
+            delete_clip_paths(
+                self.args.output_dir,
+                [analysis_dir, json_path],
+            )
+            failure = {
+                "clip_index": clip_index,
+                "failed_at": utc_now(),
+                "event": clean_value(event),
+                "error": str(exc),
+            }
+            with self.lock:
+                self.error = failure["error"]
+                self.failed_recordings.append(failure)
+        finally:
+            with self.lock:
+                self.active_recordings.pop(clip_index, None)
 
     def _capture_processing_snapshot(
         self,
@@ -3441,7 +3680,11 @@ def read_clip_sidecar(
     data["processing_snapshots_shown"] = len(snapshots)
     data["clip_id"] = json_path.stem
     data["json_path"] = str(json_path)
-    data["video_url"] = f"/api/live/clips/{json_path.stem}/video"
+    data["video_url"] = (
+        f"/api/live/clips/{json_path.stem}/video"
+        if data.get("video_path")
+        else None
+    )
     if data.get("raw_video_path"):
         data["raw_video_url"] = f"/api/live/clips/{json_path.stem}/raw-video"
     data["detail_url"] = f"/history/{json_path.stem}"
@@ -3808,7 +4051,11 @@ def api_history_events():
     for event in events:
         event["id"] = str(event["id"])
         event["detail_url"] = f"/history/{event['id']}"
-        event["video_url"] = f"/api/history/events/{event['id']}/video"
+        event["video_url"] = (
+            f"/api/history/events/{event['id']}/video"
+            if event.get("video_path")
+            else None
+        )
     return jsonify(
         events=clean_value(events),
         count=len(events),

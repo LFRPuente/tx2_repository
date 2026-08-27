@@ -30,6 +30,7 @@ from live_mvp_app import (
     measurement_evidence_snapshots,
     measurement_marker_active,
     plc_status_with_signal_state,
+    read_clip_sidecar,
     write_json_atomic,
 )
 from tools.plc_triggered_video_recorder import edge_matches
@@ -510,6 +511,173 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual([item["frame_index"] for item in selected], [2])
 
 class ClipRecorderTests(unittest.TestCase):
+    def test_snapshot_only_saves_one_evidence_image_and_no_video(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            args = SimpleNamespace(
+                output_dir=output_dir,
+                record_seconds=8.0,
+                pre_trigger_seconds=2.0,
+                save_raw_clips=True,
+                snapshot_only=True,
+                measurement_delay_seconds=0.0,
+                max_clips=100,
+                plc_endpoint="opc.tcp://test",
+                event_node="ns=2;s=MeasureLength",
+                watchdog_node="ns=2;s=VisionWD",
+                source="rtsp",
+                camera_ip="camera",
+                model=output_dir / "best.pt",
+                conf=0.1,
+                imgsz=960,
+            )
+            buffer = FrameBuffer(maxlen=8)
+            processor = FakeOverlayProcessor(buffer)
+            recorder = ClipRecorder(args, buffer, processor)
+            frame_monotonic = time.perf_counter()
+            buffer.append(
+                {
+                    "index": 7,
+                    "utc": "measurement-frame",
+                    "monotonic": frame_monotonic,
+                    "frame": np.zeros((80, 120, 3), dtype=np.uint8),
+                }
+            )
+
+            with patch(
+                "live_mvp_app.build_vision_configuration",
+                return_value={"configuration_hash": "snapshot-test"},
+            ):
+                recorder.start_event_clip(
+                    {
+                        "event_edge": "rising",
+                        "event_read_monotonic": frame_monotonic + 0.01,
+                        "read_utc": "plc-event",
+                    }
+                )
+                deadline = time.perf_counter() + 2.0
+                while (
+                    recorder.snapshot()["recording"]
+                    and time.perf_counter() < deadline
+                ):
+                    time.sleep(0.01)
+
+            sidecars = list(output_dir.rglob("*.json"))
+            images = list(output_dir.rglob("*.jpg"))
+            self.assertEqual(len(sidecars), 1)
+            self.assertEqual(len(images), 1)
+            self.assertEqual(list(output_dir.rglob("*.mp4")), [])
+            data = json.loads(sidecars[0].read_text(encoding="utf-8"))
+            self.assertTrue(data["snapshot_only"])
+            self.assertEqual(data["processing_mode"], "plc_triggered_snapshot")
+            self.assertEqual(data["frames_written"], 0)
+            self.assertNotIn("video_path", data)
+            self.assertNotIn("raw_video_path", data)
+            self.assertEqual(data["processing_snapshot_count"], 1)
+            self.assertEqual(len(data["processing_snapshots"][0]["pieces"]), 1)
+            self.assertTrue(
+                data["processing_snapshots"][0]["measurement_evidence"]
+            )
+            image = cv2.imread(str(images[0]))
+            self.assertIsNotNone(image)
+            self.assertGreater(float(image[:8, :, 1].mean()), 80.0)
+            status = recorder.snapshot()
+            self.assertTrue(status["snapshot_only"])
+            self.assertFalse(status["save_raw_clips"])
+            self.assertEqual(status["video_encoder"], "disabled")
+
+    def test_snapshot_only_discards_event_when_no_piece_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            args = SimpleNamespace(
+                output_dir=output_dir,
+                record_seconds=8.0,
+                snapshot_only=True,
+                save_raw_clips=False,
+                measurement_delay_seconds=0.0,
+                max_clips=100,
+                plc_endpoint="opc.tcp://test",
+                event_node="ns=2;s=MeasureLength",
+                watchdog_node="ns=2;s=VisionWD",
+                source="rtsp",
+                camera_ip="camera",
+            )
+            buffer = FrameBuffer(maxlen=8)
+            processor = FakeOverlayProcessor(buffer, detects_piece=False)
+            recorder = ClipRecorder(args, buffer, processor)
+            frame_monotonic = time.perf_counter()
+            buffer.append(
+                {
+                    "index": 1,
+                    "utc": "empty-frame",
+                    "monotonic": frame_monotonic,
+                    "frame": np.zeros((48, 64, 3), dtype=np.uint8),
+                }
+            )
+
+            recorder.start_event_clip(
+                {
+                    "event_edge": "rising",
+                    "event_read_monotonic": frame_monotonic + 0.01,
+                }
+            )
+            deadline = time.perf_counter() + 2.0
+            while recorder.snapshot()["recording"] and time.perf_counter() < deadline:
+                time.sleep(0.01)
+
+            self.assertEqual(list(output_dir.rglob("*.json")), [])
+            self.assertEqual(list(output_dir.rglob("*.jpg")), [])
+            self.assertEqual(recorder.snapshot()["discarded_clip_count"], 1)
+
+    def test_snapshot_only_discards_a_stale_camera_frame_without_health_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = SimpleNamespace(
+                output_dir=Path(temp_dir),
+                record_seconds=8.0,
+                snapshot_only=True,
+                save_raw_clips=False,
+                measurement_delay_seconds=0.0,
+                max_clips=100,
+                plc_endpoint="opc.tcp://test",
+                event_node="ns=2;s=MeasureLength",
+                watchdog_node="ns=2;s=VisionWD",
+                source="rtsp",
+                camera_ip="camera",
+            )
+            buffer = FrameBuffer(maxlen=8)
+            recorder = ClipRecorder(args, buffer, FakeOverlayProcessor(buffer))
+            recorder.start_event_clip(
+                {
+                    "event_edge": "rising",
+                    "event_read_monotonic": time.perf_counter(),
+                }
+            )
+            deadline = time.perf_counter() + 1.0
+            while recorder.snapshot()["recording"] and time.perf_counter() < deadline:
+                time.sleep(0.01)
+
+            status = recorder.snapshot()
+            self.assertEqual(status["discarded_clip_count"], 1)
+            self.assertEqual(
+                status["last_discarded_clip"]["reason"],
+                "camera_frame_unavailable",
+            )
+            self.assertEqual(status["failed_recording_count"], 0)
+            self.assertEqual(status["error"], "")
+
+    def test_sidecar_without_video_has_no_video_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sidecar_path = Path(temp_dir) / "snapshot.json"
+            sidecar_path.write_text(
+                json.dumps({"processing_snapshots": []}),
+                encoding="utf-8",
+            )
+
+            data = read_clip_sidecar(sidecar_path)
+
+            self.assertIsNotNone(data)
+            self.assertIsNone(data["video_url"])
+
     def test_shutdown_rejects_new_plc_recordings(self) -> None:
         args = SimpleNamespace(record_seconds=8.0)
         recorder = ClipRecorder(args, FrameBuffer(maxlen=8))

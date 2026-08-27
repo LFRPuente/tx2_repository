@@ -155,7 +155,7 @@ if ($Production) {
   --video-bitrate-mbps 16 `
   --processing-cache-frames 320 `
   --pre-trigger-seconds 2 `
-  --save-raw-clips `
+  --snapshot-only `
   --raw-camera-resolution 2880x2160 `
   --raw-record-fps 10 `
   --measurement-delay-seconds 0 `
