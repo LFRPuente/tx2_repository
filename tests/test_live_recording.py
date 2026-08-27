@@ -437,7 +437,11 @@ class PlcEdgeTests(unittest.TestCase):
 
     def test_plc_signal_state_marks_only_recent_triggers(self) -> None:
         status = {
-            "last_trigger": {"event_read_monotonic": 100.0},
+            "last_trigger": {
+                "event_read_monotonic": 100.0,
+                "event_source_timestamp": "2026-08-27T20:00:00.100+00:00",
+                "read_utc": "2026-08-27T20:00:00.125+00:00",
+            },
         }
         with patch("live_mvp_app.time.perf_counter", return_value=103.5):
             recent = plc_status_with_signal_state(status)
@@ -446,6 +450,7 @@ class PlcEdgeTests(unittest.TestCase):
 
         self.assertTrue(recent["signal_recent"])
         self.assertEqual(recent["last_trigger_age_seconds"], 3.5)
+        self.assertEqual(recent["last_trigger"]["delivery_latency_ms"], 25.0)
         self.assertFalse(stale["signal_recent"])
 
     def test_live_ui_exposes_plc_signal_state(self) -> None:
@@ -455,12 +460,13 @@ class PlcEdgeTests(unittest.TestCase):
         self.assertIn("Last PLC Cut Signal", LIVE_SCRIPT)
         self.assertNotIn("Last PLC signal", LIVE_SCRIPT)
         self.assertIn("measurement-taken", LIVE_STYLE)
-        self.assertIn("data.recorder?.measurement_marker_active", LIVE_SCRIPT)
+        self.assertIn("measurementHighlightUntil", LIVE_SCRIPT)
+        self.assertIn("pendingPlcPresentation", LIVE_SCRIPT)
         self.assertIn("updatePlcSignal(data.plc || {})", LIVE_SCRIPT)
         self.assertIn("keepLiveVideoNearEdge", LIVE_SCRIPT)
         self.assertIn("consecutiveStatusFailures", LIVE_SCRIPT)
         self.assertNotIn('setPill(byId("top-state"), "frame error"', LIVE_SCRIPT)
-        self.assertNotIn("liveVideo.currentTime =", LIVE_SCRIPT)
+        self.assertIn("liveVideo.currentTime =", LIVE_SCRIPT)
         self.assertIn("/api/live/frame?metadata=1", LIVE_SCRIPT)
         self.assertIn('src="/api/live/stream.mp4"', LIVE_TEMPLATE)
         self.assertNotIn("/api/live/image.jpg?frame=", LIVE_SCRIPT)
@@ -548,7 +554,7 @@ class ClipRecorderTests(unittest.TestCase):
                 "live_mvp_app.build_vision_configuration",
                 return_value={"configuration_hash": "snapshot-test"},
             ):
-                recorder.start_event_clip(
+                alignment = recorder.start_event_clip(
                     {
                         "event_edge": "rising",
                         "event_read_monotonic": frame_monotonic + 0.01,
@@ -574,6 +580,13 @@ class ClipRecorderTests(unittest.TestCase):
             self.assertNotIn("video_path", data)
             self.assertNotIn("raw_video_path", data)
             self.assertEqual(data["processing_snapshot_count"], 1)
+            self.assertEqual(alignment["measurement_frame_index"], 7)
+            self.assertAlmostEqual(
+                alignment["measurement_frame_offset_ms"],
+                -10.0,
+                places=2,
+            )
+            self.assertEqual(data["measurement_snapshot_frame_index"], 7)
             self.assertEqual(len(data["processing_snapshots"][0]["pieces"]), 1)
             self.assertTrue(
                 data["processing_snapshots"][0]["measurement_evidence"]
@@ -585,6 +598,72 @@ class ClipRecorderTests(unittest.TestCase):
             self.assertTrue(status["snapshot_only"])
             self.assertFalse(status["save_raw_clips"])
             self.assertEqual(status["video_encoder"], "disabled")
+
+    def test_snapshot_only_freezes_the_plc_aligned_frame_before_processing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            args = SimpleNamespace(
+                output_dir=output_dir,
+                record_seconds=8.0,
+                snapshot_only=True,
+                save_raw_clips=False,
+                measurement_delay_seconds=0.0,
+                max_clips=100,
+                plc_endpoint="opc.tcp://test",
+                event_node="ns=2;s=MeasureLength",
+                watchdog_node="ns=2;s=VisionWD",
+                source="rtsp",
+                camera_ip="camera",
+                model=output_dir / "best.pt",
+            )
+            buffer = FrameBuffer(maxlen=8)
+            processor = FakeOverlayProcessor(
+                buffer,
+                processing_delay_seconds=0.15,
+            )
+            recorder = ClipRecorder(args, buffer, processor)
+            event_monotonic = time.perf_counter()
+            buffer.append(
+                {
+                    "index": 40,
+                    "utc": "plc-frame",
+                    "monotonic": event_monotonic - 0.02,
+                    "frame": np.zeros((48, 64, 3), dtype=np.uint8),
+                }
+            )
+
+            with patch(
+                "live_mvp_app.build_vision_configuration",
+                return_value={"configuration_hash": "alignment-test"},
+            ):
+                alignment = recorder.start_event_clip(
+                    {
+                        "event_edge": "rising",
+                        "event_read_monotonic": event_monotonic,
+                    }
+                )
+                buffer.append(
+                    {
+                        "index": 41,
+                        "utc": "later-frame",
+                        "monotonic": event_monotonic + 0.1,
+                        "frame": np.zeros((48, 64, 3), dtype=np.uint8),
+                    }
+                )
+                deadline = time.perf_counter() + 2.0
+                while (
+                    recorder.snapshot()["recording"]
+                    and time.perf_counter() < deadline
+                ):
+                    time.sleep(0.01)
+
+            sidecars = list(output_dir.rglob("*.json"))
+            self.assertEqual(len(sidecars), 1)
+            data = json.loads(sidecars[0].read_text(encoding="utf-8"))
+            self.assertEqual(alignment["measurement_frame_index"], 40)
+            self.assertEqual(processor.processed_indices, [40])
+            self.assertEqual(data["measurement_snapshot_frame_index"], 40)
+            self.assertEqual(data["first_frame_utc"], "plc-frame")
 
     def test_snapshot_only_discards_event_when_no_piece_is_detected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

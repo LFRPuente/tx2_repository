@@ -2,6 +2,9 @@ const byId = (id) => document.getElementById(id);
 
 let lastPlcTriggerKey = null;
 let plcSignalHighlightUntil = 0;
+let measurementHighlightUntil = 0;
+let pendingPlcPresentation = null;
+let pendingDiagramResult = null;
 let analysisRequestInFlight = false;
 let statusRequestInFlight = false;
 let lastDiagramFrameIndex = null;
@@ -10,6 +13,13 @@ let streamRetryDelayMs = 1000;
 let consecutiveStatusFailures = 0;
 
 const STATUS_FAILURE_THRESHOLD = 3;
+const PLC_SIGNAL_HIGHLIGHT_MS = 4000;
+const MEASUREMENT_HIGHLIGHT_MS = 900;
+const LIVE_TARGET_LATENCY_SECONDS = 0.18;
+const LIVE_SOFT_LATENCY_SECONDS = 0.35;
+const LIVE_HARD_LATENCY_SECONDS = 0.9;
+const LIVE_TRANSPORT_ALLOWANCE_MS = 250;
+const MAX_PRESENTATION_DELAY_MS = 1400;
 
 function setPill(element, text, tone) {
   element.textContent = text;
@@ -106,11 +116,54 @@ function signalTime(trigger) {
 
 function plcTriggerKey(plc, trigger) {
   if (!trigger) return "";
+  if (trigger.event_key) return String(trigger.event_key);
   return [
     trigger.event_source_timestamp || "",
     trigger.read_utc || "",
     Number(plc.events_found || 0),
   ].join("|");
+}
+
+function livePlaybackLagSeconds() {
+  if (!liveVideo?.buffered?.length || liveVideo.readyState < 2) return 0;
+  const liveEdge = liveVideo.buffered.end(liveVideo.buffered.length - 1);
+  return Math.max(0, liveEdge - liveVideo.currentTime);
+}
+
+function presentationDelayMs() {
+  const lag = livePlaybackLagSeconds();
+  const effectiveLag = lag > LIVE_HARD_LATENCY_SECONDS
+    ? LIVE_TARGET_LATENCY_SECONDS
+    : lag;
+  return Math.min(
+    MAX_PRESENTATION_DELAY_MS,
+    Math.max(0, effectiveLag * 1000) + LIVE_TRANSPORT_ALLOWANCE_MS,
+  );
+}
+
+function presentPendingPlcEvent() {
+  if (
+    pendingPlcPresentation
+    && Date.now() >= pendingPlcPresentation.presentAt
+  ) {
+    plcSignalHighlightUntil = Date.now() + PLC_SIGNAL_HIGHLIGHT_MS;
+    measurementHighlightUntil = Date.now() + MEASUREMENT_HIGHLIGHT_MS;
+    pendingPlcPresentation = null;
+  }
+
+  if (
+    pendingDiagramResult
+    && !pendingPlcPresentation
+  ) {
+    lastDiagramFrameIndex = pendingDiagramResult.frame_index;
+    updateDiagram(pendingDiagramResult);
+    pendingDiagramResult = null;
+  }
+
+  byId("original-stage").classList.toggle(
+    "measurement-taken",
+    Date.now() < measurementHighlightUntil,
+  );
 }
 
 function updatePlcSignal(plc) {
@@ -120,11 +173,15 @@ function updatePlcSignal(plc) {
 
   if (!plc.connected) {
     plcSignalHighlightUntil = 0;
+    measurementHighlightUntil = 0;
+    pendingPlcPresentation = null;
     signal.className = "plc-signal offline";
     text.textContent = "PLC disconnected";
     signal.title = "";
   } else if (!trigger) {
     plcSignalHighlightUntil = 0;
+    measurementHighlightUntil = 0;
+    pendingPlcPresentation = null;
     signal.className = "plc-signal";
     text.textContent = "Waiting for PLC signal";
     signal.title = "";
@@ -134,7 +191,14 @@ function updatePlcSignal(plc) {
       triggerKey !== lastPlcTriggerKey
       && (lastPlcTriggerKey !== null || Boolean(plc.signal_recent))
     );
-    if (receivedNow) plcSignalHighlightUntil = Date.now() + 4000;
+    if (receivedNow) {
+      pendingPlcPresentation = {
+        key: triggerKey,
+        presentAt: Date.now() + presentationDelayMs(),
+      };
+    }
+
+    presentPendingPlcEvent();
 
     const highlighting = Date.now() < plcSignalHighlightUntil;
     const time = signalTime(trigger);
@@ -162,15 +226,19 @@ async function refreshAnalysis() {
     if (!response.ok) throw new Error(data.error || "frame error");
 
     const result = data.result;
-    byId("original-stage").classList.toggle(
-      "measurement-taken",
-      Boolean(data.recorder?.measurement_marker_active),
-    );
     updatePlcSignal(data.plc || {});
     if (result && result.frame_index !== lastDiagramFrameIndex) {
-      lastDiagramFrameIndex = result.frame_index;
-      updateDiagram(result);
+      if (
+        pendingPlcPresentation
+        && result.plc_event_key === pendingPlcPresentation.key
+      ) {
+        pendingDiagramResult = result;
+      } else {
+        lastDiagramFrameIndex = result.frame_index;
+        updateDiagram(result);
+      }
     }
+    presentPendingPlcEvent();
   } catch {
     // Preserve the last valid UI state during a transient metadata failure.
   } finally {
@@ -221,17 +289,20 @@ async function refreshStatus() {
 const liveVideo = byId("live-video");
 const liveStage = byId("original-stage");
 const liveVideoState = byId("live-video-state");
-const MAX_LIVE_LATENCY_SECONDS = 1.25;
 
 function keepLiveVideoNearEdge() {
   if (!liveVideo.buffered.length || liveVideo.readyState < 2) return;
   const liveEdge = liveVideo.buffered.end(liveVideo.buffered.length - 1);
   const latency = liveEdge - liveVideo.currentTime;
 
-  if (latency > MAX_LIVE_LATENCY_SECONDS) {
-    liveVideo.playbackRate = 1.25;
-  } else if (latency > 0.6) {
-    liveVideo.playbackRate = 1.08;
+  if (latency > LIVE_HARD_LATENCY_SECONDS) {
+    liveVideo.currentTime = Math.max(
+      0,
+      liveEdge - LIVE_TARGET_LATENCY_SECONDS,
+    );
+    liveVideo.playbackRate = 1;
+  } else if (latency > LIVE_SOFT_LATENCY_SECONDS) {
+    liveVideo.playbackRate = 1.12;
   } else if (liveVideo.playbackRate !== 1) {
     liveVideo.playbackRate = 1;
   }

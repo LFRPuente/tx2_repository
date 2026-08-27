@@ -384,12 +384,19 @@ P1388-LE stream profile was changed to 30 FPS and validated on 2026-08-27 at
 effective FPS).
 
 The automatic per-piece measurements for a retained event come from the camera
-frame immediately preceding the PLC signal. At that instant, the
-Live camera perimeter turns green and the same green perimeter is embedded in
-the saved evidence JPEG. The sidecar records the configured delay and the
-actual selected-frame offset. This
-canonical frame bypasses queued clip frames, so the diagram updates from the
-PLC-aligned result instead of following the last frame completed by a clip.
+frame immediately preceding the PLC signal. The recorder freezes that frame
+while accepting the PLC edge, before starting the asynchronous YOLO task, so a
+busy inference queue cannot replace it with a different frame. The same frame
+is embedded in the saved evidence JPEG with a green perimeter. The Live UI
+delays its PLC highlight by the current browser playback lag and presents the
+PLC-aligned diagram under the same event key. The browser also seeks back to
+the Live edge if its fMP4 buffer exceeds the low-latency limit.
+
+`/api/live/frame?metadata=1` exposes `preview_frame_utc` and
+`preview_frame_age_ms`. The PLC payload exposes `delivery_latency_ms`, while
+each completed result includes `plc_event_key`, `plc_delivery_latency_ms`, and
+`measurement_frame_offset_ms`. These fields distinguish OPC delivery, camera
+alignment, processing time, and browser presentation when diagnosing timing.
 
 The database reconciler also verifies retained sidecar event IDs against the
 active database. A sidecar marked as synced is imported again if its database
@@ -528,6 +535,7 @@ Use this checklist for the on-machine validation:
 - [ ] Confirm OPC UA connects to `opc.tcp://10.14.6.48:49320` and `VisionWD` keeps changing.
 - [ ] Trigger a `MeasureLength` rising edge and verify that exactly one JPEG event appears in `/history` with no video player.
 - [ ] Trigger two nearby events and verify that neither event is lost.
+- [ ] Confirm each trigger/result pair shares the same `event_key` and that `delivery_latency_ms` remains well below the visible browser delay.
 - [ ] Verify each sidecar JSON contains the PLC source timestamp, watchdog value, selected frame timestamp, and one canonical processing snapshot.
 - [ ] Verify no new processed or RAW MP4 is created while `--snapshot-only` is active.
 - [ ] Verify SQLite stores one event with zero or more per-piece automatic measurements.

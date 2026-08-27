@@ -63,10 +63,12 @@ class LiveVisionPipelineTests(unittest.TestCase):
         )
 
         self.assertIn("-rtsp_transport", command)
-        self.assertNotIn("nobuffer", command)
-        self.assertNotIn("low_delay", command)
+        self.assertIn("nobuffer", command)
+        self.assertIn("low_delay", command)
         self.assertEqual(command[command.index("-analyzeduration") + 1], "0")
         self.assertEqual(command[command.index("-probesize") + 1], "32768")
+        self.assertEqual(command[command.index("-reorder_queue_size") + 1], "0")
+        self.assertEqual(command[command.index("-max_delay") + 1], "0")
         self.assertEqual(command[command.index("-flush_packets") + 1], "1")
         self.assertEqual(command[command.index("-c:v") + 1], "copy")
         self.assertIn(

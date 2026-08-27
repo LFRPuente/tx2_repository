@@ -88,6 +88,17 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def timestamp_delta_ms(later: Any, earlier: Any) -> float | None:
+    if not later or not earlier:
+        return None
+    try:
+        later_dt = datetime.fromisoformat(str(later).replace("Z", "+00:00"))
+        earlier_dt = datetime.fromisoformat(str(earlier).replace("Z", "+00:00"))
+        return round((later_dt - earlier_dt).total_seconds() * 1000.0, 1)
+    except (TypeError, ValueError):
+        return None
+
+
 def file_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%fZ")
 
@@ -253,6 +264,10 @@ def compact_live_result(result: dict[str, Any]) -> dict[str, Any]:
         "frame_index",
         "frame_utc",
         "processed_utc",
+        "plc_event_key",
+        "plc_event_source_timestamp",
+        "plc_delivery_latency_ms",
+        "measurement_frame_offset_ms",
         "original_width",
         "original_height",
         "rectified_width",
@@ -329,10 +344,17 @@ def compact_processor_status(status: dict[str, Any]) -> dict[str, Any]:
 
 def plc_status_with_signal_state(status: dict[str, Any]) -> dict[str, Any]:
     payload = status.copy()
-    trigger = payload.get("last_trigger")
+    raw_trigger = payload.get("last_trigger")
+    trigger = raw_trigger.copy() if isinstance(raw_trigger, dict) else None
+    if trigger is not None:
+        trigger["delivery_latency_ms"] = timestamp_delta_ms(
+            trigger.get("read_utc"),
+            trigger.get("event_source_timestamp"),
+        )
+        payload["last_trigger"] = trigger
     event_monotonic = (
         trigger.get("event_read_monotonic")
-        if isinstance(trigger, dict)
+        if trigger is not None
         else None
     )
     try:
@@ -436,10 +458,18 @@ def build_live_stream_command(
             (
                 "-rtsp_transport",
                 "tcp",
+                "-fflags",
+                "nobuffer",
+                "-flags",
+                "low_delay",
                 "-analyzeduration",
                 "0",
                 "-probesize",
                 "32768",
+                "-reorder_queue_size",
+                "0",
+                "-max_delay",
+                "0",
             )
         )
     else:
@@ -2014,16 +2044,39 @@ class ClipRecorder:
                 "shutting_down": self.stop_event.is_set(),
             }
 
-    def start_event_clip(self, event: dict[str, Any]) -> None:
+    def start_event_clip(self, event: dict[str, Any]) -> dict[str, Any]:
         event = dict(event)
         event_monotonic = float(event.get("event_read_monotonic") or time.perf_counter())
         event["event_read_monotonic"] = event_monotonic
         with self.lock:
             if self.stop_event.is_set():
-                return
+                return {}
 
-        if not bool(getattr(self.args, "snapshot_only", False)):
-            measurement_source = self.buffer.latest_at_or_before(event_monotonic)
+        event_key = build_event_key(
+            event,
+            str(getattr(self.args, "plc_endpoint", "")),
+            str(getattr(self.args, "event_node", "")),
+        )
+        event["event_key"] = event_key
+        alignment = {"event_key": event_key}
+
+        measurement_source = self.buffer.latest_at_or_before(event_monotonic)
+        if measurement_source is not None:
+            source_monotonic = float(measurement_source["monotonic"])
+            alignment.update(
+                measurement_frame_index=int(measurement_source["index"]),
+                measurement_frame_utc=measurement_source.get("utc"),
+                measurement_frame_offset_ms=round(
+                    (source_monotonic - event_monotonic) * 1000.0,
+                    1,
+                ),
+            )
+            event.update(alignment)
+
+        snapshot_only = bool(getattr(self.args, "snapshot_only", False))
+        if snapshot_only:
+            event["_measurement_source"] = measurement_source
+        else:
             process_measurement = getattr(
                 self.processor,
                 "process_measurement_frame",
@@ -2051,7 +2104,7 @@ class ClipRecorder:
 
         with self.lock:
             if self.stop_event.is_set():
-                return
+                return alignment
             self.clip_index += 1
             clip_index = self.clip_index
             self.active_recordings[clip_index] = event_monotonic
@@ -2069,6 +2122,7 @@ class ClipRecorder:
                 self.recording_threads.discard(thread)
                 self.active_recordings.pop(clip_index, None)
             raise
+        return alignment
 
     def _run_recording_thread(self, clip_index: int, event: dict[str, Any]) -> None:
         try:
@@ -2197,17 +2251,20 @@ class ClipRecorder:
         return source
 
     def _record_snapshot(self, clip_index: int, event: dict[str, Any]) -> None:
+        source = event.pop("_measurement_source", None)
         event_mono = float(event.get("event_read_monotonic") or time.perf_counter())
-        event_key = build_event_key(
-            event,
-            str(getattr(self.args, "plc_endpoint", "")),
-            str(getattr(self.args, "event_node", "")),
+        event_key = str(
+            event.get("event_key")
+            or build_event_key(
+                event,
+                str(getattr(self.args, "plc_endpoint", "")),
+                str(getattr(self.args, "event_node", "")),
+            )
         )
         measurement_event_id = event_uuid(event_key)
         analysis_dir: Path | None = None
         json_path: Path | None = None
         try:
-            source = self.buffer.latest_at_or_before(event_mono)
             source_mono = float(source["monotonic"]) if source is not None else None
             if source_mono is None or (
                 event_mono - source_mono > CAMERA_FRAME_STALE_SECONDS
@@ -2248,6 +2305,18 @@ class ClipRecorder:
                     source,
                     include_evidence_images=False,
                 )
+            result.update(
+                plc_event_key=event_key,
+                plc_event_source_timestamp=event.get("event_source_timestamp"),
+                plc_delivery_latency_ms=timestamp_delta_ms(
+                    event.get("read_utc"),
+                    event.get("event_source_timestamp"),
+                ),
+                measurement_frame_offset_ms=round(
+                    (source_mono - event_mono) * 1000.0,
+                    1,
+                ),
+            )
             publish_measurement = getattr(
                 self.processor,
                 "publish_measurement_result",
@@ -3429,8 +3498,8 @@ class PLCMonitor:
                     }
                     if edge_matches(self.args.plc_edge, edge):
                         updates["events_found"] = int(self.state.get("events_found", 0)) + 1
+                        row.update(self.recorder.start_event_clip(row))
                         updates["last_trigger"] = row
-                        self.recorder.start_event_clip(row)
                     self._set_state(**updates)
                     previous_watchdog = watchdog_value
                     previous_event = event.get("value")
@@ -3982,6 +4051,21 @@ def api_live_frame():
         data["result"] = measurement_result
         data["preview_frame_index"] = (
             int(latest_item["index"]) if latest_item is not None else None
+        )
+        data["preview_frame_utc"] = (
+            latest_item.get("utc") if latest_item is not None else None
+        )
+        data["preview_frame_age_ms"] = (
+            round(
+                max(
+                    0.0,
+                    time.perf_counter() - float(latest_item["monotonic"]),
+                )
+                * 1000.0,
+                1,
+            )
+            if latest_item is not None
+            else None
         )
         data["recorder"] = compact_recorder_status(_recorder.snapshot())
         data["plc"] = plc_status_with_signal_state(_plc.snapshot())
