@@ -153,7 +153,7 @@ if ($Production) {
   --record-fps 10 `
   --video-encoder nvenc `
   --video-bitrate-mbps 16 `
-  --processing-cache-frames 160 `
+  --processing-cache-frames 320 `
   --pre-trigger-seconds 2 `
   --save-raw-clips `
   --raw-camera-resolution 2880x2160 `

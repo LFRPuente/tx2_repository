@@ -16,6 +16,7 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict, deque
@@ -78,6 +79,9 @@ DEFAULT_EVENT_NODE = "ns=2;s=ControlLogix.AS20.VisionSystem.MeasureLength"
 DEFAULT_PRE_TRIGGER_SECONDS = 2.0
 DEFAULT_MEASUREMENT_DELAY_SECONDS = 0.0
 MEASUREMENT_MARKER_DURATION_SECONDS = 0.8
+CAMERA_FRAME_STALE_SECONDS = 3.0
+CAMERA_STARTUP_TIMEOUT_SECONDS = 12.0
+JSON_WRITE_LOCK = threading.Lock()
 
 
 def utc_now() -> str:
@@ -107,9 +111,23 @@ def clean_value(value: Any) -> Any:
 
 
 def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
+    with JSON_WRITE_LOCK:
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f"{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                json.dump(data, handle, indent=2, ensure_ascii=False)
+                temporary = Path(handle.name)
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 def measurement_evidence_snapshots(
@@ -298,6 +316,8 @@ def compact_processor_status(status: dict[str, Any]) -> dict[str, Any]:
         "inference_device_name",
         "cuda_available",
         "homography_backend",
+        "warmup_complete",
+        "warmup_duration_ms",
     )
     return {
         key: clean_value(status.get(key))
@@ -362,6 +382,18 @@ def build_nvdec_camera_command(
         "error",
         "-rtsp_transport",
         "tcp",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-analyzeduration",
+        "0",
+        "-probesize",
+        "32768",
+        "-reorder_queue_size",
+        "0",
+        "-max_delay",
+        "0",
         "-hwaccel",
         "cuda",
         "-hwaccel_output_format",
@@ -466,19 +498,17 @@ def build_nvenc_writer_command(
         "-c:v",
         "h264_nvenc",
         "-preset",
-        "p4",
+        "p1",
         "-tune",
-        "hq",
+        "ll",
         "-rc",
-        "vbr",
-        "-cq",
-        "19",
+        "cbr",
         "-b:v",
         f"{bitrate:g}M",
         "-maxrate",
-        f"{bitrate * 2.0:g}M",
+        f"{bitrate:g}M",
         "-bufsize",
-        f"{bitrate * 2.0:g}M",
+        f"{bitrate:g}M",
         "-pix_fmt",
         "yuv420p",
         "-movflags",
@@ -543,10 +573,13 @@ class NvencVideoWriter:
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+            creationflags=(
+                int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                | int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+            ),
         )
         self.closed = False
-        self.frame_queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=4)
+        self.frame_queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=1)
         self.worker_error = ""
         self.worker_frame_count = 0
         self.worker_write_duration_ms = 0.0
@@ -872,6 +905,7 @@ def direct_raw_capture_enabled(args: argparse.Namespace) -> bool:
     return bool(
         getattr(args, "save_raw_clips", False)
         and str(getattr(args, "source", "")) in ("rtsp", "auto")
+        and str(getattr(args, "raw_rtsp_url", "")).strip()
     )
 
 
@@ -1220,6 +1254,7 @@ class CameraReader:
             "width": None,
             "height": None,
             "last_frame_utc": None,
+            "last_frame_monotonic": None,
         }
 
     def start(self) -> None:
@@ -1237,6 +1272,20 @@ class CameraReader:
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             data = self.state.copy()
+        last_frame_monotonic = data.pop("last_frame_monotonic", None)
+        data["last_frame_age_seconds"] = (
+            max(0.0, time.perf_counter() - float(last_frame_monotonic))
+            if last_frame_monotonic is not None
+            else None
+        )
+        frame_age = data["last_frame_age_seconds"]
+        if data.get("connected") and (
+            frame_age is None or frame_age > CAMERA_FRAME_STALE_SECONDS
+        ):
+            data["connected"] = False
+            data["error"] = (
+                "Camera connection is stale; waiting for decoder restart"
+            )
         data["buffer"] = self.buffer.stats()
         return data
 
@@ -1299,12 +1348,44 @@ class CameraReader:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=frame_bytes * 2,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=(
+                int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                | int(getattr(subprocess, "HIGH_PRIORITY_CLASS", 0))
+            ),
         )
         with self.capture_process_lock:
             self.capture_process = process
 
         frames_received = 0
+        last_frame_received = time.perf_counter()
+        watchdog_error = ""
+        watchdog_stop = threading.Event()
+
+        def monitor_decoder() -> None:
+            nonlocal watchdog_error
+            while not watchdog_stop.wait(0.5):
+                timeout = (
+                    CAMERA_FRAME_STALE_SECONDS
+                    if frames_received
+                    else CAMERA_STARTUP_TIMEOUT_SECONDS
+                )
+                age = time.perf_counter() - last_frame_received
+                if age <= timeout:
+                    continue
+                watchdog_error = (
+                    f"Camera produced no frame for {age:.1f}s; restarting NVDEC"
+                )
+                self._set_state(connected=False, error=watchdog_error)
+                if process.poll() is None:
+                    process.terminate()
+                return
+
+        watchdog_thread = threading.Thread(
+            target=monitor_decoder,
+            name="live-camera-nvdec-watchdog",
+            daemon=True,
+        )
+        watchdog_thread.start()
         try:
             if process.stdout is None:
                 return frame_index, False
@@ -1327,6 +1408,7 @@ class CameraReader:
                     "monotonic": time.perf_counter(),
                     "frame": frame,
                 }
+                last_frame_received = float(item["monotonic"])
                 self.buffer.append(item)
                 frame_index += 1
                 frames_received += 1
@@ -1340,8 +1422,11 @@ class CameraReader:
                     width=width,
                     height=height,
                     last_frame_utc=item["utc"],
+                    last_frame_monotonic=item["monotonic"],
                 )
         finally:
+            watchdog_stop.set()
+            watchdog_thread.join(timeout=1.0)
             with self.capture_process_lock:
                 if self.capture_process is process:
                     self.capture_process = None
@@ -1356,7 +1441,7 @@ class CameraReader:
         if frames_received:
             self._set_state(
                 connected=False,
-                error="NVDEC camera read stopped; retrying",
+                error=watchdog_error or "NVDEC camera read stopped; retrying",
             )
         return frame_index, frames_received > 0
 
@@ -1423,7 +1508,13 @@ class CameraReader:
                 }
                 self._publish_frame(item)
                 frame_index += 1
-                self._set_state(frames_read=frame_index, last_frame_utc=item["utc"], width=frame.shape[1], height=frame.shape[0])
+                self._set_state(
+                    frames_read=frame_index,
+                    last_frame_utc=item["utc"],
+                    last_frame_monotonic=item["monotonic"],
+                    width=frame.shape[1],
+                    height=frame.shape[0],
+                )
 
                 if simulated_video:
                     target_delay = 1.0 / max(1.0, float(self.args.capture_fps or fps))
@@ -1442,7 +1533,9 @@ class LiveProcessor:
         self.buffer = buffer
         device_info = vision.resolve_yolo_device(getattr(args, "device", "auto"))
         self.inference_lock = threading.Lock()
+        self.measurement_priority = threading.Event()
         self.lock = threading.Lock()
+        self.measurement_result: dict[str, Any] | None = None
         self.result_cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
         self.result_cache_limit = max(
             1,
@@ -1463,11 +1556,40 @@ class LiveProcessor:
             "torch_version": device_info["torch_version"],
             "torch_cuda_version": device_info["torch_cuda_version"],
             "homography_backend": "opencv_cpu",
+            "warmup_complete": False,
+            "warmup_duration_ms": None,
             "processing_cache_hits": 0,
             "processing_cache_misses": 0,
             "last_stage_durations_ms": None,
             "result": None,
         }
+
+    def warm_up(self) -> None:
+        started = time.perf_counter()
+        _matrix, out_size, _homography = vision.load_homography()
+        calibration = vision.load_measurement_calibration()
+        width, height = (int(value) for value in out_size)
+        rectified = np.zeros((height, width, 3), dtype=np.uint8)
+        with self.inference_lock:
+            vision.predict_yolo_boxes_with_rules(
+                rectified,
+                conf=float(self.args.conf),
+                imgsz=int(self.args.imgsz),
+                exclusion_zones=calibration.get("exclusion_zones"),
+                exclusion_max_overlap=float(
+                    calibration.get(
+                        "exclusion_max_box_overlap",
+                        vision.EXCLUSION_ZONE_MAX_BOX_OVERLAP,
+                    )
+                ),
+            )
+        self._set_state(
+            warmup_complete=True,
+            warmup_duration_ms=round(
+                (time.perf_counter() - started) * 1000.0,
+                1,
+            ),
+        )
 
     def snapshot(self, include_images: bool = False) -> dict[str, Any]:
         with self.lock:
@@ -1497,15 +1619,29 @@ class LiveProcessor:
                     }
         return data
 
+    def publish_measurement_result(self, result: dict[str, Any]) -> None:
+        with self.lock:
+            self.measurement_result = result.copy()
+
+    def live_measurement_snapshot(self) -> dict[str, Any] | None:
+        with self.lock:
+            result = self.measurement_result
+            if not isinstance(result, dict):
+                return None
+            return compact_live_result(result)
+
     def process_clip_frame(
         self,
         item: dict[str, Any],
         *,
         include_evidence_images: bool = False,
+        measurement_priority: bool = False,
     ) -> tuple[dict[str, Any], float]:
         started = time.perf_counter()
         self._set_state(processing=True)
         try:
+            while not measurement_priority and self.measurement_priority.is_set():
+                time.sleep(0.005)
             with self.inference_lock:
                 cache_key = self._cache_key(item)
                 cached = self.result_cache.get(cache_key)
@@ -1518,13 +1654,14 @@ class LiveProcessor:
                     cache_hit = False
                 else:
                     self.result_cache.move_to_end(cache_key)
-                    result = self._materialize_cached_result(
-                        cached,
-                        item,
-                        include_evidence_images=include_evidence_images,
-                    )
                     cache_hit = True
-                result["processing_cache_hit"] = cache_hit
+            if cache_hit:
+                result = self._materialize_cached_result(
+                    cached,
+                    item,
+                    include_evidence_images=include_evidence_images,
+                )
+            result["processing_cache_hit"] = cache_hit
             duration_ms = round((time.perf_counter() - started) * 1000.0, 1)
             result_frame_index = int(result["frame_index"])
             with self.lock:
@@ -1555,6 +1692,20 @@ class LiveProcessor:
         except Exception as exc:
             self._set_state(ok=False, processing=False, error=str(exc))
             raise
+
+    def process_measurement_frame(
+        self,
+        item: dict[str, Any],
+    ) -> tuple[dict[str, Any], float]:
+        self.measurement_priority.set()
+        try:
+            return self.process_clip_frame(
+                item,
+                include_evidence_images=False,
+                measurement_priority=True,
+            )
+        finally:
+            self.measurement_priority.clear()
 
     def _set_state(self, **updates: Any) -> None:
         with self.lock:
@@ -1852,6 +2003,36 @@ class ClipRecorder:
         with self.lock:
             if self.stop_event.is_set():
                 return
+
+        measurement_source = self.buffer.latest_at_or_before(event_monotonic)
+        process_measurement = getattr(
+            self.processor,
+            "process_measurement_frame",
+            None,
+        )
+        publish_measurement = getattr(
+            self.processor,
+            "publish_measurement_result",
+            None,
+        )
+        if (
+            measurement_source is not None
+            and callable(process_measurement)
+            and callable(publish_measurement)
+            and event_monotonic - float(measurement_source["monotonic"])
+            <= CAMERA_FRAME_STALE_SECONDS
+        ):
+            try:
+                measurement_result, _duration_ms = process_measurement(
+                    measurement_source
+                )
+                publish_measurement(measurement_result)
+            except Exception:
+                pass
+
+        with self.lock:
+            if self.stop_event.is_set():
+                return
             self.clip_index += 1
             clip_index = self.clip_index
             self.active_recordings[clip_index] = event_monotonic
@@ -2109,7 +2290,7 @@ class ClipRecorder:
         first_written_source: dict[str, Any] | None = None
         last_written_source: dict[str, Any] | None = None
         writer: cv2.VideoWriter | NvencVideoWriter | None = None
-        raw_writer: cv2.VideoWriter | None = None
+        raw_writer: cv2.VideoWriter | NvencVideoWriter | None = None
         video_path: Path | None = None
         raw_video_path: Path | None = None
         raw_capture_process: subprocess.Popen | None = None
@@ -2247,7 +2428,18 @@ class ClipRecorder:
             else:
                 writer = cv2.VideoWriter(str(video_path), *writer_args)
             if buffer_raw_capture and raw_video_path is not None:
-                if os.name == "nt":
+                if (
+                    self.video_encoder == "nvidia_nvenc"
+                    and self.video_ffmpeg_executable is not None
+                ):
+                    raw_writer = NvencVideoWriter(
+                        self.video_ffmpeg_executable,
+                        raw_video_path,
+                        fps,
+                        (raw_width, raw_height),
+                        float(getattr(self.args, "video_bitrate_mbps", 16.0)),
+                    )
+                elif os.name == "nt":
                     raw_writer = cv2.VideoWriter(
                         str(raw_video_path),
                         cv2.CAP_MSMF,
@@ -2385,6 +2577,13 @@ class ClipRecorder:
                         source_frame_monotonic
                     )
                     event_recording_frame["monotonic"] = event_mono
+                    publish_measurement = getattr(
+                        self.processor,
+                        "publish_measurement_result",
+                        None,
+                    )
+                    if callable(publish_measurement):
+                        publish_measurement(event_result)
                     self._capture_processing_snapshot(
                         analysis_dir,
                         processing_snapshots,
@@ -2673,7 +2872,10 @@ class ClipRecorder:
                     writer.release()
                 writer = None
             if raw_writer is not None:
-                raw_writer.release()
+                if isinstance(raw_writer, NvencVideoWriter):
+                    raw_writer.abort()
+                else:
+                    raw_writer.release()
                 raw_writer = None
             delete_clip_paths(
                 self.args.output_dir,
@@ -2704,7 +2906,10 @@ class ClipRecorder:
             if writer is not None:
                 writer.release()
             if raw_writer is not None:
-                raw_writer.release()
+                if isinstance(raw_writer, NvencVideoWriter):
+                    raw_writer.abort()
+                else:
+                    raw_writer.release()
             with self.lock:
                 self.active_recordings.pop(clip_index, None)
 
@@ -3064,6 +3269,9 @@ class LiveMvpRuntime:
                 raise RuntimeError("A stopped Live MVP runtime cannot be restarted")
             try:
                 self._initialize()
+                warm_up = getattr(self.processor, "warm_up", None)
+                if callable(warm_up):
+                    warm_up()
                 self.camera.start()
                 self.plc.start()
                 if self.reconciler is not None:
@@ -3520,12 +3728,15 @@ def api_live_frame():
     data = _processor.snapshot(include_images=not metadata_only)
     latest_item = _buffer.latest()
     if metadata_only:
-        result = data.get("result")
-        data["result"] = (
-            compact_live_result(result)
-            if isinstance(result, dict)
-            else None
-        )
+        measurement_result = _processor.live_measurement_snapshot()
+        if measurement_result is None:
+            result = data.get("result")
+            measurement_result = (
+                compact_live_result(result)
+                if isinstance(result, dict)
+                else None
+            )
+        data["result"] = measurement_result
         data["preview_frame_index"] = (
             int(latest_item["index"]) if latest_item is not None else None
         )

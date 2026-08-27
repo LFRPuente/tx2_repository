@@ -30,6 +30,7 @@ from live_mvp_app import (
     measurement_evidence_snapshots,
     measurement_marker_active,
     plc_status_with_signal_state,
+    write_json_atomic,
 )
 from tools.plc_triggered_video_recorder import edge_matches
 
@@ -42,6 +43,30 @@ HISTORY_TEMPLATE = (REPO_ROOT / "templates" / "history.html").read_text(
 HISTORY_SCRIPT = (REPO_ROOT / "static" / "js" / "history.js").read_text(
     encoding="utf-8"
 )
+
+
+class AtomicJsonTests(unittest.TestCase):
+    def test_concurrent_sidecar_updates_use_independent_temporary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "clip.json"
+            errors: list[Exception] = []
+
+            def write(value: int) -> None:
+                try:
+                    for _ in range(10):
+                        write_json_atomic(path, {"value": value})
+                except Exception as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=write, args=(value,)) for value in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2.0)
+
+            self.assertEqual(errors, [])
+            self.assertIn(json.loads(path.read_text(encoding="utf-8"))["value"], range(4))
+            self.assertEqual(list(Path(temp_dir).glob("*.tmp")), [])
 
 
 class FakeOverlayProcessor:
@@ -279,15 +304,32 @@ class RawCaptureTests(unittest.TestCase):
         self.assertIn("videokeyframeinterval=30", url)
         self.assertIn("axis%20user:p%40ss%20word@", url)
 
-    def test_direct_raw_copy_is_only_used_for_camera_sources(self) -> None:
+    def test_direct_raw_copy_requires_an_explicit_dedicated_camera_url(self) -> None:
         self.assertTrue(
             direct_raw_capture_enabled(
-                SimpleNamespace(save_raw_clips=True, source="rtsp")
+                SimpleNamespace(
+                    save_raw_clips=True,
+                    source="rtsp",
+                    raw_rtsp_url="rtsp://camera.example/raw",
+                )
             )
         )
         self.assertFalse(
             direct_raw_capture_enabled(
-                SimpleNamespace(save_raw_clips=True, source="video")
+                SimpleNamespace(
+                    save_raw_clips=True,
+                    source="rtsp",
+                    raw_rtsp_url="",
+                )
+            )
+        )
+        self.assertFalse(
+            direct_raw_capture_enabled(
+                SimpleNamespace(
+                    save_raw_clips=True,
+                    source="video",
+                    raw_rtsp_url="rtsp://camera.example/raw",
+                )
             )
         )
 
@@ -334,6 +376,40 @@ class LiveProcessorTests(unittest.TestCase):
             )
 
         self.assertEqual(processor.snapshot()["result"]["frame_index"], 90)
+
+    def test_live_diagram_keeps_the_plc_measurement_result(self) -> None:
+        processor = LiveProcessor(
+            SimpleNamespace(process_fps=10.0),
+            FrameBuffer(maxlen=8),
+        )
+        processor.publish_measurement_result(
+            {
+                "frame_index": 80,
+                "frame_utc": "plc-frame",
+                "rectified_width": 100,
+                "rectified_height": 200,
+                "pieces": [
+                    {
+                        "piece_id": 1,
+                        "box": {"x": 10, "y": 20, "w": 30, "h": 40},
+                        "sobel": {"line": {"y": 55}},
+                        "measurement": {"measurement_in": 480.0},
+                        "valid": True,
+                    }
+                ],
+                "original_image": "large-image-payload",
+            }
+        )
+        processor._set_state(
+            last_frame_index=90,
+            result={"frame_index": 90, "pieces": []},
+        )
+
+        result = processor.live_measurement_snapshot()
+
+        self.assertEqual(result["frame_index"], 80)
+        self.assertEqual(len(result["pieces"]), 1)
+        self.assertNotIn("original_image", result)
 
 
 class PlcEdgeTests(unittest.TestCase):

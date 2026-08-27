@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,7 +28,29 @@ class LiveVisionPipelineTests(unittest.TestCase):
         self.assertIn("h264_cuvid", command)
         self.assertIn("fps=10,hwdownload,format=nv12,format=bgr24", command)
         self.assertIn("bgr24", command)
+        self.assertEqual(command[command.index("-fflags") + 1], "nobuffer")
+        self.assertEqual(command[command.index("-flags") + 1], "low_delay")
+        self.assertEqual(command[command.index("-analyzeduration") + 1], "0")
+        self.assertEqual(command[command.index("-reorder_queue_size") + 1], "0")
         self.assertEqual(command[-1], "pipe:1")
+
+    def test_camera_snapshot_rejects_a_stale_connected_state(self) -> None:
+        reader = live.CameraReader(
+            SimpleNamespace(source="rtsp", record_fps=10.0),
+            live.FrameBuffer(maxlen=8),
+        )
+        reader._set_state(
+            connected=True,
+            last_frame_monotonic=100.0,
+            last_frame_utc="frame-time",
+        )
+
+        with patch("live_mvp_app.time.perf_counter", return_value=104.5):
+            status = reader.snapshot()
+
+        self.assertFalse(status["connected"])
+        self.assertEqual(status["last_frame_age_seconds"], 4.5)
+        self.assertIn("stale", status["error"].lower())
 
     def test_resolution_dimensions_parses_native_axis_resolution(self) -> None:
         self.assertEqual(live.resolution_dimensions("2880x2160"), (2880, 2160))
@@ -63,6 +87,9 @@ class LiveVisionPipelineTests(unittest.TestCase):
 
         self.assertEqual(command[command.index("-c:v") + 1], "h264_nvenc")
         self.assertEqual(command[command.index("-pix_fmt") + 1], "bgr24")
+        self.assertEqual(command[command.index("-preset") + 1], "p1")
+        self.assertEqual(command[command.index("-tune") + 1], "ll")
+        self.assertEqual(command[command.index("-rc") + 1], "cbr")
         self.assertIn("2880x2160", command)
         self.assertNotIn("libx264", command)
 
@@ -159,6 +186,40 @@ class LiveVisionPipelineTests(unittest.TestCase):
         self.assertTrue(status["ok"])
         self.assertEqual(status["processing_mode"], "plc_triggered_clip")
         self.assertEqual(status["processed_count"], 0)
+
+    def test_processor_warmup_uses_rectified_shape_without_publishing_a_result(self) -> None:
+        processor = live.LiveProcessor(
+            SimpleNamespace(device="cpu", conf=0.1, imgsz=960),
+            live.FrameBuffer(maxlen=8),
+        )
+        calibration = {
+            "exclusion_zones": [],
+            "exclusion_max_box_overlap": 0.2,
+        }
+        with (
+            patch.object(
+                live.vision,
+                "load_homography",
+                return_value=(np.eye(3), (32, 24), {}),
+            ),
+            patch.object(
+                live.vision,
+                "load_measurement_calibration",
+                return_value=calibration,
+            ),
+            patch.object(
+                live.vision,
+                "predict_yolo_boxes_with_rules",
+                return_value=([], {}),
+            ) as predict,
+        ):
+            processor.warm_up()
+
+        self.assertEqual(predict.call_args.args[0].shape, (24, 32, 3))
+        status = processor.snapshot()
+        self.assertTrue(status["warmup_complete"])
+        self.assertIsNotNone(status["warmup_duration_ms"])
+        self.assertIsNone(status["result"])
 
     def test_live_processor_applies_calibrated_zones_and_keeps_box_rules(self) -> None:
         processor = live.LiveProcessor(
@@ -286,6 +347,116 @@ class LiveVisionPipelineTests(unittest.TestCase):
         self.assertFalse(first["processing_cache_hit"])
         self.assertTrue(second["processing_cache_hit"])
         self.assertEqual(processor.snapshot()["processing_cache_hits"], 1)
+
+    def test_cached_overlay_is_materialized_outside_the_inference_lock(self) -> None:
+        processor = live.LiveProcessor(
+            SimpleNamespace(device="cpu", processing_cache_frames=4),
+            live.FrameBuffer(maxlen=8),
+        )
+        item = {
+            "index": 24,
+            "utc": "frame-24",
+            "monotonic": 24.0,
+            "frame": np.zeros((8, 8, 3), dtype=np.uint8),
+        }
+        analyzed = {
+            "frame_index": 24,
+            "frame_utc": "frame-24",
+            "frame_monotonic": 24.0,
+            "pieces": [],
+            "calibration": {},
+            "_original_overlay": {},
+            "_recording_frame": {
+                "index": 24,
+                "utc": "frame-24",
+                "monotonic": 24.0,
+                "frame": item["frame"],
+                "raw_frame": item["frame"],
+            },
+        }
+
+        with patch.object(processor, "_process", return_value=analyzed):
+            processor.process_clip_frame(item)
+        original_materialize = processor._materialize_cached_result
+
+        def materialize(*args, **kwargs):
+            self.assertFalse(processor.inference_lock.locked())
+            return original_materialize(*args, **kwargs)
+
+        with patch.object(
+            processor,
+            "_materialize_cached_result",
+            side_effect=materialize,
+        ):
+            processor.process_clip_frame(item)
+
+    def test_measurement_frame_runs_before_waiting_clip_work(self) -> None:
+        processor = live.LiveProcessor(
+            SimpleNamespace(device="cpu", processing_cache_frames=8),
+            live.FrameBuffer(maxlen=8),
+        )
+        first_started = threading.Event()
+        release_first = threading.Event()
+        processed_order: list[int] = []
+
+        def analyze(item, *, include_evidence_images=False):
+            index = int(item["index"])
+            processed_order.append(index)
+            if index == 1:
+                first_started.set()
+                release_first.wait(timeout=1.0)
+            return {
+                "frame_index": index,
+                "frame_utc": item["utc"],
+                "frame_monotonic": item["monotonic"],
+                "pieces": [],
+                "calibration": {},
+                "_original_overlay": {},
+                "_recording_frame": {
+                    **item,
+                    "raw_frame": item["frame"],
+                },
+            }
+
+        def item(index: int) -> dict:
+            return {
+                "index": index,
+                "utc": f"frame-{index}",
+                "monotonic": float(index),
+                "frame": np.zeros((8, 8, 3), dtype=np.uint8),
+            }
+
+        with patch.object(processor, "_process", side_effect=analyze):
+            first = threading.Thread(
+                target=processor.process_clip_frame,
+                args=(item(1),),
+            )
+            first.start()
+            self.assertTrue(first_started.wait(timeout=1.0))
+
+            measurement = threading.Thread(
+                target=processor.process_measurement_frame,
+                args=(item(2),),
+            )
+            measurement.start()
+            deadline = time.perf_counter() + 1.0
+            while (
+                not processor.measurement_priority.is_set()
+                and time.perf_counter() < deadline
+            ):
+                time.sleep(0.005)
+
+            trailing = threading.Thread(
+                target=processor.process_clip_frame,
+                args=(item(3),),
+            )
+            trailing.start()
+            release_first.set()
+            for thread in (first, measurement, trailing):
+                thread.join(timeout=2.0)
+                self.assertFalse(thread.is_alive())
+
+        self.assertEqual(processed_order, [1, 2, 3])
 
 
 if __name__ == "__main__":

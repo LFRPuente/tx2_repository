@@ -734,7 +734,7 @@ El resultado del procesador debe conservar los numeros sin formatear:
 
 El endpoint completo `/api/live/frame` conserva compatibilidad con clientes
 anteriores. La UI usa `/api/live/frame?metadata=1` para recibir solo geometria y
-mediciones, y `/api/live/stream.mp4` para recibir H.264 a 10 FPS dentro de
+mediciones, y `/api/live/stream.mp4` para recibir H.264 a 30 FPS dentro de
 fragmented MP4. FFmpeg usa `codec copy`: el navegador decodifica el video y el
 backend no genera un JPEG por frame. `/api/live/image.jpg` queda disponible
 solo bajo demanda para compatibilidad. Ninguna imagen debe guardarse como
@@ -1087,8 +1087,8 @@ nueva fila por cada reconexion.
 ### 13.3 Al cerrar el clip
 
 1. Cerrar correctamente `VideoWriter`.
-2. Finalizar la copia H.264 raw temporal y verificar resolucion, FPS y duracion
-   desde el contenedor MP4.
+2. Finalizar el MP4 raw temporal escrito por NVENC desde el buffer compartido y
+   verificar resolucion, FPS y duracion desde el contenedor MP4.
 3. Verificar si YOLO detecto al menos una pieza en cualquiera de los frames
    procesados de los 8 segundos.
 4. Si no hubo piezas, eliminar ambos MP4, snapshots temporales y evento pendiente;
@@ -1510,8 +1510,8 @@ temporal explicito, no una cola activada por errores de PostgreSQL.
 - [x] Conservar credenciales AXIS fuera del repo.
 - [x] Pedir `2880x2160` para Live y para el RAW temporal.
 - [x] Ejecutar YOLO/Sobel solo en clips PLC, procesando todos sus frames fuente,
-  y copiar H.264 raw a 10 FPS sin decodificar.
-- [x] Servir el Live a 10 FPS con H.264 copy, fragmented MP4 y metadata compacta.
+  y escribir el RAW a 10 FPS desde el buffer compartido mediante NVENC.
+- [x] Servir el Live a 30 FPS con H.264 copy, fragmented MP4 y metadata compacta.
 - [x] Decodificar H.264 del Live con NVIDIA NVDEC y fallback automatico a OpenCV.
 
 ### `requirements.txt`
@@ -1703,7 +1703,7 @@ Para 15 FPS:
 presupuesto promedio por frame <= 66.7 ms
 ```
 
-La vista Live de 10 FPS copia H.264 sin presupuesto de JPEG en Python. La
+La vista Live de 30 FPS copia H.264 sin presupuesto de JPEG en Python. La
 decodificacion NVDEC del buffer, la inferencia PLC y el MP4 procesado permanecen
 en 10 FPS.
 
@@ -1720,11 +1720,20 @@ Baseline validado el 2026-08-24 con un clip retenido a `2880x2160`, YOLO v3
 
 Cuellos corregidos:
 
-- el navegador usa H.264 copy a 10 FPS y no dispara YOLO/JPEG;
+- el navegador usa H.264 copy a 30 FPS y no dispara YOLO/JPEG;
 - el buffer PLC decodifica solamente 10 FPS con NVDEC;
 - no se genera JPEG en cada frame, solo en la evidencia canonica;
 - clips solapados reutilizan resultados por indice de frame y fingerprint de
   modelo/configuracion;
+- el frame alineado a la señal PLC tiene prioridad sobre el trabajo pendiente
+  de los clips y es la fuente estable del diagrama;
+- YOLO se calienta una sola vez con la geometria rectificada antes de iniciar
+  el monitor PLC para eliminar la latencia del primer trigger;
+- el RAW reutiliza el buffer decodificado y no abre otra sesion RTSP por evento;
+- los cache hits reconstruyen overlays fuera del lock de YOLO y las colas NVENC
+  conservan un solo frame pendiente por writer;
+- NVDEC usa prioridad alta y los writers NVENC prioridad baja con preset de
+  baja latencia `p1/ll`, conservando resolucion y bitrate;
 - NVIDIA NVENC escribe en una cola de fondo mientras se analiza el frame
   siguiente;
 - `stage_durations_ms`, cache hits/misses y encoder aparecen en status/sidecar.
@@ -1756,10 +1765,10 @@ No bajar la resolucion original guardada para compensar inferencia. Si hace
 falta, procesar una frecuencia menor que la captura o usar optimizacion
 TensorRT, manteniendo el frame original para evidencia.
 
-La consulta VAPIX y la prueba RTSP realizadas el 2026-08-24 confirmaron que el
-modo de captura desplegado acepta `2880x2160 @ 10 FPS` y devuelve HTTP 400 al
-solicitar 11 FPS o mas. No se debe cambiar el capture mode para ganar cadencia
-sin volver a validar encuadre, homografia y calibracion.
+La prueba RTSP realizada el 2026-08-27 confirmo el perfil desplegado a
+`2880x2160 @ 30 FPS`, con 138 frames recibidos en cinco segundos (27.6 FPS
+efectivos). El Live solicita ese perfil; el buffer de medicion selecciona 10 FPS
+sin cambiar el encuadre, la homografia ni la calibracion.
 
 ## 24. Health y observabilidad
 

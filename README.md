@@ -346,9 +346,17 @@ Benchmark from 2026-08-24 using a retained `2880x2160` clip, YOLO v3 at
 
 The previous path encoded a full JPEG for every processed frame and wrote H.264
 synchronously. The current path creates JPEG evidence only for the canonical
-PLC measurement frame, caches frame metadata for overlapping clips, and
-overlaps NVENC with the next frame's analysis. `/api/live/status` exposes the
-selected encoder, cache hit/miss counts, and the latest per-stage durations.
+PLC measurement frame, gives that frame priority over queued clip work, caches
+frame metadata for overlapping clips, and overlaps NVENC with the next frame's
+analysis. Cached overlays are rebuilt outside the YOLO lock, the cache covers
+up to 32 seconds at 10 FPS, and the NVENC input queue is deliberately bounded
+to one frame per writer to limit memory during overlapping events. Startup
+warms YOLO with the deployed rectified geometry before PLC monitoring begins,
+so the first production signal does not pay the model initialization cost. The
+camera decoder runs above the clip encoders in Windows scheduling priority;
+NVENC uses its low-latency `p1/ll` preset at the configured 16 Mbps.
+`/api/live/status` exposes the selected encoder, cache hit/miss counts, and the
+latest per-stage durations.
 
 It connects to the PLC through OPC UA and records one 8-second clip when
 `MeasureLength` changes from `False` to `True`. The recording is provisional
@@ -357,19 +365,21 @@ seconds, the processed MP4, temporary raw MP4, processing captures, sidecar,
 and pending database event are discarded.
 
 Temporary raw capture is enabled by `--save-raw-clips`. For a camera source,
-the app opens a separate `2880x2160`, 10 FPS RTSP stream and copies its H.264
-packets directly to `<clip>_raw.mp4` without decoding or overlays. YOLO remains
-at 10 FPS. The AXIS P1388-LE stream profile was changed to 30 FPS and validated
-on 2026-08-27 at `2880x2160`: an isolated five-second RTSP probe received 138
-frames (27.6 effective FPS). The measurement buffer, raw clips, and processed
-clips intentionally remain at 10 FPS. Remove the flag and the three `--raw-*`
-launcher arguments when this temporary data collection is complete.
+the app reuses the native `2880x2160` frames already decoded into the PLC
+buffer and writes `<clip>_raw.mp4` through NVENC without overlays. It does not
+open an RTSP stream per event. YOLO, raw clips, and processed clips remain at
+10 FPS. The AXIS P1388-LE stream profile was changed to 30 FPS and validated on
+2026-08-27 at `2880x2160`: an isolated five-second RTSP probe received 138
+frames (27.6 effective FPS). Remove the flag and the three `--raw-*` launcher
+arguments when this temporary data collection is complete.
 
 The automatic per-piece measurements for a retained event come from the camera
 frame immediately preceding the PLC signal. At that instant, the
 Live camera perimeter turns green and the same green perimeter is embedded in
 the processed MP4 for 0.8 seconds. The sidecar records the configured delay,
-the actual selected-frame offset, and the marked video frame range.
+the actual selected-frame offset, and the marked video frame range. This
+canonical frame bypasses queued clip frames, so the diagram updates from the
+PLC-aligned result instead of following the last frame completed by a clip.
 
 The database reconciler also verifies retained sidecar event IDs against the
 active database. A sidecar marked as synced is imported again if its database
@@ -392,7 +402,7 @@ processing snapshots, and the overlays produced while the clip was recorded.
 The MP4 itself contains the processed live camera view with the YOLO-derived
 reference and front overlays. While temporary raw capture is active, a
 `Raw clip` action opens the synchronized camera-only MP4.
-The Processing evidence section shows only the canonical `PLC + 2.0 seconds`
+The Processing evidence section shows only the canonical PLC-signal
 camera frame with a green perimeter. All processing snapshots remain available
 in the sidecar JSON and selected database for audit, but are not rendered as a
 gallery. The app retains the 100 most recent events and removes all processed,
@@ -401,7 +411,7 @@ raw, sidecar, and evidence artifacts belonging to older events automatically.
 The selected database is the History system of record. Each PLC signal creates an
 idempotent event, snapshots the active model/homography/calibration hashes,
 stores all processing snapshots, selects one canonical snapshot, and persists
-the per-piece automatic measurements from the `PLC + 2.0 seconds` snapshot.
+the per-piece automatic measurements from the PLC-signal snapshot.
 Operator corrections preserve the
 automatic value and create immutable audit revisions with optimistic
 concurrency checks. The SQLite schema keeps the event, piece, asset and revision
@@ -410,10 +420,10 @@ History API.
 
 The live frame buffer is capped to avoid retaining several gigabytes of images.
 Processed clips are streamed directly to disk and resampled to the configured
-output FPS. Temporary raw clips are copied directly from H.264, so their
-playback duration and native frame rate come from the camera stream. If a
-second PLC event arrives while another clip is active, both recording windows
-are preserved as separate clips.
+output FPS. Temporary raw clips reuse the same bounded decoded frame buffer and
+are encoded with NVENC, avoiding another camera connection. If a second PLC
+event arrives while another clip is active, both recording windows are
+preserved as separate clips and shared frame analyses are reused.
 
 Live MVP data is stored directly under:
 

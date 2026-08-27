@@ -27,6 +27,11 @@ class FakeComponent:
         self.events.append(f"{self.name}.stop")
 
 
+class FakeProcessor(FakeComponent):
+    def warm_up(self) -> None:
+        self.events.append("processor.warm_up")
+
+
 class FakeRecorder(FakeComponent):
     def validate_configuration(self) -> None:
         self.events.append("recorder.validate")
@@ -73,7 +78,7 @@ class LiveRuntimeTests(unittest.TestCase):
     def test_runtime_starts_once_and_stops_in_dependency_order(self) -> None:
         events: list[str] = []
         camera = FakeComponent("camera", events)
-        processor = FakeComponent("processor", events)
+        processor = FakeProcessor("processor", events)
         recorder = FakeRecorder("recorder", events)
         plc = FakeComponent("plc", events)
         args = SimpleNamespace(
@@ -103,6 +108,7 @@ class LiveRuntimeTests(unittest.TestCase):
             events,
             [
                 "recorder.validate",
+                "processor.warm_up",
                 "camera.start",
                 "plc.start",
                 "plc.stop",
