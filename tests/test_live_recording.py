@@ -412,6 +412,28 @@ class LiveProcessorTests(unittest.TestCase):
         self.assertEqual(len(result["pieces"]), 1)
         self.assertNotIn("original_image", result)
 
+    def test_live_measurement_image_is_bound_to_the_plc_event(self) -> None:
+        processor = LiveProcessor(
+            SimpleNamespace(process_fps=10.0),
+            FrameBuffer(maxlen=8),
+        )
+        frame = np.zeros((60, 80, 3), dtype=np.uint8)
+        processor.publish_measurement_result(
+            {
+                "plc_event_key": "event-42",
+                "_recording_frame": {"frame": frame},
+            }
+        )
+
+        jpeg = processor.live_measurement_image("event-42")
+
+        self.assertIsNotNone(jpeg)
+        decoded = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        self.assertEqual(decoded.shape[:2], frame.shape[:2])
+        self.assertGreater(int(decoded[2, 20, 1]), int(decoded[2, 20, 2]))
+        self.assertIs(jpeg, processor.live_measurement_image("event-42"))
+        self.assertIsNone(processor.live_measurement_image("another-event"))
+
 
 class PlcEdgeTests(unittest.TestCase):
     def test_summary_processor_status_excludes_heavy_result_payload(self) -> None:
@@ -460,10 +482,17 @@ class PlcEdgeTests(unittest.TestCase):
         self.assertIn("Last PLC Cut Signal", LIVE_SCRIPT)
         self.assertNotIn("Last PLC signal", LIVE_SCRIPT)
         self.assertIn("measurement-taken", LIVE_STYLE)
+        self.assertIn('id="plc-measurement-frame"', LIVE_TEMPLATE)
+        self.assertIn("/api/live/measurement.jpg?event_key=", LIVE_SCRIPT)
+        self.assertIn("exactFrameReady", LIVE_SCRIPT)
+        self.assertNotIn("presentationDelayMs", LIVE_SCRIPT)
         self.assertIn("measurementHighlightUntil", LIVE_SCRIPT)
         self.assertIn("pendingPlcPresentation", LIVE_SCRIPT)
         self.assertIn("updatePlcSignal(data.plc || {})", LIVE_SCRIPT)
         self.assertIn("keepLiveVideoNearEdge", LIVE_SCRIPT)
+        self.assertIn("monitorLiveVideo", LIVE_SCRIPT)
+        self.assertIn("LIVE_STALL_TIMEOUT_MS", LIVE_SCRIPT)
+        self.assertIn('addEventListener("stalled", reconnectLiveVideo)', LIVE_SCRIPT)
         self.assertIn("consecutiveStatusFailures", LIVE_SCRIPT)
         self.assertNotIn('setPill(byId("top-state"), "frame error"', LIVE_SCRIPT)
         self.assertIn("liveVideo.currentTime =", LIVE_SCRIPT)

@@ -451,6 +451,8 @@ def build_live_stream_command(
     source: str,
     *,
     rtsp_source: bool,
+    fps: float = 30.0,
+    bitrate_mbps: float = 16.0,
 ) -> list[str]:
     command = [
         str(ffmpeg_executable),
@@ -476,6 +478,12 @@ def build_live_stream_command(
                 "0",
                 "-max_delay",
                 "0",
+                "-hwaccel",
+                "cuda",
+                "-hwaccel_output_format",
+                "cuda",
+                "-c:v",
+                "h264_cuvid",
             )
         )
     else:
@@ -490,7 +498,27 @@ def build_live_stream_command(
             "-sn",
             "-dn",
             "-c:v",
-            "copy",
+            "h264_nvenc",
+            "-preset",
+            "p2",
+            "-tune",
+            "ll",
+            "-rc",
+            "cbr",
+            "-b:v",
+            f"{max(1.0, float(bitrate_mbps)):g}M",
+            "-maxrate",
+            f"{max(1.0, float(bitrate_mbps)):g}M",
+            "-bufsize",
+            f"{max(1.0, float(bitrate_mbps)) / 2.0:g}M",
+            "-g",
+            str(max(1, int(round(float(fps))))),
+            "-bf",
+            "0",
+            "-fps_mode",
+            "cfr",
+            "-r",
+            str(max(1, int(round(float(fps))))),
             "-movflags",
             "frag_every_frame+empty_moov+default_base_moof",
             "-avoid_negative_ts",
@@ -1432,13 +1460,16 @@ class CameraReader:
             if process.stdout is None:
                 return frame_index, False
             while not self.stop_event.is_set():
-                data = bytearray()
-                while len(data) < frame_bytes and not self.stop_event.is_set():
-                    chunk = process.stdout.read(frame_bytes - len(data))
-                    if not chunk:
+                data = bytearray(frame_bytes)
+                view = memoryview(data)
+                offset = 0
+                while offset < frame_bytes and not self.stop_event.is_set():
+                    bytes_read = process.stdout.readinto(view[offset:])
+                    if not bytes_read:
                         break
-                    data.extend(chunk)
-                if len(data) != frame_bytes:
+                    offset += bytes_read
+                view.release()
+                if offset != frame_bytes:
                     break
 
                 frame = np.frombuffer(data, dtype=np.uint8).reshape(
@@ -1579,6 +1610,7 @@ class LiveProcessor:
         self.measurement_priority = threading.Event()
         self.lock = threading.Lock()
         self.measurement_result: dict[str, Any] | None = None
+        self.measurement_image_cache: tuple[str, bytes] | None = None
         self.result_cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
         self.result_cache_limit = max(
             1,
@@ -1680,6 +1712,7 @@ class LiveProcessor:
     def publish_measurement_result(self, result: dict[str, Any]) -> None:
         with self.lock:
             self.measurement_result = result.copy()
+            self.measurement_image_cache = None
 
     def live_measurement_snapshot(self) -> dict[str, Any] | None:
         with self.lock:
@@ -1687,6 +1720,37 @@ class LiveProcessor:
             if not isinstance(result, dict):
                 return None
             return compact_live_result(result)
+
+    def live_measurement_image(self, event_key: str) -> bytes | None:
+        with self.lock:
+            result = self.measurement_result
+            if (
+                not isinstance(result, dict)
+                or result.get("plc_event_key") != event_key
+            ):
+                return None
+            if (
+                self.measurement_image_cache is not None
+                and self.measurement_image_cache[0] == event_key
+            ):
+                return self.measurement_image_cache[1]
+            recording_frame = result.get("_recording_frame")
+            if not isinstance(recording_frame, dict):
+                return None
+            frame = recording_frame.get("frame")
+            if not isinstance(frame, np.ndarray):
+                return None
+            frame = frame.copy()
+
+        jpeg = img_to_jpeg(draw_measurement_perimeter(frame), quality=85)
+        with self.lock:
+            current = self.measurement_result
+            if (
+                isinstance(current, dict)
+                and current.get("plc_event_key") == event_key
+            ):
+                self.measurement_image_cache = (event_key, jpeg)
+        return jpeg
 
     def process_clip_frame(
         self,
@@ -3961,9 +4025,10 @@ def api_live_status():
         live_stream={
             "codec": "h264",
             "transport": "fragmented_mp4",
-            "encoding": "copy",
+            "encoding": "nvidia_nvenc",
             "fps": float(_args.live_stream_fps),
             "resolution": str(_args.camera_resolution),
+            "bitrate_mbps": float(_args.video_bitrate_mbps),
         },
         plc=plc_status_with_signal_state(_plc.snapshot()),
         recorder=(
@@ -4020,6 +4085,8 @@ def api_live_stream():
             ffmpeg_executable,
             source,
             rtsp_source=rtsp_source,
+            fps=float(_args.live_stream_fps),
+            bitrate_mbps=float(_args.video_bitrate_mbps),
         ),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -4126,8 +4193,25 @@ def api_live_image():
     frame_index = int(latest_item["index"])
     jpeg = img_to_jpeg(latest_item["frame"], quality=80)
     response = Response(jpeg, mimetype="image/jpeg")
-    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Cache-Control"] = (
+        "no-store, no-cache, must-revalidate, max-age=0"
+    )
     response.headers["X-Frame-Index"] = str(frame_index)
+    return response
+
+
+@app.route("/api/live/measurement.jpg")
+def api_live_measurement_image():
+    event_key = request.args.get("event_key", "").strip()
+    if not event_key:
+        abort(400, description="event_key is required")
+    jpeg = _processor.live_measurement_image(event_key)
+    if jpeg is None:
+        abort(404, description="Measurement frame is not available for this event")
+    response = Response(jpeg, mimetype="image/jpeg")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-TX2-PLC-Event-Key"] = event_key
     return response
 
 

@@ -55,11 +55,13 @@ class LiveVisionPipelineTests(unittest.TestCase):
     def test_resolution_dimensions_parses_native_axis_resolution(self) -> None:
         self.assertEqual(live.resolution_dimensions("2880x2160"), (2880, 2160))
 
-    def test_live_stream_command_copies_h264_into_fragmented_mp4(self) -> None:
+    def test_live_stream_command_normalizes_h264_with_nvidia(self) -> None:
         command = live.build_live_stream_command(
             Path("ffmpeg.exe"),
             "rtsp://camera.example/stream",
             rtsp_source=True,
+            fps=30.0,
+            bitrate_mbps=16.0,
         )
 
         self.assertIn("-rtsp_transport", command)
@@ -70,13 +72,23 @@ class LiveVisionPipelineTests(unittest.TestCase):
         self.assertEqual(command[command.index("-reorder_queue_size") + 1], "0")
         self.assertEqual(command[command.index("-max_delay") + 1], "0")
         self.assertEqual(command[command.index("-flush_packets") + 1], "1")
-        self.assertEqual(command[command.index("-c:v") + 1], "copy")
+        codecs = [
+            command[index + 1]
+            for index, value in enumerate(command[:-1])
+            if value == "-c:v"
+        ]
+        self.assertEqual(codecs, ["h264_cuvid", "h264_nvenc"])
+        self.assertEqual(command[command.index("-b:v") + 1], "16M")
+        self.assertEqual(command[command.index("-fps_mode") + 1], "cfr")
+        self.assertEqual(command[command.index("-r") + 1], "30")
+        self.assertEqual(command[command.index("-g") + 1], "30")
+        self.assertEqual(command[command.index("-bf") + 1], "0")
         self.assertIn(
             "frag_every_frame+empty_moov+default_base_moof",
             command,
         )
         self.assertEqual(command[-2:], ["mp4", "pipe:1"])
-        self.assertNotIn("h264_nvenc", command)
+        self.assertNotIn("copy", command)
 
     def test_clip_writer_command_uses_nvidia_encoder(self) -> None:
         command = live.build_nvenc_writer_command(

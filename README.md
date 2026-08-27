@@ -349,11 +349,13 @@ measurement diagram. It requests the AXIS stream at its configured
 whose H.264 packets are copied without decoding or re-encoding. The camera
 reader requests the same fixed 30 FPS profile, then NVDEC selects 10 FPS for the
 PLC inference buffer and processed clips. The browser stream therefore does not
-double YOLO/Sobel work or JPEG encoding. A short FFmpeg startup probe, per-frame
-MP4 fragmentation, playback-rate catch-up without MP4 seeks, and three-sample
-status hysteresis keep the operator view close to real time without false
-disconnect flashes. The 30 FPS presentation path remains independent of the 10
-FPS PLC measurement and recording path.
+double YOLO/Sobel work or JPEG encoding. NVDEC/NVENC normalizes the camera's
+bursty H.264 timestamps to constant 30 FPS at the configured 16 Mbps while
+preserving `2880x2160`. Per-frame MP4 fragmentation, playback-rate catch-up, a
+3.5-second frozen-playback watchdog, and three-sample status hysteresis keep the
+operator view close to real time without leaving a stalled player on screen.
+The 30 FPS presentation path remains independent of the 10 FPS PLC measurement
+and recording path.
 The one-second health poll also uses a compact processor summary instead of
 resending piece and Sobel evidence already supplied by the analysis endpoint.
 YOLO runs through TensorRT on the L40S and
@@ -388,8 +390,12 @@ up to 32 seconds at 10 FPS, and the NVENC input queue is deliberately bounded
 to one frame per writer to limit memory during overlapping events. Startup
 warms YOLO with the deployed rectified geometry before PLC monitoring begins,
 so the first production signal does not pay the model initialization cost. The
-camera decoder runs above the clip encoders in Windows scheduling priority;
-NVENC uses its low-latency `p1/ll` preset at the configured 16 Mbps.
+camera decoder runs above the clip encoders in Windows scheduling priority and
+fills each retained frame directly instead of copying an intermediate 18.7 MB
+buffer. On the deployed two-vCPU host this reduced the Python process sample
+from 25.9% to 18.0% of total CPU.
+Clip NVENC uses its low-latency `p1/ll` preset. The browser stream uses `p2/ll`,
+constant 30 FPS, a one-second GOP with no B-frames, and the configured 16 Mbps.
 `/api/live/status` exposes the selected encoder, cache hit/miss counts, and the
 latest per-stage durations.
 
@@ -412,9 +418,11 @@ frame immediately preceding the PLC signal. The recorder freezes that frame
 while accepting the PLC edge, before starting the asynchronous YOLO task, so a
 busy inference queue cannot replace it with a different frame. The same frame
 is embedded in the saved evidence JPEG with a green perimeter. The Live UI
-delays its PLC highlight by the current browser playback lag and presents the
-PLC-aligned diagram under the same event key. The browser also seeks back to
-the Live edge if its fMP4 buffer exceeds the low-latency limit.
+requests that exact in-memory frame by `plc_event_key` and presents it, the
+green perimeter, the PLC notification, and the diagram together. It no longer
+estimates synchronization from the independent browser RTSP timeline. The video
+continues underneath the brief exact-frame overlay and catches up to the Live
+edge if its fMP4 buffer exceeds the low-latency limit.
 
 `/api/live/frame?metadata=1` exposes `preview_frame_utc` and
 `preview_frame_age_ms`. The PLC payload exposes `delivery_latency_ms`, while

@@ -182,6 +182,7 @@ h2 {
 .stage::after {
   position: absolute;
   inset: 0;
+  z-index: 3;
   border: 0 solid #2ecc71;
   content: "";
   pointer-events: none;
@@ -200,9 +201,27 @@ h2 {
   object-fit: contain;
 }
 
+.measurement-frame {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  visibility: hidden;
+  opacity: 0;
+}
+
+.measurement-frame.visible {
+  visibility: visible;
+  opacity: 1;
+}
+
 .stream-state {
   position: absolute;
   inset: 0;
+  z-index: 4;
   display: grid;
   place-items: center;
   pointer-events: none;
