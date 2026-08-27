@@ -20,16 +20,23 @@ $outputDir = Join-Path $root "outputs"
 $defaultSqlitePath = Join-Path $outputDir "tx2_live_mvp.sqlite3"
 $datasetDir = Join-Path $root "dataset_pieces"
 $pieceModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v3\weights\best.pt"
+$pieceEnginePath = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v3\weights\best.engine"
 $previousPieceModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v2\weights\best.pt"
 $olderPieceModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_pieces_v1\weights\best.pt"
 $legacyModelPath = Join-Path $root "runs\detect\runs_tx2\yolo11n_tubos_v1\weights\best.pt"
-$modelPath = @($pieceModelPath, $previousPieceModelPath, $olderPieceModelPath, $legacyModelPath) |
+$modelPath = @($pieceEnginePath, $pieceModelPath, $previousPieceModelPath, $olderPieceModelPath, $legacyModelPath) |
     Where-Object { Test-Path -LiteralPath $_ } |
     Select-Object -First 1
 if (-not $modelPath) {
     throw "No YOLO model was found. Expected the current model at: $pieceModelPath"
 }
-if ($modelPath -eq $legacyModelPath) {
+if ($modelPath -eq $pieceEnginePath) {
+    Write-Host "Inference: TensorRT FP16"
+    $modelHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $modelPath).Hash
+    Write-Host "Model: individual pieces ($modelPath)"
+    Write-Host "Model SHA-256: $modelHash"
+}
+elseif ($modelPath -eq $legacyModelPath) {
     Write-Warning "Individual-piece model not found. Live inference is using the legacy package model."
 }
 else {

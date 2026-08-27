@@ -1773,6 +1773,33 @@ No bajar la resolucion original guardada para compensar inferencia. Si hace
 falta, procesar una frecuencia menor que la captura o usar optimizacion
 TensorRT, manteniendo el frame original para evidencia.
 
+TensorRT quedo integrado el 2026-08-27 para la NVIDIA L40S. El launcher busca
+primero `yolo11n_pieces_v3/weights/best.engine` y conserva `best.pt` como
+respaldo automatico. El engine es FP16 dinamico a `imgsz=960`: la dimension
+espacial dinamica es obligatoria para conservar el padding rectangular que usa
+PyTorch; un engine estatico `960x960` produjo cajas distintas y fue descartado.
+
+Validacion A/B sobre ocho frames actuales, despues de la homografia guardada:
+
+| Medida YOLO | PyTorch CUDA | TensorRT FP16 |
+|---|---:|---:|
+| Inferencia promedio | 37.19 ms | 2.12 ms |
+| `predict()` mediana | 14.45 ms | 5.59 ms |
+| Frames con conteo identico | 8/8 | 8/8 |
+| IoU media de cajas pareadas | referencia | 0.99188 |
+
+El engine se genera localmente porque depende de GPU, driver, CUDA y TensorRT:
+
+```powershell
+.\.venv-gpu\Scripts\python.exe -m pip install -r requirements-tensorrt.txt
+.\.venv-gpu\Scripts\python.exe tools\export_tensorrt_model.py --force
+```
+
+`/api/live/status` expone `inference_backend`, `inference_model`,
+`inference_fallback_active` e `inference_backend_error`. Sobel, homografia,
+reglas y overlays siguen en CPU; en este host mover la homografia completa a
+GPU fue mas lento por las transferencias de memoria.
+
 La prueba RTSP realizada el 2026-08-27 confirmo el perfil desplegado a
 `2880x2160 @ 30 FPS`, con 138 frames recibidos en cinco segundos (27.6 FPS
 efectivos). El Live solicita ese perfil; el buffer de medicion selecciona 10 FPS

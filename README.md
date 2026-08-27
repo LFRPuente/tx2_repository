@@ -257,6 +257,22 @@ launcher prefers `.venv-gpu\Scripts\python.exe` automatically and resolves
 .\run_live_mvp_app.ps1 -Device auto
 ```
 
+The deployed L40S host can run the v3 detector through TensorRT. Install the
+optional export/runtime dependencies and build the hardware-specific dynamic
+FP16 engine once:
+
+```powershell
+.\.venv-gpu\Scripts\python.exe -m pip install -r requirements-tensorrt.txt
+.\.venv-gpu\Scripts\python.exe tools\export_tensorrt_model.py --force
+```
+
+`run_live_mvp_app.ps1` selects `best.engine` before `best.pt`. The engine keeps
+dynamic spatial dimensions so the rectangular YOLO input is identical to the
+PyTorch path. If the engine is absent or cannot load on the installed GPU, the
+Live automatically falls back to the matching checkpoint. TensorRT engines
+are generated locally because they depend on the GPU, TensorRT, CUDA, and
+driver versions; they are not committed to Git.
+
 Use the single-process Waitress launcher for the IIS backend:
 
 ```powershell
@@ -283,8 +299,9 @@ approved VPN address range. This direct mode does not provide IIS Windows
 Authentication or TLS, so it is intended only for the internal pilot. Remove
 `TX2_LISTEN_ADDRESS` to return to the loopback-only IIS backend.
 
-The selected device, GPU name, PyTorch version, and CUDA runtime are exposed
-under `processor` in `/api/live/status`. Use `-Device cpu` only for an explicit
+The selected device, GPU name, inference backend and active model are exposed
+under `processor` in `/api/live/status`. The same payload reports whether the
+PyTorch fallback was activated and why. Use `-Device cpu` only for an explicit
 CPU fallback.
 
 ### Current PLC capture mode
@@ -339,7 +356,7 @@ disconnect flashes. The 30 FPS presentation path remains independent of the 10
 FPS PLC measurement and recording path.
 The one-second health poll also uses a compact processor summary instead of
 resending piece and Sobel evidence already supplied by the analysis endpoint.
-YOLO runs on CUDA and
+YOLO runs through TensorRT on the L40S and
 processed clips are written through an asynchronous NVIDIA NVENC queue. The
 homography intentionally stays in OpenCV CPU: on the deployed L40S host it is
 faster than transferring the full 2880x2160 frame to CUDA and back before YOLO.
@@ -375,6 +392,13 @@ camera decoder runs above the clip encoders in Windows scheduling priority;
 NVENC uses its low-latency `p1/ll` preset at the configured 16 Mbps.
 `/api/live/status` exposes the selected encoder, cache hit/miss counts, and the
 latest per-stage durations.
+
+TensorRT validation on 2026-08-27 used eight current `2880x2160` camera frames
+after the saved homography. The dynamic FP16 engine matched the PyTorch count
+on 8/8 frames, with mean matched-box IoU `0.99188`. Mean YOLO inference time
+fell from `37.19 ms` to `2.12 ms`; median full `predict()` wall time was
+`14.45 ms` for PyTorch and `5.59 ms` for TensorRT. A static square engine was
+explicitly rejected because it changed the detector geometry and results.
 
 It connects to the PLC through OPC UA and creates one measurement snapshot when
 `MeasureLength` changes from `False` to `True`. If YOLO does not detect a piece

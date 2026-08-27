@@ -28,6 +28,7 @@ DEFAULT_DATASET_DIR = PROJECT_ROOT / "dataset_pieces"
 DEFAULT_PIECE_MODEL = (
     PROJECT_ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v3" / "weights" / "best.pt"
 )
+DEFAULT_PIECE_ENGINE = DEFAULT_PIECE_MODEL.with_suffix(".engine")
 PREVIOUS_PIECE_MODEL = (
     PROJECT_ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v2" / "weights" / "best.pt"
 )
@@ -41,6 +42,7 @@ DEFAULT_MODEL = next(
     (
         path
         for path in (
+            DEFAULT_PIECE_ENGINE,
             DEFAULT_PIECE_MODEL,
             PREVIOUS_PIECE_MODEL,
             OLDER_PIECE_MODEL,
@@ -2082,15 +2084,85 @@ def yolo_device_info() -> dict:
 
 
 def load_yolo_model():
-    global _yolo_model
+    global _yolo_backend_error, _yolo_model, _yolo_model_path
     if _yolo_model is None:
         from ultralytics import YOLO
 
         if not _args.model.exists():
             raise RuntimeError(f"No existe el modelo YOLO: {_args.model}")
-        _yolo_model = YOLO(str(_args.model))
-        _yolo_model.to(yolo_device_info()["device"])
+        _yolo_model_path = _args.model.resolve()
+        _yolo_model = YOLO(
+            str(_yolo_model_path),
+            task="detect" if _yolo_model_path.suffix.lower() == ".engine" else None,
+        )
+        if _yolo_model_path.suffix.lower() != ".engine":
+            _yolo_model.to(yolo_device_info()["device"])
+        _yolo_backend_error = ""
     return _yolo_model
+
+
+def yolo_backend_info() -> dict:
+    args = globals().get("_args")
+    requested = Path(getattr(args, "model", DEFAULT_MODEL)).resolve()
+    active = _yolo_model_path or requested
+    return {
+        "backend": "tensorrt" if active.suffix.lower() == ".engine" else "pytorch",
+        "requested_model": str(requested),
+        "active_model": str(active),
+        "fallback_active": active != requested,
+        "backend_error": _yolo_backend_error,
+    }
+
+
+def _pytorch_fallback_model(engine_path: Path) -> Path | None:
+    matching_checkpoint = engine_path.with_suffix(".pt")
+    if matching_checkpoint.exists():
+        return matching_checkpoint.resolve()
+    return next(
+        (
+            path.resolve()
+            for path in (
+                DEFAULT_PIECE_MODEL,
+                PREVIOUS_PIECE_MODEL,
+                OLDER_PIECE_MODEL,
+                DEFAULT_LEGACY_MODEL,
+            )
+            if path.exists()
+        ),
+        None,
+    )
+
+
+def _predict_with_yolo_model(model, rectified: np.ndarray, conf: float, imgsz: int):
+    return model.predict(
+        rectified,
+        conf=conf,
+        imgsz=imgsz,
+        device=yolo_device_info()["device"],
+        verbose=False,
+    )[0]
+
+
+def _retry_yolo_with_pytorch(
+    rectified: np.ndarray,
+    conf: float,
+    imgsz: int,
+    engine_error: Exception,
+):
+    global _yolo_backend_error, _yolo_model, _yolo_model_path
+
+    engine_path = _yolo_model_path or Path(_args.model).resolve()
+    fallback_path = _pytorch_fallback_model(engine_path)
+    if fallback_path is None:
+        raise engine_error
+
+    from ultralytics import YOLO
+
+    _yolo_backend_error = f"{type(engine_error).__name__}: {engine_error}"
+    _yolo_model_path = fallback_path
+    _yolo_model = YOLO(str(fallback_path))
+    _yolo_model.to(yolo_device_info()["device"])
+    return _predict_with_yolo_model(_yolo_model, rectified, conf, imgsz)
 
 
 def normalize_exclusion_zones(
@@ -2179,13 +2251,13 @@ def predict_yolo_boxes_with_rules(
     exclusion_max_overlap: float = EXCLUSION_ZONE_MAX_BOX_OVERLAP,
 ) -> tuple[list[dict], dict]:
     model = load_yolo_model()
-    result = model.predict(
-        rectified,
-        conf=conf,
-        imgsz=imgsz,
-        device=yolo_device_info()["device"],
-        verbose=False,
-    )[0]
+    try:
+        result = _predict_with_yolo_model(model, rectified, conf, imgsz)
+    except Exception as exc:
+        active_path = _yolo_model_path or Path(_args.model)
+        if active_path.suffix.lower() != ".engine":
+            raise
+        result = _retry_yolo_with_pytorch(rectified, conf, imgsz, exc)
     normalized_zones = normalize_exclusion_zones(exclusion_zones, image_shape=rectified.shape)
     if result.boxes is None or len(result.boxes) == 0:
         return [], {
@@ -2508,6 +2580,8 @@ _image: np.ndarray | None = None
 _source_label = ""
 _yolo_model = None
 _yolo_device_info: dict | None = None
+_yolo_model_path: Path | None = None
+_yolo_backend_error = ""
 _piece_box_profile_cache: dict | None = None
 _lens_map_cache: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
 

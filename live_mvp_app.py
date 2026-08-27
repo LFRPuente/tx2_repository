@@ -57,6 +57,7 @@ DEFAULT_VIDEO = Path(r"C:\Users\luis_\Downloads\20260724_10\20260724_100105_6439
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
 DEFAULT_DATASET_DIR = ROOT / "dataset_pieces"
 DEFAULT_PIECE_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v3" / "weights" / "best.pt"
+DEFAULT_PIECE_ENGINE = DEFAULT_PIECE_MODEL.with_suffix(".engine")
 PREVIOUS_PIECE_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v2" / "weights" / "best.pt"
 OLDER_PIECE_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_pieces_v1" / "weights" / "best.pt"
 DEFAULT_LEGACY_MODEL = ROOT / "runs" / "detect" / "runs_tx2" / "yolo11n_tubos_v1" / "weights" / "best.pt"
@@ -64,6 +65,7 @@ DEFAULT_MODEL = next(
     (
         path
         for path in (
+            DEFAULT_PIECE_ENGINE,
             DEFAULT_PIECE_MODEL,
             PREVIOUS_PIECE_MODEL,
             OLDER_PIECE_MODEL,
@@ -330,6 +332,10 @@ def compact_processor_status(status: dict[str, Any]) -> dict[str, Any]:
         "last_duration_ms",
         "inference_device",
         "inference_device_name",
+        "inference_backend",
+        "inference_model",
+        "inference_fallback_active",
+        "inference_backend_error",
         "cuda_available",
         "homography_backend",
         "warmup_complete",
@@ -1568,6 +1574,7 @@ class LiveProcessor:
         self.args = args
         self.buffer = buffer
         device_info = vision.resolve_yolo_device(getattr(args, "device", "auto"))
+        configured_model = Path(getattr(args, "model", DEFAULT_MODEL)).resolve()
         self.inference_lock = threading.Lock()
         self.measurement_priority = threading.Event()
         self.lock = threading.Lock()
@@ -1592,6 +1599,12 @@ class LiveProcessor:
             "last_duration_ms": None,
             "inference_device": device_info["device"],
             "inference_device_name": device_info["device_name"],
+            "inference_backend": (
+                "tensorrt" if configured_model.suffix.lower() == ".engine" else "pytorch"
+            ),
+            "inference_model": str(configured_model),
+            "inference_fallback_active": False,
+            "inference_backend_error": "",
             "cuda_available": device_info["cuda_available"],
             "torch_version": device_info["torch_version"],
             "torch_cuda_version": device_info["torch_cuda_version"],
@@ -1623,12 +1636,17 @@ class LiveProcessor:
                     )
                 ),
             )
+        backend_info = vision.yolo_backend_info()
         self._set_state(
             warmup_complete=True,
             warmup_duration_ms=round(
                 (time.perf_counter() - started) * 1000.0,
                 1,
             ),
+            inference_backend=backend_info["backend"],
+            inference_model=backend_info["active_model"],
+            inference_fallback_active=backend_info["fallback_active"],
+            inference_backend_error=backend_info["backend_error"],
         )
 
     def snapshot(self, include_images: bool = False) -> dict[str, Any]:
@@ -1704,6 +1722,7 @@ class LiveProcessor:
             result["processing_cache_hit"] = cache_hit
             duration_ms = round((time.perf_counter() - started) * 1000.0, 1)
             result_frame_index = int(result["frame_index"])
+            backend_info = vision.yolo_backend_info()
             with self.lock:
                 updates = dict(
                     ok=True,
@@ -1714,6 +1733,10 @@ class LiveProcessor:
                     last_duration_ms=duration_ms,
                     homography_backend="opencv_cpu",
                     last_stage_durations_ms=result.get("stage_durations_ms"),
+                    inference_backend=backend_info["backend"],
+                    inference_model=backend_info["active_model"],
+                    inference_fallback_active=backend_info["fallback_active"],
+                    inference_backend_error=backend_info["backend_error"],
                 )
                 cache_state_key = (
                     "processing_cache_hits"
@@ -1880,6 +1903,7 @@ class LiveProcessor:
             (time.perf_counter() - stage_started) * 1000.0,
             2,
         )
+        backend_info = vision.yolo_backend_info()
 
         rect_h, rect_w = rectified.shape[:2]
         src_h, src_w = original.shape[:2]
@@ -1929,7 +1953,9 @@ class LiveProcessor:
                 for piece in pieces
                 if (piece.get("sobel") or {}).get("line")
             ],
-            "model": str(self.args.model),
+            "model": backend_info["active_model"],
+            "inference_backend": backend_info["backend"],
+            "inference_fallback_active": backend_info["fallback_active"],
             "conf": float(self.args.conf),
             "homography_backend": "opencv_cpu",
             "_original_overlay": original_overlay,
