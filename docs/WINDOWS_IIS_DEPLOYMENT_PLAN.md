@@ -69,8 +69,10 @@ Web local:       http://127.0.0.1:8767
 URL objetivo:    https://tx2-measurement.barnstxprod.local
 Camara default:  10.14.115.241
 Resolucion:      2880x2160
+Perfil RTSP:     30 FPS fijo
 YOLO/Sobel:      10 FPS objetivo
-Live/Raw:        10 FPS (maximo a 2880x2160 aceptado por la camara)
+Live:            30 FPS a 2880x2160
+Raw:             10 FPS a 2880x2160
 PLC OPC UA:      opc.tcp://10.14.6.48:49320
 Trigger:         ns=2;s=ControlLogix.AS20.VisionSystem.MeasureLength
 Watchdog:        ns=2;s=ControlLogix.AS20.VisionSystem.VisionWD
@@ -78,10 +80,12 @@ Grabacion:       8 segundos por evento
 Medicion:        frame inmediatamente anterior/alineado a la senal PLC
 ```
 
-La camara fue consultada por VAPIX y probada por RTSP el 2026-08-24. El capture
-mode vigente admite `2880x2160 @ 10 FPS`; solicitudes de 11, 12, 15, 20, 25 o
-30 FPS devuelven `400 Bad Request`. No se cambia el capture mode porque puede
-alterar el encuadre y obligaria a recalibrar homografia y mediciones.
+La camara es una AXIS P1388-LE. El perfil fue actualizado a 30 FPS y validado
+por RTSP el 2026-08-27: a `2880x2160` entrego 138 frames en 5.03 segundos
+(27.6 FPS efectivos). El Live copia ese H.264 sin recodificar. La conexion de
+captura solicita el mismo perfil fijo de 30 FPS y NVDEC selecciona 10 FPS para
+YOLO/Sobel y clips procesados; los clips raw tambien permanecen a 10 FPS para
+conservar el flujo de medicion y almacenamiento existente.
 
 ## 4. Arquitectura recomendada para la primera etapa
 

@@ -310,13 +310,15 @@ http://127.0.0.1:8767
 
 The Live MVP provides a light interface with the live camera view and
 measurement diagram. It requests the AXIS stream at its configured
-`2880x2160` resolution. The browser receives a separate 10 FPS fragmented MP4
-whose H.264 packets are copied without decoding or re-encoding. A 10 FPS NVDEC
-camera buffer feeds PLC inference and processed clips, so the browser stream
-does not double YOLO/Sobel work or JPEG encoding. A short FFmpeg startup probe,
-per-frame MP4 fragmentation, playback-rate catch-up without MP4 seeks, and
-three-sample status hysteresis keep the operator view close to real time without
-false disconnect flashes or invented frames above the camera's 10 FPS limit.
+`2880x2160` resolution. The browser receives a separate 30 FPS fragmented MP4
+whose H.264 packets are copied without decoding or re-encoding. The camera
+reader requests the same fixed 30 FPS profile, then NVDEC selects 10 FPS for the
+PLC inference buffer and processed clips. The browser stream therefore does not
+double YOLO/Sobel work or JPEG encoding. A short FFmpeg startup probe, per-frame
+MP4 fragmentation, playback-rate catch-up without MP4 seeks, and three-sample
+status hysteresis keep the operator view close to real time without false
+disconnect flashes. The 30 FPS presentation path remains independent of the 10
+FPS PLC measurement and recording path.
 The one-second health poll also uses a compact processor summary instead of
 resending piece and Sobel evidence already supplied by the analysis endpoint.
 YOLO runs on CUDA and
@@ -357,11 +359,11 @@ and pending database event are discarded.
 Temporary raw capture is enabled by `--save-raw-clips`. For a camera source,
 the app opens a separate `2880x2160`, 10 FPS RTSP stream and copies its H.264
 packets directly to `<clip>_raw.mp4` without decoding or overlays. YOLO remains
-at 10 FPS. A camera capability probe on 2026-08-24 confirmed that the deployed
-capture mode rejects requested rates above 10 FPS at this resolution. Changing
-the sensor capture mode can alter framing and requires homography/calibration
-validation first. Remove the flag and the three `--raw-*` launcher arguments
-when this temporary data collection is complete.
+at 10 FPS. The AXIS P1388-LE stream profile was changed to 30 FPS and validated
+on 2026-08-27 at `2880x2160`: an isolated five-second RTSP probe received 138
+frames (27.6 effective FPS). The measurement buffer, raw clips, and processed
+clips intentionally remain at 10 FPS. Remove the flag and the three `--raw-*`
+launcher arguments when this temporary data collection is complete.
 
 The automatic per-piece measurements for a retained event come from the camera
 frame immediately preceding the PLC signal. At that instant, the

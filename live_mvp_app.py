@@ -707,8 +707,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--conf", type=float, default=0.10)
     parser.add_argument("--imgsz", type=int, default=960)
-    parser.add_argument("--capture-fps", type=float, default=10.0)
-    parser.add_argument("--live-stream-fps", type=float, default=10.0)
+    parser.add_argument("--capture-fps", type=float, default=30.0)
+    parser.add_argument("--live-stream-fps", type=float, default=30.0)
     parser.add_argument(
         "--live-rtsp-url",
         default=os.environ.get("AXIS_LIVE_RTSP_URL", ""),
@@ -821,12 +821,14 @@ def _axis_rtsp_url(
 
 
 def build_rtsp_url(args: argparse.Namespace) -> str:
-    return _axis_rtsp_url(
+    url = _axis_rtsp_url(
         args,
         str(args.camera_resolution),
         float(args.capture_fps),
         str(args.rtsp_url),
     )
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}videozfpsmode=fixed"
 
 
 def build_live_rtsp_url(args: argparse.Namespace) -> str:

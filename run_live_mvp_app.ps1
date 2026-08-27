@@ -145,8 +145,8 @@ if ($Production) {
   --model $modelPath `
   --device $Device `
   --conf $Confidence `
-  --capture-fps 10 `
-  --live-stream-fps 10 `
+  --capture-fps 30 `
+  --live-stream-fps 30 `
   --buffer-seconds 3 `
   --buffer-max-frames 60 `
   --record-seconds 8 `

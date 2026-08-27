@@ -84,15 +84,32 @@ class LiveVisionPipelineTests(unittest.TestCase):
                 camera_ip="camera.example",
                 codec="h264",
                 camera_resolution="2880x2160",
-                live_stream_fps=10.0,
+                live_stream_fps=30.0,
                 live_rtsp_url="",
             )
         )
 
         self.assertIn("resolution=2880x2160", url)
-        self.assertIn("fps=10", url)
+        self.assertIn("fps=30", url)
         self.assertIn("videozfpsmode=fixed", url)
         self.assertNotIn("videokeyframeinterval", url)
+
+    def test_processing_rtsp_url_shares_the_fixed_30_fps_camera_profile(self) -> None:
+        url = live.build_rtsp_url(
+            SimpleNamespace(
+                camera_user="",
+                camera_password="",
+                camera_ip="camera.example",
+                codec="h264",
+                camera_resolution="2880x2160",
+                capture_fps=30.0,
+                rtsp_url="",
+            )
+        )
+
+        self.assertIn("resolution=2880x2160", url)
+        self.assertIn("fps=30", url)
+        self.assertIn("videozfpsmode=fixed", url)
 
     def test_live_processor_reports_resolved_inference_device(self) -> None:
         device_info = {
