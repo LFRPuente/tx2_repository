@@ -441,6 +441,7 @@ function startLiveVideo() {
   const generation = liveStreamGeneration + 1;
   liveStreamGeneration = generation;
   stopLiveVideoTransport();
+  liveVideo.dataset.streamError = "";
   liveStage.classList.remove("stream-ready");
   liveVideoState.textContent = "Connecting to camera...";
   lastLiveVideoProgressAt = Date.now();
@@ -510,6 +511,7 @@ liveVideo.addEventListener("playing", () => {
   clearTimeout(streamRetryTimer);
   streamRetryTimer = null;
   streamRetryDelayMs = 1000;
+  liveVideo.dataset.streamError = "";
   liveStage.classList.add("stream-ready");
   noteLiveVideoProgress();
   keepLiveVideoNearEdge();

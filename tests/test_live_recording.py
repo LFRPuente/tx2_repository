@@ -491,6 +491,7 @@ class PlcEdgeTests(unittest.TestCase):
         self.assertIn("updatePlcSignal(data.plc || {})", LIVE_SCRIPT)
         self.assertIn("new MediaSource()", LIVE_SCRIPT)
         self.assertIn("/api/live/heartbeat", LIVE_SCRIPT)
+        self.assertIn('liveVideo.dataset.streamError = "";', LIVE_SCRIPT)
         self.assertIn("keepLiveVideoNearEdge", LIVE_SCRIPT)
         self.assertIn("monitorLiveVideo", LIVE_SCRIPT)
         self.assertIn("LIVE_STALL_TIMEOUT_MS", LIVE_SCRIPT)
