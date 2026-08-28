@@ -5,9 +5,6 @@ let plcSignalHighlightUntil = 0;
 let measurementHighlightUntil = 0;
 let pendingPlcPresentation = null;
 let pendingDiagramResult = null;
-let exactMeasurementLoader = null;
-let exactMeasurementFrameKey = "";
-let exactMeasurementVisibleUntil = 0;
 let analysisRequestInFlight = false;
 let statusRequestInFlight = false;
 let lastDiagramFrameIndex = null;
@@ -16,14 +13,23 @@ let streamRetryDelayMs = 1000;
 let consecutiveStatusFailures = 0;
 let lastLiveVideoProgressAt = Date.now();
 let lastLiveVideoCurrentTime = -1;
+let liveStreamGeneration = 0;
+let liveStreamAbortController = null;
+let liveMediaSource = null;
+let liveObjectUrl = "";
+const liveClientId = window.crypto?.randomUUID?.()
+  || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 const STATUS_FAILURE_THRESHOLD = 3;
 const PLC_SIGNAL_HIGHLIGHT_MS = 4000;
 const MEASUREMENT_HIGHLIGHT_MS = 900;
-const LIVE_TARGET_LATENCY_SECONDS = 0.18;
-const LIVE_SOFT_LATENCY_SECONDS = 0.35;
-const LIVE_HARD_LATENCY_SECONDS = 0.9;
-const LIVE_STALL_TIMEOUT_MS = 3500;
+const LIVE_TARGET_LATENCY_SECONDS = 0.35;
+const LIVE_SOFT_LATENCY_SECONDS = 0.7;
+const LIVE_HARD_LATENCY_SECONDS = 1.5;
+const LIVE_STALL_TIMEOUT_MS = 8000;
+const LIVE_STARTUP_TIMEOUT_MS = 15000;
+const LIVE_APPEND_BYTES = 512 * 1024;
+const LIVE_MIME_TYPE = 'video/mp4; codecs="avc1.640033"';
 
 function setPill(element, text, tone) {
   element.textContent = text;
@@ -128,47 +134,33 @@ function plcTriggerKey(plc, trigger) {
   ].join("|");
 }
 
-function requestExactMeasurementFrame(eventKey) {
-  const pending = pendingPlcPresentation;
-  if (!pending || pending.key !== eventKey || pending.imageRequested) return;
-
-  pending.imageRequested = true;
-  const loader = new Image();
-  exactMeasurementLoader = loader;
-  loader.addEventListener("load", () => {
-    if (
-      exactMeasurementLoader !== loader
-      || !pendingPlcPresentation
-      || pendingPlcPresentation.key !== eventKey
-    ) return;
-
-    const frame = byId("plc-measurement-frame");
-    frame.src = loader.src;
-    frame.dataset.eventKey = eventKey;
-    pendingPlcPresentation.exactFrameReady = true;
-    presentPendingPlcEvent();
-  });
-  loader.addEventListener("error", () => {
-    if (pendingPlcPresentation?.key === eventKey) {
-      pendingPlcPresentation.imageRequested = false;
-    }
-  });
-  loader.src = `/api/live/measurement.jpg?event_key=${
-    encodeURIComponent(eventKey)
-  }&t=${Date.now()}`;
+function livePresentationDelayMs(trigger) {
+  let liveLatencyMs = 0;
+  if (liveVideo.buffered.length && liveVideo.readyState >= 1) {
+    const liveEdge = liveVideo.buffered.end(liveVideo.buffered.length - 1);
+    liveLatencyMs = Math.max(0, (liveEdge - liveVideo.currentTime) * 1000);
+  }
+  const timestamp = trigger.event_source_timestamp || trigger.read_utc;
+  const parsed = timestamp ? new Date(timestamp).getTime() : Number.NaN;
+  const eventAgeMs = Number.isFinite(parsed) ? Math.max(0, Date.now() - parsed) : 0;
+  return Math.min(2000, Math.max(0, liveLatencyMs - eventAgeMs));
 }
 
 function presentPendingPlcEvent() {
+  const now = Date.now();
   if (
     pendingPlcPresentation
-    && pendingPlcPresentation.resultReady
-    && pendingPlcPresentation.exactFrameReady
+    && !pendingPlcPresentation.presentationStarted
+    && now >= pendingPlcPresentation.presentAt
   ) {
-    const now = Date.now();
     plcSignalHighlightUntil = now + PLC_SIGNAL_HIGHLIGHT_MS;
     measurementHighlightUntil = now + MEASUREMENT_HIGHLIGHT_MS;
-    exactMeasurementFrameKey = pendingPlcPresentation.key;
-    exactMeasurementVisibleUntil = measurementHighlightUntil;
+    pendingPlcPresentation.presentationStarted = true;
+  }
+  if (
+    pendingPlcPresentation?.resultReady
+    && pendingPlcPresentation.presentationStarted
+  ) {
     pendingPlcPresentation = null;
   }
 
@@ -181,16 +173,9 @@ function presentPendingPlcEvent() {
     pendingDiagramResult = null;
   }
 
-  const now = Date.now();
-  const measurementFrame = byId("plc-measurement-frame");
-  const exactFrameVisible = (
-    now < exactMeasurementVisibleUntil
-    && measurementFrame.dataset.eventKey === exactMeasurementFrameKey
-  );
-  measurementFrame.classList.toggle("visible", exactFrameVisible);
   byId("original-stage").classList.toggle(
     "measurement-taken",
-    now < measurementHighlightUntil && exactFrameVisible,
+    Date.now() < measurementHighlightUntil,
   );
 }
 
@@ -202,7 +187,6 @@ function updatePlcSignal(plc) {
   if (!plc.connected) {
     plcSignalHighlightUntil = 0;
     measurementHighlightUntil = 0;
-    exactMeasurementVisibleUntil = 0;
     pendingPlcPresentation = null;
     signal.className = "plc-signal offline";
     text.textContent = "PLC disconnected";
@@ -210,7 +194,6 @@ function updatePlcSignal(plc) {
   } else if (!trigger) {
     plcSignalHighlightUntil = 0;
     measurementHighlightUntil = 0;
-    exactMeasurementVisibleUntil = 0;
     pendingPlcPresentation = null;
     signal.className = "plc-signal";
     text.textContent = "Waiting for PLC signal";
@@ -222,11 +205,16 @@ function updatePlcSignal(plc) {
       && (lastPlcTriggerKey !== null || Boolean(plc.signal_recent))
     );
     if (receivedNow) {
+      const now = Date.now();
+      const presentationDelayMs = livePresentationDelayMs(trigger);
+      byId("original-stage").dataset.plcPresentationDelayMs = (
+        presentationDelayMs.toFixed(0)
+      );
       pendingPlcPresentation = {
         key: triggerKey,
         resultReady: false,
-        exactFrameReady: false,
-        imageRequested: false,
+        presentAt: now + presentationDelayMs,
+        presentationStarted: false,
       };
       pendingDiagramResult = null;
     }
@@ -267,7 +255,6 @@ async function refreshAnalysis() {
     ) {
       pendingPlcPresentation.resultReady = true;
       pendingDiagramResult = result;
-      requestExactMeasurementFrame(pendingPlcPresentation.key);
     } else if (result && result.frame_index !== lastDiagramFrameIndex) {
       lastDiagramFrameIndex = result.frame_index;
       updateDiagram(result);
@@ -330,35 +317,173 @@ function keepLiveVideoNearEdge() {
   const latency = liveEdge - liveVideo.currentTime;
 
   if (latency > LIVE_HARD_LATENCY_SECONDS) {
-    liveVideo.currentTime = Math.max(
-      0,
-      liveEdge - LIVE_TARGET_LATENCY_SECONDS,
-    );
-    liveVideo.playbackRate = 1;
+    liveVideo.playbackRate = 1.25;
   } else if (latency > LIVE_SOFT_LATENCY_SECONDS) {
-    liveVideo.playbackRate = 1.12;
+    liveVideo.playbackRate = 1.1;
   } else if (liveVideo.playbackRate !== 1) {
     liveVideo.playbackRate = 1;
   }
+}
+
+function stopLiveVideoTransport() {
+  if (liveStreamAbortController) liveStreamAbortController.abort();
+  liveStreamAbortController = null;
+  liveMediaSource = null;
+  if (liveObjectUrl) URL.revokeObjectURL(liveObjectUrl);
+  liveObjectUrl = "";
+}
+
+function appendLiveChunk(sourceBuffer, chunk, generation) {
+  return new Promise((resolve, reject) => {
+    if (generation !== liveStreamGeneration) {
+      resolve();
+      return;
+    }
+
+    const cleanup = () => {
+      sourceBuffer.removeEventListener("updateend", onUpdateEnd);
+      sourceBuffer.removeEventListener("error", onError);
+    };
+    const onUpdateEnd = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error("The browser rejected a live video fragment."));
+    };
+
+    sourceBuffer.addEventListener("updateend", onUpdateEnd, { once: true });
+    sourceBuffer.addEventListener("error", onError, { once: true });
+    try {
+      sourceBuffer.appendBuffer(chunk);
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
+  });
+}
+
+async function trimLiveBuffer(sourceBuffer, generation) {
+  if (
+    generation !== liveStreamGeneration
+    || liveVideo.currentTime < 30
+    || !sourceBuffer.buffered.length
+  ) return;
+  const removeEnd = liveVideo.currentTime - 15;
+  if (sourceBuffer.buffered.start(0) >= removeEnd) return;
+  await new Promise((resolve, reject) => {
+    const cleanup = () => {
+      sourceBuffer.removeEventListener("updateend", onUpdateEnd);
+      sourceBuffer.removeEventListener("error", onError);
+    };
+    const onUpdateEnd = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error("Could not trim the live video buffer."));
+    };
+    sourceBuffer.addEventListener("updateend", onUpdateEnd, { once: true });
+    sourceBuffer.addEventListener("error", onError, { once: true });
+    try {
+      sourceBuffer.remove(0, removeEnd);
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
+  });
+}
+
+async function consumeLiveStream(mediaSource, generation) {
+  const sourceBuffer = mediaSource.addSourceBuffer(LIVE_MIME_TYPE);
+  const controller = new AbortController();
+  liveStreamAbortController = controller;
+  const response = await fetch(
+    `/api/live/stream.mp4?generation=${generation}&client_id=${
+      encodeURIComponent(liveClientId)
+    }`,
+    { cache: "no-store", signal: controller.signal },
+  );
+  if (!response.ok || !response.body) {
+    throw new Error(`Live stream returned HTTP ${response.status}.`);
+  }
+
+  const reader = response.body.getReader();
+  let pendingChunks = [];
+  let pendingBytes = 0;
+  while (generation === liveStreamGeneration) {
+    const { done, value } = await reader.read();
+    if (done) throw new Error("The live stream ended.");
+    if (!value?.byteLength) continue;
+    pendingChunks.push(value);
+    pendingBytes += value.byteLength;
+    if (pendingBytes < LIVE_APPEND_BYTES) continue;
+
+    const appendData = new Uint8Array(pendingBytes);
+    let offset = 0;
+    pendingChunks.forEach((part) => {
+      appendData.set(part, offset);
+      offset += part.byteLength;
+    });
+    pendingChunks = [];
+    pendingBytes = 0;
+    await appendLiveChunk(sourceBuffer, appendData, generation);
+    await trimLiveBuffer(sourceBuffer, generation);
+    if (generation !== liveStreamGeneration) return;
+    keepLiveVideoNearEdge();
+    liveVideo.play().catch(() => {});
+  }
+}
+
+function startLiveVideo() {
+  const generation = liveStreamGeneration + 1;
+  liveStreamGeneration = generation;
+  stopLiveVideoTransport();
+  liveStage.classList.remove("stream-ready");
+  liveVideoState.textContent = "Connecting to camera...";
+  lastLiveVideoProgressAt = Date.now();
+  lastLiveVideoCurrentTime = -1;
+
+  if (!window.MediaSource || !MediaSource.isTypeSupported(LIVE_MIME_TYPE)) {
+    liveVideo.src = `/api/live/stream.mp4?fallback=${Date.now()}&client_id=${
+      encodeURIComponent(liveClientId)
+    }`;
+    liveVideo.load();
+    liveVideo.play().catch(() => {});
+    return;
+  }
+
+  const mediaSource = new MediaSource();
+  liveMediaSource = mediaSource;
+  liveObjectUrl = URL.createObjectURL(mediaSource);
+  liveVideo.src = liveObjectUrl;
+  mediaSource.addEventListener("sourceopen", () => {
+    if (generation !== liveStreamGeneration) return;
+    consumeLiveStream(mediaSource, generation).catch((error) => {
+      if (error?.name !== "AbortError" && generation === liveStreamGeneration) {
+        liveVideo.dataset.streamError = String(error?.message || error);
+        reconnectLiveVideo();
+      }
+    });
+  }, { once: true });
+  liveVideo.load();
 }
 
 function reconnectLiveVideo() {
   if (streamRetryTimer !== null) return;
   streamRetryTimer = setTimeout(() => {
     streamRetryTimer = null;
-    liveStage.classList.remove("stream-ready");
     liveVideoState.textContent = "Reconnecting...";
-    lastLiveVideoProgressAt = Date.now();
-    lastLiveVideoCurrentTime = -1;
-    liveVideo.src = `/api/live/stream.mp4?retry=${Date.now()}`;
-    liveVideo.load();
-    liveVideo.play().catch(() => {});
+    startLiveVideo();
     streamRetryDelayMs = Math.min(streamRetryDelayMs * 2, 8000);
   }, streamRetryDelayMs);
 }
 
 function noteLiveVideoProgress() {
   const currentTime = Number(liveVideo.currentTime || 0);
+  liveVideo.dataset.currentTime = currentTime.toFixed(3);
   if (
     currentTime > lastLiveVideoCurrentTime + 0.01
     || currentTime < lastLiveVideoCurrentTime
@@ -370,10 +495,14 @@ function noteLiveVideoProgress() {
 
 function monitorLiveVideo() {
   noteLiveVideoProgress();
+  const progressAge = Date.now() - lastLiveVideoProgressAt;
+  liveVideo.dataset.lastProgressAgeMs = String(progressAge);
+  const timeout = liveStage.classList.contains("stream-ready")
+    ? LIVE_STALL_TIMEOUT_MS
+    : LIVE_STARTUP_TIMEOUT_MS;
   if (
     !document.hidden
-    && liveStage.classList.contains("stream-ready")
-    && Date.now() - lastLiveVideoProgressAt > LIVE_STALL_TIMEOUT_MS
+    && progressAge > timeout
   ) reconnectLiveVideo();
 }
 
@@ -386,12 +515,33 @@ liveVideo.addEventListener("playing", () => {
   keepLiveVideoNearEdge();
 });
 liveVideo.addEventListener("timeupdate", noteLiveVideoProgress);
-liveVideo.addEventListener("stalled", reconnectLiveVideo);
 liveVideo.addEventListener("error", reconnectLiveVideo);
+document.addEventListener("visibilitychange", () => {
+  if (
+    !document.hidden
+    && Date.now() - lastLiveVideoProgressAt > LIVE_STALL_TIMEOUT_MS
+  ) reconnectLiveVideo();
+});
+window.addEventListener("pagehide", () => {
+  stopLiveVideoTransport();
+  navigator.sendBeacon(
+    `/api/live/disconnect?client_id=${encodeURIComponent(liveClientId)}`,
+  );
+});
+
+function sendLiveHeartbeat() {
+  fetch(
+    `/api/live/heartbeat?client_id=${encodeURIComponent(liveClientId)}`,
+    { method: "POST", cache: "no-store", keepalive: true },
+  ).catch(() => {});
+}
 
 setInterval(keepLiveVideoNearEdge, 500);
 setInterval(monitorLiveVideo, 1000);
+setInterval(sendLiveHeartbeat, 2000);
 setInterval(refreshAnalysis, 100);
 setInterval(refreshStatus, 1000);
+startLiveVideo();
+sendLiveHeartbeat();
 refreshAnalysis();
 refreshStatus();

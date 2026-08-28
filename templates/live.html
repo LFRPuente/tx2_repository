@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TX2 Live MVP</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/live.css') }}">
-  <script src="{{ url_for('static', filename='js/live.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='js/live.js') }}?v=20260827-live-mse3" defer></script>
 </head>
 <body>
   <div class="app">
@@ -29,15 +29,8 @@
             muted
             playsinline
             preload="auto"
-            src="/api/live/stream.mp4"
             aria-label="Live camera"
           ></video>
-          <img
-            id="plc-measurement-frame"
-            class="measurement-frame"
-            alt=""
-            aria-hidden="true"
-          >
           <div id="live-video-state" class="empty stream-state">Connecting to camera...</div>
         </div>
       </section>

@@ -451,8 +451,6 @@ def build_live_stream_command(
     source: str,
     *,
     rtsp_source: bool,
-    fps: float = 30.0,
-    bitrate_mbps: float = 16.0,
 ) -> list[str]:
     command = [
         str(ffmpeg_executable),
@@ -466,24 +464,14 @@ def build_live_stream_command(
             (
                 "-rtsp_transport",
                 "tcp",
-                "-fflags",
-                "nobuffer",
                 "-flags",
                 "low_delay",
                 "-analyzeduration",
-                "0",
+                "1000000",
                 "-probesize",
-                "32768",
-                "-reorder_queue_size",
-                "0",
+                "1048576",
                 "-max_delay",
-                "0",
-                "-hwaccel",
-                "cuda",
-                "-hwaccel_output_format",
-                "cuda",
-                "-c:v",
-                "h264_cuvid",
+                "500000",
             )
         )
     else:
@@ -498,27 +486,7 @@ def build_live_stream_command(
             "-sn",
             "-dn",
             "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p2",
-            "-tune",
-            "ll",
-            "-rc",
-            "cbr",
-            "-b:v",
-            f"{max(1.0, float(bitrate_mbps)):g}M",
-            "-maxrate",
-            f"{max(1.0, float(bitrate_mbps)):g}M",
-            "-bufsize",
-            f"{max(1.0, float(bitrate_mbps)) / 2.0:g}M",
-            "-g",
-            str(max(1, int(round(float(fps))))),
-            "-bf",
-            "0",
-            "-fps_mode",
-            "cfr",
-            "-r",
-            str(max(1, int(round(float(fps))))),
+            "copy",
             "-movflags",
             "frag_every_frame+empty_moov+default_base_moof",
             "-avoid_negative_ts",
@@ -3720,6 +3688,9 @@ _database: DatabaseRepository | SQLiteDatabaseRepository | None = None
 _reconciler: DatabaseReconciler | None = None
 _runtime: LiveMvpRuntime | None = None
 _runtime_lock = threading.Lock()
+_live_stream_clients: dict[str, dict[str, Any]] = {}
+_live_stream_clients_lock = threading.Lock()
+LIVE_STREAM_CLIENT_TIMEOUT_SECONDS = 12.0
 
 
 def _publish_runtime(runtime: LiveMvpRuntime) -> None:
@@ -4025,10 +3996,9 @@ def api_live_status():
         live_stream={
             "codec": "h264",
             "transport": "fragmented_mp4",
-            "encoding": "nvidia_nvenc",
+            "encoding": "camera_h264_copy",
             "fps": float(_args.live_stream_fps),
             "resolution": str(_args.camera_resolution),
-            "bitrate_mbps": float(_args.video_bitrate_mbps),
         },
         plc=plc_status_with_signal_state(_plc.snapshot()),
         recorder=(
@@ -4069,8 +4039,96 @@ def api_health():
     ), (200 if healthy else 503)
 
 
+def _live_stream_client_id() -> str:
+    client_id = request.args.get("client_id", "").strip()
+    if (
+        not client_id
+        or len(client_id) > 80
+        or any(not (character.isalnum() or character in "-_") for character in client_id)
+    ):
+        abort(400, description="A valid live stream client_id is required")
+    return client_id
+
+
+def _terminate_live_stream_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2.0)
+
+
+def _register_live_stream_process(
+    client_id: str,
+    process: subprocess.Popen[bytes],
+) -> None:
+    with _live_stream_clients_lock:
+        previous = _live_stream_clients.get(client_id)
+        _live_stream_clients[client_id] = {
+            "process": process,
+            "last_seen": time.monotonic(),
+        }
+    if previous is not None and previous.get("process") is not process:
+        _terminate_live_stream_process(previous["process"])
+
+
+def _touch_live_stream_client(client_id: str) -> bool:
+    with _live_stream_clients_lock:
+        client = _live_stream_clients.get(client_id)
+        if client is None:
+            return False
+        client["last_seen"] = time.monotonic()
+        return True
+
+
+def _live_stream_client_expired(
+    client_id: str,
+    process: subprocess.Popen[bytes],
+) -> bool:
+    with _live_stream_clients_lock:
+        client = _live_stream_clients.get(client_id)
+        return (
+            client is None
+            or client.get("process") is not process
+            or time.monotonic() - float(client["last_seen"])
+            > LIVE_STREAM_CLIENT_TIMEOUT_SECONDS
+        )
+
+
+def _unregister_live_stream_process(
+    client_id: str,
+    process: subprocess.Popen[bytes],
+) -> None:
+    with _live_stream_clients_lock:
+        client = _live_stream_clients.get(client_id)
+        if client is not None and client.get("process") is process:
+            _live_stream_clients.pop(client_id, None)
+
+
+@app.post("/api/live/heartbeat")
+def api_live_heartbeat():
+    client_id = _live_stream_client_id()
+    return ("", 204 if _touch_live_stream_client(client_id) else 404)
+
+
+@app.post("/api/live/disconnect")
+def api_live_disconnect():
+    client_id = _live_stream_client_id()
+    with _live_stream_clients_lock:
+        client = _live_stream_clients.pop(client_id, None)
+    if client is not None:
+        _terminate_live_stream_process(client["process"])
+    return "", 204
+
+
 @app.route("/api/live/stream.mp4")
 def api_live_stream():
+    if "generation" not in request.args and "fallback" not in request.args:
+        abort(410, description="Reload the Live page to use the current player")
+    client_id = _live_stream_client_id()
     if str(_args.codec).lower() != "h264":
         abort(503, description="The browser live stream requires H.264")
     ffmpeg_executable = bundled_ffmpeg_executable()
@@ -4085,8 +4143,6 @@ def api_live_stream():
             ffmpeg_executable,
             source,
             rtsp_source=rtsp_source,
-            fps=float(_args.live_stream_fps),
-            bitrate_mbps=float(_args.video_bitrate_mbps),
         ),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -4094,26 +4150,64 @@ def api_live_stream():
         bufsize=0,
         creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
     )
+    _register_live_stream_process(client_id, process)
+    output_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=8)
+    stop_reader = threading.Event()
 
-    def stream():
+    def read_process_output() -> None:
         try:
             if process.stdout is None:
                 return
-            while True:
-                chunk = process.stdout.read(64 * 1024)
+            while not stop_reader.is_set():
+                chunk = process.stdout.read(256 * 1024)
                 if not chunk:
                     break
+                while not stop_reader.is_set():
+                    try:
+                        output_queue.put(chunk, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+        finally:
+            while not stop_reader.is_set():
+                try:
+                    output_queue.put(None, timeout=0.5)
+                    break
+                except queue.Full:
+                    continue
+
+    reader_thread = threading.Thread(
+        target=read_process_output,
+        name="live-stream-reader",
+        daemon=True,
+    )
+    reader_thread.start()
+
+    def stream():
+        started_at = time.monotonic()
+        delivered_bytes = False
+        try:
+            while True:
+                if _live_stream_client_expired(client_id, process):
+                    break
+                try:
+                    chunk = output_queue.get(timeout=0.5)
+                except queue.Empty:
+                    if process.poll() is not None:
+                        break
+                    if not delivered_bytes and time.monotonic() - started_at > 8.0:
+                        break
+                    continue
+                if chunk is None:
+                    break
+                delivered_bytes = True
                 yield chunk
         finally:
+            _unregister_live_stream_process(client_id, process)
+            stop_reader.set()
             if process.stdout is not None:
                 process.stdout.close()
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=2.0)
+            _terminate_live_stream_process(process)
 
     response = Response(stream(), mimetype="video/mp4", direct_passthrough=True)
     response.headers["Cache-Control"] = "no-store"

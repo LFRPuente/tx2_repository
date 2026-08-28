@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+from werkzeug.exceptions import Gone
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -55,40 +56,42 @@ class LiveVisionPipelineTests(unittest.TestCase):
     def test_resolution_dimensions_parses_native_axis_resolution(self) -> None:
         self.assertEqual(live.resolution_dimensions("2880x2160"), (2880, 2160))
 
-    def test_live_stream_command_normalizes_h264_with_nvidia(self) -> None:
+    def test_live_stream_command_copies_camera_h264_into_fragmented_mp4(self) -> None:
         command = live.build_live_stream_command(
             Path("ffmpeg.exe"),
             "rtsp://camera.example/stream",
             rtsp_source=True,
-            fps=30.0,
-            bitrate_mbps=16.0,
         )
 
         self.assertIn("-rtsp_transport", command)
-        self.assertIn("nobuffer", command)
         self.assertIn("low_delay", command)
-        self.assertEqual(command[command.index("-analyzeduration") + 1], "0")
-        self.assertEqual(command[command.index("-probesize") + 1], "32768")
-        self.assertEqual(command[command.index("-reorder_queue_size") + 1], "0")
-        self.assertEqual(command[command.index("-max_delay") + 1], "0")
+        self.assertEqual(command[command.index("-analyzeduration") + 1], "1000000")
+        self.assertEqual(command[command.index("-probesize") + 1], "1048576")
+        self.assertEqual(command[command.index("-max_delay") + 1], "500000")
         self.assertEqual(command[command.index("-flush_packets") + 1], "1")
-        codecs = [
-            command[index + 1]
-            for index, value in enumerate(command[:-1])
-            if value == "-c:v"
-        ]
-        self.assertEqual(codecs, ["h264_cuvid", "h264_nvenc"])
-        self.assertEqual(command[command.index("-b:v") + 1], "16M")
-        self.assertEqual(command[command.index("-fps_mode") + 1], "cfr")
-        self.assertEqual(command[command.index("-r") + 1], "30")
-        self.assertEqual(command[command.index("-g") + 1], "30")
-        self.assertEqual(command[command.index("-bf") + 1], "0")
+        self.assertEqual(command[command.index("-c:v") + 1], "copy")
         self.assertIn(
             "frag_every_frame+empty_moov+default_base_moof",
             command,
         )
         self.assertEqual(command[-2:], ["mp4", "pipe:1"])
-        self.assertNotIn("copy", command)
+        self.assertNotIn("h264_nvenc", command)
+
+    def test_live_stream_rejects_the_retired_direct_video_player(self) -> None:
+        with live.app.test_request_context("/api/live/stream.mp4"):
+            with self.assertRaises(Gone):
+                live.api_live_stream()
+
+    def test_live_page_bootstraps_the_mse_player(self) -> None:
+        html = (live.ROOT / "templates" / "live.html").read_text(encoding="utf-8")
+        javascript = (live.ROOT / "static" / "js" / "live.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn('src="/api/live/stream.mp4"', html)
+        self.assertNotIn("plc-measurement-frame", html)
+        self.assertIn("new MediaSource()", javascript)
+        self.assertIn("/api/live/heartbeat", javascript)
 
     def test_clip_writer_command_uses_nvidia_encoder(self) -> None:
         command = live.build_nvenc_writer_command(
