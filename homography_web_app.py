@@ -2322,6 +2322,7 @@ def sobel_projection_for_box(
     line_x_range: tuple[float, float] | None = None,
     config_overrides: dict | None = None,
     require_projection_valid: bool = True,
+    edge_response_fn=None,
 ) -> dict:
     from yolo_roi_sobel_projection import ProjectionConfig, edge_response_from_roi, project_edge_line
 
@@ -2348,7 +2349,8 @@ def sobel_projection_for_box(
     y1 = max(y0 + 2, min(y1, height - 1))
 
     roi = rectified[y0:y1, x0:x1]
-    _gray, edge = edge_response_from_roi(roi, cfg)
+    response_fn = edge_response_fn or edge_response_from_roi
+    _gray, edge = response_fn(roi, cfg)
     projection = project_edge_line(edge, cfg)
 
     points = []
@@ -2430,7 +2432,11 @@ def sobel_projection_for_box(
     }
 
 
-def sobel_projection_for_piece(rectified: np.ndarray, box: dict) -> dict:
+def sobel_projection_for_piece(
+    rectified: np.ndarray,
+    box: dict,
+    edge_response_fn=None,
+) -> dict:
     height, width = rectified.shape[:2]
     piece_x0 = float(np.clip(float(box["x"]), 0.0, float(max(0, width - 2))))
     piece_y0 = float(np.clip(float(box["y"]), 0.0, float(max(0, height - 2))))
@@ -2482,6 +2488,7 @@ def sobel_projection_for_piece(rectified: np.ndarray, box: dict) -> dict:
             "edge_polarity": "falling",
         },
         require_projection_valid=False,
+        edge_response_fn=edge_response_fn,
     )
     result["roi_box"] = box
     result["analysis_box"] = analysis_box
@@ -2538,6 +2545,7 @@ def analyze_piece_boxes(
     calibration: dict,
     frame_idx: int | None = None,
     time_sec: float | None = None,
+    edge_response_fn=None,
 ) -> tuple[list[dict], dict]:
     ordered_boxes = sorted(
         boxes,
@@ -2548,7 +2556,11 @@ def analyze_piece_boxes(
     )
     pieces = []
     for piece_id, box in enumerate(ordered_boxes, start=1):
-        sobel = sobel_projection_for_piece(rectified, box)
+        sobel = sobel_projection_for_piece(
+            rectified,
+            box,
+            edge_response_fn=edge_response_fn,
+        )
         sobel.update(frame_idx=frame_idx, time_sec=time_sec)
         measurement = measurement_from_sobel(sobel, calibration, rectified.shape[1])
         pieces.append(

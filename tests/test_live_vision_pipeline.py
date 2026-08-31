@@ -165,10 +165,21 @@ class LiveVisionPipelineTests(unittest.TestCase):
             "torch_version": "2.12.1+cu130",
             "torch_cuda_version": "13.0",
         }
-        with patch.object(
-            live.vision,
-            "resolve_yolo_device",
-            return_value=device_info,
+        geometry_backend = SimpleNamespace(
+            homography_name="torch_cuda",
+            sobel_name="torch_cuda",
+        )
+        with (
+            patch.object(
+                live.vision,
+                "resolve_yolo_device",
+                return_value=device_info,
+            ),
+            patch.object(
+                live,
+                "create_geometry_backend",
+                return_value=(geometry_backend, ""),
+            ),
         ):
             processor = live.LiveProcessor(
                 SimpleNamespace(process_fps=10.0, device="auto"),
@@ -179,7 +190,34 @@ class LiveVisionPipelineTests(unittest.TestCase):
         self.assertEqual(status["inference_device"], "cuda:0")
         self.assertEqual(status["inference_device_name"], "NVIDIA L40S")
         self.assertTrue(status["cuda_available"])
+        self.assertEqual(status["homography_backend"], "torch_cuda")
+        self.assertEqual(status["sobel_backend"], "torch_cuda")
+        self.assertEqual(status["geometry_backend_error"], "")
+
+    def test_live_processor_falls_back_to_cpu_geometry(self) -> None:
+        processor = live.LiveProcessor(
+            SimpleNamespace(device="cpu"),
+            live.FrameBuffer(maxlen=8),
+        )
+        processor.geometry_backend = SimpleNamespace(
+            homography_name="torch_cuda",
+            sobel_name="torch_cuda",
+            warp_perspective=lambda *_args: (_ for _ in ()).throw(
+                RuntimeError("CUDA warp failed")
+            ),
+        )
+
+        output = processor._warp_perspective(
+            np.zeros((8, 8, 3), dtype=np.uint8),
+            np.eye(3),
+            (8, 8),
+        )
+
+        self.assertEqual(output.shape, (8, 8, 3))
+        status = processor.snapshot()
         self.assertEqual(status["homography_backend"], "opencv_cpu")
+        self.assertEqual(status["sobel_backend"], "opencv_cpu")
+        self.assertEqual(status["geometry_backend_error"], "CUDA warp failed")
 
     def test_idle_live_processor_does_not_process_or_encode_frames(self) -> None:
         buffer = live.FrameBuffer(maxlen=8)

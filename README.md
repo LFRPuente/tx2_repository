@@ -24,6 +24,7 @@ before that hostname is reachable from VPN clients.
 
 - `homography_web_app.py`: Flask tool for homography, YOLO annotation, measurement calibration, Sobel front detection, and frame review.
 - `live_mvp_app.py`: Live MVP backend with AXIS video, PLC-triggered snapshots, measurement processing, APIs, and event history. The 8-second clip path remains available but is currently disabled.
+- `torch_cuda_geometry.py`: PyTorch CUDA homography backend with validated OpenCV fallback and an optional CUDA Sobel path.
 - `templates/`: Flask HTML views for Live, History, homography, ROI selection, and annotation.
 - `static/css/` and `static/js/`: presentation and browser behavior for every Flask app, kept outside the Python backends.
 - `mvp_react_app/`: React/Vite MVP showing the simplified measurement view with the real video overlay and a diagram.
@@ -361,10 +362,14 @@ The 30 FPS presentation path remains independent of the 10 FPS PLC measurement
 and recording path.
 The one-second health poll also uses a compact processor summary instead of
 resending piece and Sobel evidence already supplied by the analysis endpoint.
-YOLO runs through TensorRT on the L40S and
-processed clips are written through an asynchronous NVIDIA NVENC queue. The
-homography intentionally stays in OpenCV CPU: on the deployed L40S host it is
-faster than transferring the full 2880x2160 frame to CUDA and back before YOLO.
+YOLO runs through TensorRT on the L40S and processed clips are written through
+an asynchronous NVIDIA NVENC queue. Geometry mode defaults to `auto`: the
+homography runs through PyTorch CUDA, while the small per-piece Sobel ROIs stay
+in OpenCV CPU. Use `--geometry-device cpu` for the complete legacy path or
+`--geometry-device cuda` to benchmark CUDA Sobel as well. `/api/live/status`
+reports `homography_backend`, `sobel_backend`, and `geometry_backend_error`.
+Any CUDA geometry failure switches the processor to OpenCV without dropping
+the PLC event.
 Live inference uses
 the individual-piece model at an initial confidence of `0.10`, applies the same
 geometric rules as the offline tool, filters boxes against configured exclusion
@@ -401,6 +406,18 @@ Clip NVENC uses its low-latency `p1/ll` preset. Snapshot-only production leaves
 that clip encoder disabled, and the browser stream copies camera H.264 directly.
 `/api/live/status` exposes the selected encoder, cache hit/miss counts, and the
 latest per-stage durations.
+
+CUDA geometry validation on 2026-08-31 compared the saved 2880x2160 PLC frame
+against OpenCV. The rectified image differed by at most one 8-bit color level;
+the detected front and calibrated measurement matched exactly (`0 px` and
+`0 in` difference). Full PyTorch CUDA Sobel was not selected for production:
+real events spent 287-722 ms synchronizing small ROIs after TensorRT, while the
+same OpenCV Sobel stage normally used 3-8 ms. The deployed hybrid keeps the
+large homography on the L40S and avoids that per-piece synchronization cost.
+NVDEC still downloads BGR frames to host memory for the PLC ring buffer, so
+this is not a zero-CPU pipeline. Keeping decoded surfaces entirely on the GPU
+requires a CUDA-native decoder/buffer integration rather than the current
+FFmpeg raw-video pipe.
 
 TensorRT validation on 2026-08-27 used eight current `2880x2160` camera frames
 after the saved homography. The dynamic FP16 engine matched the PyTorch count

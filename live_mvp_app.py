@@ -38,6 +38,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import homography_web_app as vision
+from torch_cuda_geometry import create_geometry_backend
 from tx2_database import (
     DatabaseRepository,
     DatabaseUnavailable,
@@ -338,6 +339,8 @@ def compact_processor_status(status: dict[str, Any]) -> dict[str, Any]:
         "inference_backend_error",
         "cuda_available",
         "homography_backend",
+        "sobel_backend",
+        "geometry_backend_error",
         "warmup_complete",
         "warmup_duration_ms",
     )
@@ -770,6 +773,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--device",
         default=os.environ.get("TX2_YOLO_DEVICE", "auto"),
         help="YOLO inference device: auto, cpu, cuda or cuda:N.",
+    )
+    parser.add_argument(
+        "--geometry-device",
+        choices=("auto", "cpu", "cuda"),
+        default=os.environ.get("TX2_GEOMETRY_DEVICE", "auto"),
+        help=(
+            "Geometry backend: auto uses CUDA homography with CPU Sobel; "
+            "cpu uses OpenCV; cuda also runs Sobel through PyTorch CUDA."
+        ),
     )
     parser.add_argument("--conf", type=float, default=0.10)
     parser.add_argument("--imgsz", type=int, default=960)
@@ -1573,6 +1585,11 @@ class LiveProcessor:
         self.args = args
         self.buffer = buffer
         device_info = vision.resolve_yolo_device(getattr(args, "device", "auto"))
+        self.geometry_backend, geometry_error = create_geometry_backend(
+            getattr(args, "geometry_device", "auto"),
+            str(device_info["device"]),
+            bool(device_info["cuda_available"]),
+        )
         configured_model = Path(getattr(args, "model", DEFAULT_MODEL)).resolve()
         self.inference_lock = threading.Lock()
         self.measurement_priority = threading.Event()
@@ -1608,7 +1625,9 @@ class LiveProcessor:
             "cuda_available": device_info["cuda_available"],
             "torch_version": device_info["torch_version"],
             "torch_cuda_version": device_info["torch_cuda_version"],
-            "homography_backend": "opencv_cpu",
+            "homography_backend": self.geometry_backend.homography_name,
+            "sobel_backend": self.geometry_backend.sobel_name,
+            "geometry_backend_error": geometry_error,
             "warmup_complete": False,
             "warmup_duration_ms": None,
             "processing_cache_hits": 0,
@@ -1619,9 +1638,17 @@ class LiveProcessor:
 
     def warm_up(self) -> None:
         started = time.perf_counter()
-        _matrix, out_size, _homography = vision.load_homography()
+        matrix, out_size, _homography = vision.load_homography()
         calibration = vision.load_measurement_calibration()
         width, height = (int(value) for value in out_size)
+        input_width, input_height = resolution_dimensions(
+            getattr(self.args, "camera_resolution", "2880x2160")
+        )
+        self._prepare_homography(
+            (input_height, input_width),
+            matrix,
+            out_size,
+        )
         rectified = np.zeros((height, width, 3), dtype=np.uint8)
         with self.inference_lock:
             vision.predict_yolo_boxes_with_rules(
@@ -1763,7 +1790,8 @@ class LiveProcessor:
                     processed_count=int(self.state.get("processed_count", 0)) + 1,
                     last_processed_utc=utc_now(),
                     last_duration_ms=duration_ms,
-                    homography_backend="opencv_cpu",
+                    homography_backend=self.geometry_backend.homography_name,
+                    sobel_backend=self.geometry_backend.sobel_name,
                     last_stage_durations_ms=result.get("stage_durations_ms"),
                     inference_backend=backend_info["backend"],
                     inference_model=backend_info["active_model"],
@@ -1805,6 +1833,57 @@ class LiveProcessor:
     def _set_state(self, **updates: Any) -> None:
         with self.lock:
             self.state.update(updates)
+
+    def _use_cpu_geometry(self, error: Exception) -> None:
+        backend, _detail = create_geometry_backend("cpu", "cpu", False)
+        self.geometry_backend = backend
+        self._set_state(
+            homography_backend=backend.homography_name,
+            sobel_backend=backend.sobel_name,
+            geometry_backend_error=str(error),
+        )
+
+    def _prepare_homography(
+        self,
+        input_size: tuple[int, int],
+        matrix: np.ndarray,
+        output_size: tuple[int, int],
+    ) -> None:
+        try:
+            self.geometry_backend.prepare_homography(
+                input_size,
+                matrix,
+                output_size,
+            )
+        except Exception as exc:
+            self._use_cpu_geometry(exc)
+
+    def _warp_perspective(
+        self,
+        frame: np.ndarray,
+        matrix: np.ndarray,
+        output_size: tuple[int, int],
+    ) -> np.ndarray:
+        try:
+            return self.geometry_backend.warp_perspective(
+                frame,
+                matrix,
+                output_size,
+            )
+        except Exception as exc:
+            self._use_cpu_geometry(exc)
+            return self.geometry_backend.warp_perspective(
+                frame,
+                matrix,
+                output_size,
+            )
+
+    def _edge_response_from_roi(self, roi: np.ndarray, config: Any):
+        try:
+            return self.geometry_backend.edge_response_from_roi(roi, config)
+        except Exception as exc:
+            self._use_cpu_geometry(exc)
+            return self.geometry_backend.edge_response_from_roi(roi, config)
 
     def _cache_key(self, item: dict[str, Any]) -> tuple[Any, ...]:
         paths = []
@@ -1878,7 +1957,11 @@ class LiveProcessor:
         if include_evidence_images:
             evidence_started = time.perf_counter()
             matrix, out_size, _homography = vision.load_homography()
-            rectified = cv2.warpPerspective(original, matrix, out_size)
+            rectified = self._warp_perspective(
+                original,
+                matrix,
+                out_size,
+            )
             rectified_viz = draw_rectified_overlay(
                 rectified,
                 result.get("pieces") or [],
@@ -1913,7 +1996,11 @@ class LiveProcessor:
             )
         }
         stage_started = time.perf_counter()
-        rectified = cv2.warpPerspective(original, matrix, out_size)
+        rectified = self._warp_perspective(
+            original,
+            matrix,
+            out_size,
+        )
         stage_durations["homography"] = round(
             (time.perf_counter() - stage_started) * 1000.0,
             2,
@@ -1946,6 +2033,7 @@ class LiveProcessor:
             calibration,
             frame_idx=int(item["index"]),
             time_sec=None,
+            edge_response_fn=self._edge_response_from_roi,
         )
         stage_durations["sobel_and_measurement"] = round(
             (time.perf_counter() - stage_started) * 1000.0,
@@ -1989,7 +2077,8 @@ class LiveProcessor:
             "inference_backend": backend_info["backend"],
             "inference_fallback_active": backend_info["fallback_active"],
             "conf": float(self.args.conf),
-            "homography_backend": "opencv_cpu",
+            "homography_backend": self.geometry_backend.homography_name,
+            "sobel_backend": self.geometry_backend.sobel_name,
             "_original_overlay": original_overlay,
             "_recording_frame": {
                 "index": int(item["index"]),
