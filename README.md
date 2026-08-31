@@ -363,10 +363,11 @@ and recording path.
 The one-second health poll also uses a compact processor summary instead of
 resending piece and Sobel evidence already supplied by the analysis endpoint.
 YOLO runs through TensorRT on the L40S and processed clips are written through
-an asynchronous NVIDIA NVENC queue. Geometry mode defaults to `auto`: the
-homography runs through PyTorch CUDA, while the small per-piece Sobel ROIs stay
-in OpenCV CPU. Use `--geometry-device cpu` for the complete legacy path or
-`--geometry-device cuda` to benchmark CUDA Sobel as well. `/api/live/status`
+an asynchronous NVIDIA NVENC queue. Geometry mode defaults to `auto`, which
+runs homography and the small per-piece Sobel ROIs through OpenCV CPU. On the
+deployed L40S system this path is faster than transferring full-resolution
+frames through PyTorch CUDA. Use `--geometry-device cuda` only to benchmark the
+experimental CUDA homography and Sobel path. `/api/live/status`
 reports `homography_backend`, `sobel_backend`, and `geometry_backend_error`.
 Any CUDA geometry failure switches the processor to OpenCV without dropping
 the PLC event.

@@ -231,7 +231,7 @@ def create_geometry_backend(
     cuda_available: bool,
 ) -> tuple[OpenCvGeometryBackend | TorchCudaGeometryBackend, str]:
     mode = str(requested or "auto").lower()
-    if mode == "cpu":
+    if mode in {"auto", "cpu"}:
         return OpenCvGeometryBackend(), ""
     if not cuda_available:
         detail = "CUDA geometry requested but PyTorch CUDA is unavailable" if mode == "cuda" else ""

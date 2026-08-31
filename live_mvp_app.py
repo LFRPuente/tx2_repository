@@ -779,8 +779,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("auto", "cpu", "cuda"),
         default=os.environ.get("TX2_GEOMETRY_DEVICE", "auto"),
         help=(
-            "Geometry backend: auto uses CUDA homography with CPU Sobel; "
-            "cpu uses OpenCV; cuda also runs Sobel through PyTorch CUDA."
+            "Geometry backend: auto and cpu use OpenCV; cuda runs the "
+            "homography and Sobel through PyTorch CUDA for benchmarking."
         ),
     )
     parser.add_argument("--conf", type=float, default=0.10)

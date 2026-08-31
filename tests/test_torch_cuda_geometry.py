@@ -43,12 +43,11 @@ class GeometryBackendTests(unittest.TestCase):
         self.assertIsInstance(backend, OpenCvGeometryBackend)
         self.assertIn("unavailable", error)
 
-    @unittest.skipUnless(CUDA_AVAILABLE, "PyTorch CUDA is unavailable")
-    def test_auto_mode_keeps_small_sobel_rois_on_cpu(self) -> None:
+    def test_auto_mode_uses_faster_opencv_geometry(self) -> None:
         backend, error = create_geometry_backend("auto", "cuda:0", True)
 
-        self.assertIsInstance(backend, TorchCudaGeometryBackend)
-        self.assertEqual(backend.homography_name, "torch_cuda")
+        self.assertIsInstance(backend, OpenCvGeometryBackend)
+        self.assertEqual(backend.homography_name, "opencv_cpu")
         self.assertEqual(backend.sobel_name, "opencv_cpu")
         self.assertEqual(error, "")
 
